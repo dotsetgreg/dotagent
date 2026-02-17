@@ -36,7 +36,7 @@ func (t *MessageTool) Parameters() map[string]interface{} {
 			},
 			"channel": map[string]interface{}{
 				"type":        "string",
-				"description": "Optional: target channel (telegram, whatsapp, etc.)",
+				"description": "Optional: target channel (defaults to discord in current session)",
 			},
 			"chat_id": map[string]interface{}{
 				"type":        "string",

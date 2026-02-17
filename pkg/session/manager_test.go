@@ -12,9 +12,9 @@ func TestSanitizeFilename(t *testing.T) {
 		expected string
 	}{
 		{"simple", "simple"},
-		{"telegram:123456", "telegram_123456"},
+		{"discord:123456", "discord_123456"},
 		{"discord:987654321", "discord_987654321"},
-		{"slack:C01234", "slack_C01234"},
+		{"discord:thread-abc", "discord_thread-abc"},
 		{"no-colons-here", "no-colons-here"},
 		{"multiple:colons:here", "multiple_colons_here"},
 	}
@@ -34,7 +34,7 @@ func TestSave_WithColonInKey(t *testing.T) {
 	sm := NewSessionManager(tmpDir)
 
 	// Create a session with a key containing colon (typical channel session key).
-	key := "telegram:123456"
+	key := "discord:123456"
 	sm.GetOrCreate(key)
 	sm.AddMessage(key, "user", "hello")
 
@@ -44,7 +44,7 @@ func TestSave_WithColonInKey(t *testing.T) {
 	}
 
 	// The file on disk should use sanitized name.
-	expectedFile := filepath.Join(tmpDir, "telegram_123456.json")
+	expectedFile := filepath.Join(tmpDir, "discord_123456.json")
 	if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
 		t.Fatalf("expected session file %s to exist", expectedFile)
 	}

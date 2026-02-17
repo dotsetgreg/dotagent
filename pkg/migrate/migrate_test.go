@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/dotsetgreg/dotagent/pkg/config"
 )
 
 func TestCamelToSnake(t *testing.T) {
@@ -91,15 +91,15 @@ func TestLoadOpenClawConfig(t *testing.T) {
 
 	openclawConfig := map[string]interface{}{
 		"providers": map[string]interface{}{
-			"anthropic": map[string]interface{}{
-				"apiKey":  "sk-ant-test123",
-				"apiBase": "https://api.anthropic.com",
+			"openrouter": map[string]interface{}{
+				"apiKey":  "sk-or-test123",
+				"apiBase": "https://openrouter.ai/api/v1",
 			},
 		},
 		"agents": map[string]interface{}{
 			"defaults": map[string]interface{}{
 				"maxTokens": float64(4096),
-				"model":     "claude-3-opus",
+				"model":     "openai/gpt-5.2",
 			},
 		},
 	}
@@ -121,12 +121,12 @@ func TestLoadOpenClawConfig(t *testing.T) {
 	if !ok {
 		t.Fatal("expected providers map")
 	}
-	anthropic, ok := providers["anthropic"].(map[string]interface{})
+	openrouter, ok := providers["openrouter"].(map[string]interface{})
 	if !ok {
-		t.Fatal("expected anthropic map")
+		t.Fatal("expected openrouter map")
 	}
-	if anthropic["api_key"] != "sk-ant-test123" {
-		t.Errorf("api_key = %v, want sk-ant-test123", anthropic["api_key"])
+	if openrouter["api_key"] != "sk-or-test123" {
+		t.Errorf("api_key = %v, want sk-or-test123", openrouter["api_key"])
 	}
 
 	agents, ok := result["agents"].(map[string]interface{})
@@ -146,15 +146,8 @@ func TestConvertConfig(t *testing.T) {
 	t.Run("providers mapping", func(t *testing.T) {
 		data := map[string]interface{}{
 			"providers": map[string]interface{}{
-				"anthropic": map[string]interface{}{
-					"api_key":  "sk-ant-test",
-					"api_base": "https://api.anthropic.com",
-				},
 				"openrouter": map[string]interface{}{
 					"api_key": "sk-or-test",
-				},
-				"groq": map[string]interface{}{
-					"api_key": "gsk-test",
 				},
 			},
 		}
@@ -166,22 +159,16 @@ func TestConvertConfig(t *testing.T) {
 		if len(warnings) != 0 {
 			t.Errorf("expected no warnings, got %v", warnings)
 		}
-		if cfg.Providers.Anthropic.APIKey != "sk-ant-test" {
-			t.Errorf("Anthropic.APIKey = %q, want %q", cfg.Providers.Anthropic.APIKey, "sk-ant-test")
-		}
 		if cfg.Providers.OpenRouter.APIKey != "sk-or-test" {
 			t.Errorf("OpenRouter.APIKey = %q, want %q", cfg.Providers.OpenRouter.APIKey, "sk-or-test")
-		}
-		if cfg.Providers.Groq.APIKey != "gsk-test" {
-			t.Errorf("Groq.APIKey = %q, want %q", cfg.Providers.Groq.APIKey, "gsk-test")
 		}
 	})
 
 	t.Run("unsupported provider warning", func(t *testing.T) {
 		data := map[string]interface{}{
 			"providers": map[string]interface{}{
-				"deepseek": map[string]interface{}{
-					"api_key": "sk-deep-test",
+				"legacyprovider": map[string]interface{}{
+					"api_key": "legacy-key",
 				},
 			},
 		}
@@ -193,7 +180,7 @@ func TestConvertConfig(t *testing.T) {
 		if len(warnings) != 1 {
 			t.Fatalf("expected 1 warning, got %d", len(warnings))
 		}
-		if warnings[0] != "Provider 'deepseek' not supported in PicoClaw, skipping" {
+		if warnings[0] != "Provider 'legacyprovider' not supported in DotAgent, skipping" {
 			t.Errorf("unexpected warning: %s", warnings[0])
 		}
 	})
@@ -201,14 +188,10 @@ func TestConvertConfig(t *testing.T) {
 	t.Run("channels mapping", func(t *testing.T) {
 		data := map[string]interface{}{
 			"channels": map[string]interface{}{
-				"telegram": map[string]interface{}{
-					"enabled":    true,
-					"token":      "tg-token-123",
-					"allow_from": []interface{}{"user1"},
-				},
 				"discord": map[string]interface{}{
-					"enabled": true,
-					"token":   "disc-token-456",
+					"enabled":    true,
+					"token":      "disc-token-456",
+					"allow_from": []interface{}{"user1"},
 				},
 			},
 		}
@@ -217,17 +200,14 @@ func TestConvertConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ConvertConfig: %v", err)
 		}
-		if !cfg.Channels.Telegram.Enabled {
-			t.Error("Telegram should be enabled")
-		}
-		if cfg.Channels.Telegram.Token != "tg-token-123" {
-			t.Errorf("Telegram.Token = %q, want %q", cfg.Channels.Telegram.Token, "tg-token-123")
-		}
-		if len(cfg.Channels.Telegram.AllowFrom) != 1 || cfg.Channels.Telegram.AllowFrom[0] != "user1" {
-			t.Errorf("Telegram.AllowFrom = %v, want [user1]", cfg.Channels.Telegram.AllowFrom)
-		}
 		if !cfg.Channels.Discord.Enabled {
 			t.Error("Discord should be enabled")
+		}
+		if cfg.Channels.Discord.Token != "disc-token-456" {
+			t.Errorf("Discord.Token = %q, want %q", cfg.Channels.Discord.Token, "disc-token-456")
+		}
+		if len(cfg.Channels.Discord.AllowFrom) != 1 || cfg.Channels.Discord.AllowFrom[0] != "user1" {
+			t.Errorf("Discord.AllowFrom = %v, want [user1]", cfg.Channels.Discord.AllowFrom)
 		}
 	})
 
@@ -247,7 +227,7 @@ func TestConvertConfig(t *testing.T) {
 		if len(warnings) != 1 {
 			t.Fatalf("expected 1 warning, got %d", len(warnings))
 		}
-		if warnings[0] != "Channel 'email' not supported in PicoClaw, skipping" {
+		if warnings[0] != "Channel 'email' not supported in DotAgent, skipping" {
 			t.Errorf("unexpected warning: %s", warnings[0])
 		}
 	})
@@ -256,7 +236,7 @@ func TestConvertConfig(t *testing.T) {
 		data := map[string]interface{}{
 			"agents": map[string]interface{}{
 				"defaults": map[string]interface{}{
-					"model":               "claude-3-opus",
+					"model":               "openai/gpt-5.2",
 					"max_tokens":          float64(4096),
 					"temperature":         0.5,
 					"max_tool_iterations": float64(10),
@@ -269,8 +249,8 @@ func TestConvertConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ConvertConfig: %v", err)
 		}
-		if cfg.Agents.Defaults.Model != "claude-3-opus" {
-			t.Errorf("Model = %q, want %q", cfg.Agents.Defaults.Model, "claude-3-opus")
+		if cfg.Agents.Defaults.Model != "openai/gpt-5.2" {
+			t.Errorf("Model = %q, want %q", cfg.Agents.Defaults.Model, "openai/gpt-5.2")
 		}
 		if cfg.Agents.Defaults.MaxTokens != 4096 {
 			t.Errorf("MaxTokens = %d, want %d", cfg.Agents.Defaults.MaxTokens, 4096)
@@ -278,8 +258,8 @@ func TestConvertConfig(t *testing.T) {
 		if cfg.Agents.Defaults.Temperature != 0.5 {
 			t.Errorf("Temperature = %f, want %f", cfg.Agents.Defaults.Temperature, 0.5)
 		}
-		if cfg.Agents.Defaults.Workspace != "~/.picoclaw/workspace" {
-			t.Errorf("Workspace = %q, want %q", cfg.Agents.Defaults.Workspace, "~/.picoclaw/workspace")
+		if cfg.Agents.Defaults.Workspace != "~/.dotagent/workspace" {
+			t.Errorf("Workspace = %q, want %q", cfg.Agents.Defaults.Workspace, "~/.dotagent/workspace")
 		}
 	})
 
@@ -293,8 +273,8 @@ func TestConvertConfig(t *testing.T) {
 		if len(warnings) != 0 {
 			t.Errorf("expected no warnings, got %v", warnings)
 		}
-		if cfg.Agents.Defaults.Model != "glm-4.7" {
-			t.Errorf("default model should be glm-4.7, got %q", cfg.Agents.Defaults.Model)
+		if cfg.Agents.Defaults.Model != "openai/gpt-5.2" {
+			t.Errorf("default model should be openai/gpt-5.2, got %q", cfg.Agents.Defaults.Model)
 		}
 	})
 }
@@ -303,13 +283,9 @@ func TestMergeConfig(t *testing.T) {
 	t.Run("fills empty fields", func(t *testing.T) {
 		existing := config.DefaultConfig()
 		incoming := config.DefaultConfig()
-		incoming.Providers.Anthropic.APIKey = "sk-ant-incoming"
 		incoming.Providers.OpenRouter.APIKey = "sk-or-incoming"
 
 		result := MergeConfig(existing, incoming)
-		if result.Providers.Anthropic.APIKey != "sk-ant-incoming" {
-			t.Errorf("Anthropic.APIKey = %q, want %q", result.Providers.Anthropic.APIKey, "sk-ant-incoming")
-		}
 		if result.Providers.OpenRouter.APIKey != "sk-or-incoming" {
 			t.Errorf("OpenRouter.APIKey = %q, want %q", result.Providers.OpenRouter.APIKey, "sk-or-incoming")
 		}
@@ -317,48 +293,44 @@ func TestMergeConfig(t *testing.T) {
 
 	t.Run("preserves existing non-empty fields", func(t *testing.T) {
 		existing := config.DefaultConfig()
-		existing.Providers.Anthropic.APIKey = "sk-ant-existing"
+		existing.Providers.OpenRouter.APIKey = "sk-or-existing"
 
 		incoming := config.DefaultConfig()
-		incoming.Providers.Anthropic.APIKey = "sk-ant-incoming"
-		incoming.Providers.OpenAI.APIKey = "sk-oai-incoming"
+		incoming.Providers.OpenRouter.APIKey = "sk-or-incoming"
 
 		result := MergeConfig(existing, incoming)
-		if result.Providers.Anthropic.APIKey != "sk-ant-existing" {
-			t.Errorf("Anthropic.APIKey should be preserved, got %q", result.Providers.Anthropic.APIKey)
-		}
-		if result.Providers.OpenAI.APIKey != "sk-oai-incoming" {
-			t.Errorf("OpenAI.APIKey should be filled, got %q", result.Providers.OpenAI.APIKey)
+		if result.Providers.OpenRouter.APIKey != "sk-or-existing" {
+			t.Errorf("OpenRouter.APIKey should be preserved, got %q", result.Providers.OpenRouter.APIKey)
 		}
 	})
 
 	t.Run("merges enabled channels", func(t *testing.T) {
 		existing := config.DefaultConfig()
 		incoming := config.DefaultConfig()
-		incoming.Channels.Telegram.Enabled = true
-		incoming.Channels.Telegram.Token = "tg-token"
+		incoming.Channels.Discord.Enabled = true
+		incoming.Channels.Discord.Token = "disc-token"
 
 		result := MergeConfig(existing, incoming)
-		if !result.Channels.Telegram.Enabled {
-			t.Error("Telegram should be enabled after merge")
+		if !result.Channels.Discord.Enabled {
+			t.Error("Discord should be enabled after merge")
 		}
-		if result.Channels.Telegram.Token != "tg-token" {
-			t.Errorf("Telegram.Token = %q, want %q", result.Channels.Telegram.Token, "tg-token")
+		if result.Channels.Discord.Token != "disc-token" {
+			t.Errorf("Discord.Token = %q, want %q", result.Channels.Discord.Token, "disc-token")
 		}
 	})
 
 	t.Run("preserves existing enabled channels", func(t *testing.T) {
 		existing := config.DefaultConfig()
-		existing.Channels.Telegram.Enabled = true
-		existing.Channels.Telegram.Token = "existing-token"
+		existing.Channels.Discord.Enabled = true
+		existing.Channels.Discord.Token = "existing-token"
 
 		incoming := config.DefaultConfig()
-		incoming.Channels.Telegram.Enabled = true
-		incoming.Channels.Telegram.Token = "incoming-token"
+		incoming.Channels.Discord.Enabled = true
+		incoming.Channels.Discord.Token = "incoming-token"
 
 		result := MergeConfig(existing, incoming)
-		if result.Channels.Telegram.Token != "existing-token" {
-			t.Errorf("Telegram.Token should be preserved, got %q", result.Channels.Telegram.Token)
+		if result.Channels.Discord.Token != "existing-token" {
+			t.Errorf("Discord.Token should be preserved, got %q", result.Channels.Discord.Token)
 		}
 	})
 }
@@ -553,7 +525,7 @@ func TestRewriteWorkspacePath(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"default path", "~/.openclaw/workspace", "~/.picoclaw/workspace"},
+		{"default path", "~/.openclaw/workspace", "~/.dotagent/workspace"},
 		{"custom path", "/custom/path", "/custom/path"},
 		{"empty", "", ""},
 	}
@@ -569,7 +541,7 @@ func TestRewriteWorkspacePath(t *testing.T) {
 
 func TestRunDryRun(t *testing.T) {
 	openclawHome := t.TempDir()
-	picoClawHome := t.TempDir()
+	dotAgentHome := t.TempDir()
 
 	wsDir := filepath.Join(openclawHome, "workspace")
 	os.MkdirAll(wsDir, 0755)
@@ -578,7 +550,7 @@ func TestRunDryRun(t *testing.T) {
 
 	configData := map[string]interface{}{
 		"providers": map[string]interface{}{
-			"anthropic": map[string]interface{}{
+			"openrouter": map[string]interface{}{
 				"apiKey": "test-key",
 			},
 		},
@@ -589,7 +561,7 @@ func TestRunDryRun(t *testing.T) {
 	opts := Options{
 		DryRun:       true,
 		OpenClawHome: openclawHome,
-		PicoClawHome: picoClawHome,
+		DotAgentHome: dotAgentHome,
 	}
 
 	result, err := Run(opts)
@@ -597,11 +569,11 @@ func TestRunDryRun(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	picoWs := filepath.Join(picoClawHome, "workspace")
+	picoWs := filepath.Join(dotAgentHome, "workspace")
 	if _, err := os.Stat(filepath.Join(picoWs, "SOUL.md")); !os.IsNotExist(err) {
 		t.Error("dry run should not create files")
 	}
-	if _, err := os.Stat(filepath.Join(picoClawHome, "config.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dotAgentHome, "config.json")); !os.IsNotExist(err) {
 		t.Error("dry run should not create config")
 	}
 
@@ -610,7 +582,7 @@ func TestRunDryRun(t *testing.T) {
 
 func TestRunFullMigration(t *testing.T) {
 	openclawHome := t.TempDir()
-	picoClawHome := t.TempDir()
+	dotAgentHome := t.TempDir()
 
 	wsDir := filepath.Join(openclawHome, "workspace")
 	os.MkdirAll(wsDir, 0755)
@@ -624,17 +596,14 @@ func TestRunFullMigration(t *testing.T) {
 
 	configData := map[string]interface{}{
 		"providers": map[string]interface{}{
-			"anthropic": map[string]interface{}{
-				"apiKey": "sk-ant-migrate-test",
-			},
 			"openrouter": map[string]interface{}{
 				"apiKey": "sk-or-migrate-test",
 			},
 		},
 		"channels": map[string]interface{}{
-			"telegram": map[string]interface{}{
+			"discord": map[string]interface{}{
 				"enabled": true,
-				"token":   "tg-migrate-test",
+				"token":   "disc-migrate-test",
 			},
 		},
 	}
@@ -644,7 +613,7 @@ func TestRunFullMigration(t *testing.T) {
 	opts := Options{
 		Force:        true,
 		OpenClawHome: openclawHome,
-		PicoClawHome: picoClawHome,
+		DotAgentHome: dotAgentHome,
 	}
 
 	result, err := Run(opts)
@@ -652,7 +621,7 @@ func TestRunFullMigration(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	picoWs := filepath.Join(picoClawHome, "workspace")
+	picoWs := filepath.Join(dotAgentHome, "workspace")
 
 	soulData, err := os.ReadFile(filepath.Join(picoWs, "SOUL.md"))
 	if err != nil {
@@ -678,21 +647,18 @@ func TestRunFullMigration(t *testing.T) {
 		t.Errorf("MEMORY.md content = %q", string(memData))
 	}
 
-	picoConfig, err := config.LoadConfig(filepath.Join(picoClawHome, "config.json"))
+	picoConfig, err := config.LoadConfig(filepath.Join(dotAgentHome, "config.json"))
 	if err != nil {
-		t.Fatalf("loading PicoClaw config: %v", err)
-	}
-	if picoConfig.Providers.Anthropic.APIKey != "sk-ant-migrate-test" {
-		t.Errorf("Anthropic.APIKey = %q, want %q", picoConfig.Providers.Anthropic.APIKey, "sk-ant-migrate-test")
+		t.Fatalf("loading DotAgent config: %v", err)
 	}
 	if picoConfig.Providers.OpenRouter.APIKey != "sk-or-migrate-test" {
 		t.Errorf("OpenRouter.APIKey = %q, want %q", picoConfig.Providers.OpenRouter.APIKey, "sk-or-migrate-test")
 	}
-	if !picoConfig.Channels.Telegram.Enabled {
-		t.Error("Telegram should be enabled")
+	if !picoConfig.Channels.Discord.Enabled {
+		t.Error("Discord should be enabled")
 	}
-	if picoConfig.Channels.Telegram.Token != "tg-migrate-test" {
-		t.Errorf("Telegram.Token = %q, want %q", picoConfig.Channels.Telegram.Token, "tg-migrate-test")
+	if picoConfig.Channels.Discord.Token != "disc-migrate-test" {
+		t.Errorf("Discord.Token = %q, want %q", picoConfig.Channels.Discord.Token, "disc-migrate-test")
 	}
 
 	if result.FilesCopied < 3 {
@@ -709,7 +675,7 @@ func TestRunFullMigration(t *testing.T) {
 func TestRunOpenClawNotFound(t *testing.T) {
 	opts := Options{
 		OpenClawHome: "/nonexistent/path/to/openclaw",
-		PicoClawHome: t.TempDir(),
+		DotAgentHome: t.TempDir(),
 	}
 
 	_, err := Run(opts)
@@ -771,7 +737,7 @@ func TestCopyFile(t *testing.T) {
 
 func TestRunConfigOnly(t *testing.T) {
 	openclawHome := t.TempDir()
-	picoClawHome := t.TempDir()
+	dotAgentHome := t.TempDir()
 
 	wsDir := filepath.Join(openclawHome, "workspace")
 	os.MkdirAll(wsDir, 0755)
@@ -779,7 +745,7 @@ func TestRunConfigOnly(t *testing.T) {
 
 	configData := map[string]interface{}{
 		"providers": map[string]interface{}{
-			"anthropic": map[string]interface{}{
+			"openrouter": map[string]interface{}{
 				"apiKey": "sk-config-only",
 			},
 		},
@@ -791,7 +757,7 @@ func TestRunConfigOnly(t *testing.T) {
 		Force:        true,
 		ConfigOnly:   true,
 		OpenClawHome: openclawHome,
-		PicoClawHome: picoClawHome,
+		DotAgentHome: dotAgentHome,
 	}
 
 	result, err := Run(opts)
@@ -803,7 +769,7 @@ func TestRunConfigOnly(t *testing.T) {
 		t.Error("config should have been migrated")
 	}
 
-	picoWs := filepath.Join(picoClawHome, "workspace")
+	picoWs := filepath.Join(dotAgentHome, "workspace")
 	if _, err := os.Stat(filepath.Join(picoWs, "SOUL.md")); !os.IsNotExist(err) {
 		t.Error("config-only should not copy workspace files")
 	}
@@ -811,7 +777,7 @@ func TestRunConfigOnly(t *testing.T) {
 
 func TestRunWorkspaceOnly(t *testing.T) {
 	openclawHome := t.TempDir()
-	picoClawHome := t.TempDir()
+	dotAgentHome := t.TempDir()
 
 	wsDir := filepath.Join(openclawHome, "workspace")
 	os.MkdirAll(wsDir, 0755)
@@ -819,7 +785,7 @@ func TestRunWorkspaceOnly(t *testing.T) {
 
 	configData := map[string]interface{}{
 		"providers": map[string]interface{}{
-			"anthropic": map[string]interface{}{
+			"openrouter": map[string]interface{}{
 				"apiKey": "sk-ws-only",
 			},
 		},
@@ -831,7 +797,7 @@ func TestRunWorkspaceOnly(t *testing.T) {
 		Force:         true,
 		WorkspaceOnly: true,
 		OpenClawHome:  openclawHome,
-		PicoClawHome:  picoClawHome,
+		DotAgentHome:  dotAgentHome,
 	}
 
 	result, err := Run(opts)
@@ -843,7 +809,7 @@ func TestRunWorkspaceOnly(t *testing.T) {
 		t.Error("workspace-only should not migrate config")
 	}
 
-	picoWs := filepath.Join(picoClawHome, "workspace")
+	picoWs := filepath.Join(dotAgentHome, "workspace")
 	soulData, err := os.ReadFile(filepath.Join(picoWs, "SOUL.md"))
 	if err != nil {
 		t.Fatalf("reading SOUL.md: %v", err)

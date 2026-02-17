@@ -1,8 +1,8 @@
-// PicoClaw - Ultra-lightweight personal AI agent
+// DotAgent - Ultra-lightweight personal AI agent
 // Inspired by and based on nanobot: https://github.com/HKUDS/nanobot
 // License: MIT
 //
-// Copyright (c) 2026 PicoClaw contributors
+// Copyright (c) 2026 DotAgent contributors
 
 package tools
 
@@ -11,9 +11,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/sipeed/picoclaw/pkg/logger"
-	"github.com/sipeed/picoclaw/pkg/providers"
-	"github.com/sipeed/picoclaw/pkg/utils"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
+	"github.com/dotsetgreg/dotagent/pkg/providers"
+	"github.com/dotsetgreg/dotagent/pkg/utils"
 )
 
 // ToolLoopConfig configures the tool execution loop.

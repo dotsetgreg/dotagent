@@ -28,13 +28,13 @@ Full forecast:
 curl -s "wttr.in/London?T"
 ```
 
-Format codes: `%c` condition · `%t` temp · `%h` humidity · `%w` wind · `%l` location · `%m` moon
+Format codes: `%c` condition, `%t` temp, `%h` humidity, `%w` wind, `%l` location, `%m` moon
 
 Tips:
 - URL-encode spaces: `wttr.in/New+York`
 - Airport codes: `wttr.in/JFK`
 - Units: `?m` (metric) `?u` (USCS)
-- Today only: `?1` · Current only: `?0`
+- Today only: `?1`, current only: `?0`
 - PNG: `curl -s "wttr.in/Berlin.png" -o /tmp/weather.png`
 
 ## Open-Meteo (fallback, JSON)

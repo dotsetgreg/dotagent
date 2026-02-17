@@ -20,8 +20,8 @@ Use this skill immediately when the user asks any of:
 ## Quick start
 
 ```bash
-summarize "https://example.com" --model google/gemini-3-flash-preview
-summarize "/path/to/file.pdf" --model google/gemini-3-flash-preview
+summarize "https://example.com" --model openai/gpt-5.2
+summarize "/path/to/file.pdf" --model openai/gpt-5.2
 summarize "https://youtu.be/dQw4w9WgXcQ" --youtube auto
 ```
 
@@ -37,13 +37,10 @@ If the user asked for a transcript but it’s huge, return a tight summary first
 
 ## Model + keys
 
-Set the API key for your chosen provider:
-- OpenAI: `OPENAI_API_KEY`
-- Anthropic: `ANTHROPIC_API_KEY`
-- xAI: `XAI_API_KEY`
-- Google: `GEMINI_API_KEY` (aliases: `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY`)
+Set your OpenRouter key:
+- `DOTAGENT_PROVIDERS_OPENROUTER_API_KEY`
 
-Default model is `google/gemini-3-flash-preview` if none is set.
+Default model should be `openai/gpt-5.2` if none is set.
 
 ## Useful flags
 

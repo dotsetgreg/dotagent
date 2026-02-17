@@ -8,14 +8,14 @@ build/
 *.dylib
 *.test
 *.out
-/picoclaw
-/picoclaw-test
-cmd/picoclaw/workspace
+/dotagent
+/dotagent-test
+cmd/dotagent/workspace
 
-# Picoclaw specific
+# DotAgent specific
 
-# PicoClaw
-.picoclaw/
+# DotAgent
+.dotagent/
 config.json
 sessions/
 build/

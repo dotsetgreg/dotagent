@@ -5,12 +5,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/constants"
-	"github.com/sipeed/picoclaw/pkg/devices/events"
-	"github.com/sipeed/picoclaw/pkg/devices/sources"
-	"github.com/sipeed/picoclaw/pkg/logger"
-	"github.com/sipeed/picoclaw/pkg/state"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/constants"
+	"github.com/dotsetgreg/dotagent/pkg/devices/events"
+	"github.com/dotsetgreg/dotagent/pkg/devices/sources"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
+	"github.com/dotsetgreg/dotagent/pkg/state"
 )
 
 type Service struct {

@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/config"
-	"github.com/sipeed/picoclaw/pkg/providers"
-	"github.com/sipeed/picoclaw/pkg/tools"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/config"
+	"github.com/dotsetgreg/dotagent/pkg/providers"
+	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
 
 // mockProvider is a simple mock LLM provider for testing

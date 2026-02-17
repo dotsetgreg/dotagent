@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
 )
 
 type Channel interface {
@@ -66,8 +66,7 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {
 			allowedUser = trimmed[idx+1:]
 		}
 
-		// Support either side using "id|username" compound form.
-		// This keeps backward compatibility with legacy Telegram allowlist entries.
+		// Support either side using "id|username" compound form for backward compatibility.
 		if senderID == allowed ||
 			idPart == allowed ||
 			senderID == trimmed ||

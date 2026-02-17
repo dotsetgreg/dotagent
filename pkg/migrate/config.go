@@ -8,27 +8,15 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/dotsetgreg/dotagent/pkg/config"
 )
 
 var supportedProviders = map[string]bool{
-	"anthropic":  true,
-	"openai":     true,
 	"openrouter": true,
-	"groq":       true,
-	"zhipu":      true,
-	"vllm":       true,
-	"gemini":     true,
 }
 
 var supportedChannels = map[string]bool{
-	"telegram": true,
-	"discord":  true,
-	"whatsapp": true,
-	"feishu":   true,
-	"qq":       true,
-	"dingtalk": true,
-	"maixcam":  true,
+	"discord": true,
 }
 
 func findOpenClawConfig(openclawHome string) (string, error) {
@@ -98,27 +86,14 @@ func ConvertConfig(data map[string]interface{}) (*config.Config, []string, error
 
 			if !supportedProviders[name] {
 				if apiKey != "" || apiBase != "" {
-					warnings = append(warnings, fmt.Sprintf("Provider '%s' not supported in PicoClaw, skipping", name))
+					warnings = append(warnings, fmt.Sprintf("Provider '%s' not supported in DotAgent, skipping", name))
 				}
 				continue
 			}
 
-			pc := config.ProviderConfig{APIKey: apiKey, APIBase: apiBase}
-			switch name {
-			case "anthropic":
-				cfg.Providers.Anthropic = pc
-			case "openai":
-				cfg.Providers.OpenAI = pc
-			case "openrouter":
-				cfg.Providers.OpenRouter = pc
-			case "groq":
-				cfg.Providers.Groq = pc
-			case "zhipu":
-				cfg.Providers.Zhipu = pc
-			case "vllm":
-				cfg.Providers.VLLM = pc
-			case "gemini":
-				cfg.Providers.Gemini = pc
+			cfg.Providers.OpenRouter = config.ProviderConfig{
+				APIKey:  apiKey,
+				APIBase: apiBase,
 			}
 		}
 	}
@@ -130,72 +105,18 @@ func ConvertConfig(data map[string]interface{}) (*config.Config, []string, error
 				continue
 			}
 			if !supportedChannels[name] {
-				warnings = append(warnings, fmt.Sprintf("Channel '%s' not supported in PicoClaw, skipping", name))
+				warnings = append(warnings, fmt.Sprintf("Channel '%s' not supported in DotAgent, skipping", name))
 				continue
 			}
 			enabled, _ := getBool(cMap, "enabled")
 			allowFrom := getStringSlice(cMap, "allow_from")
 
 			switch name {
-			case "telegram":
-				cfg.Channels.Telegram.Enabled = enabled
-				cfg.Channels.Telegram.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "token"); ok {
-					cfg.Channels.Telegram.Token = v
-				}
 			case "discord":
 				cfg.Channels.Discord.Enabled = enabled
 				cfg.Channels.Discord.AllowFrom = allowFrom
 				if v, ok := getString(cMap, "token"); ok {
 					cfg.Channels.Discord.Token = v
-				}
-			case "whatsapp":
-				cfg.Channels.WhatsApp.Enabled = enabled
-				cfg.Channels.WhatsApp.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "bridge_url"); ok {
-					cfg.Channels.WhatsApp.BridgeURL = v
-				}
-			case "feishu":
-				cfg.Channels.Feishu.Enabled = enabled
-				cfg.Channels.Feishu.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "app_id"); ok {
-					cfg.Channels.Feishu.AppID = v
-				}
-				if v, ok := getString(cMap, "app_secret"); ok {
-					cfg.Channels.Feishu.AppSecret = v
-				}
-				if v, ok := getString(cMap, "encrypt_key"); ok {
-					cfg.Channels.Feishu.EncryptKey = v
-				}
-				if v, ok := getString(cMap, "verification_token"); ok {
-					cfg.Channels.Feishu.VerificationToken = v
-				}
-			case "qq":
-				cfg.Channels.QQ.Enabled = enabled
-				cfg.Channels.QQ.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "app_id"); ok {
-					cfg.Channels.QQ.AppID = v
-				}
-				if v, ok := getString(cMap, "app_secret"); ok {
-					cfg.Channels.QQ.AppSecret = v
-				}
-			case "dingtalk":
-				cfg.Channels.DingTalk.Enabled = enabled
-				cfg.Channels.DingTalk.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "client_id"); ok {
-					cfg.Channels.DingTalk.ClientID = v
-				}
-				if v, ok := getString(cMap, "client_secret"); ok {
-					cfg.Channels.DingTalk.ClientSecret = v
-				}
-			case "maixcam":
-				cfg.Channels.MaixCam.Enabled = enabled
-				cfg.Channels.MaixCam.AllowFrom = allowFrom
-				if v, ok := getString(cMap, "host"); ok {
-					cfg.Channels.MaixCam.Host = v
-				}
-				if v, ok := getFloat(cMap, "port"); ok {
-					cfg.Channels.MaixCam.Port = int(v)
 				}
 			}
 		}
@@ -232,48 +153,12 @@ func ConvertConfig(data map[string]interface{}) (*config.Config, []string, error
 }
 
 func MergeConfig(existing, incoming *config.Config) *config.Config {
-	if existing.Providers.Anthropic.APIKey == "" {
-		existing.Providers.Anthropic = incoming.Providers.Anthropic
-	}
-	if existing.Providers.OpenAI.APIKey == "" {
-		existing.Providers.OpenAI = incoming.Providers.OpenAI
-	}
 	if existing.Providers.OpenRouter.APIKey == "" {
 		existing.Providers.OpenRouter = incoming.Providers.OpenRouter
 	}
-	if existing.Providers.Groq.APIKey == "" {
-		existing.Providers.Groq = incoming.Providers.Groq
-	}
-	if existing.Providers.Zhipu.APIKey == "" {
-		existing.Providers.Zhipu = incoming.Providers.Zhipu
-	}
-	if existing.Providers.VLLM.APIKey == "" && existing.Providers.VLLM.APIBase == "" {
-		existing.Providers.VLLM = incoming.Providers.VLLM
-	}
-	if existing.Providers.Gemini.APIKey == "" {
-		existing.Providers.Gemini = incoming.Providers.Gemini
-	}
 
-	if !existing.Channels.Telegram.Enabled && incoming.Channels.Telegram.Enabled {
-		existing.Channels.Telegram = incoming.Channels.Telegram
-	}
 	if !existing.Channels.Discord.Enabled && incoming.Channels.Discord.Enabled {
 		existing.Channels.Discord = incoming.Channels.Discord
-	}
-	if !existing.Channels.WhatsApp.Enabled && incoming.Channels.WhatsApp.Enabled {
-		existing.Channels.WhatsApp = incoming.Channels.WhatsApp
-	}
-	if !existing.Channels.Feishu.Enabled && incoming.Channels.Feishu.Enabled {
-		existing.Channels.Feishu = incoming.Channels.Feishu
-	}
-	if !existing.Channels.QQ.Enabled && incoming.Channels.QQ.Enabled {
-		existing.Channels.QQ = incoming.Channels.QQ
-	}
-	if !existing.Channels.DingTalk.Enabled && incoming.Channels.DingTalk.Enabled {
-		existing.Channels.DingTalk = incoming.Channels.DingTalk
-	}
-	if !existing.Channels.MaixCam.Enabled && incoming.Channels.MaixCam.Enabled {
-		existing.Channels.MaixCam = incoming.Channels.MaixCam
 	}
 
 	if existing.Tools.Web.Brave.APIKey == "" {
@@ -323,7 +208,7 @@ func convertKeysToSnake(data interface{}) interface{} {
 }
 
 func rewriteWorkspacePath(path string) string {
-	path = strings.Replace(path, ".openclaw", ".picoclaw", 1)
+	path = strings.Replace(path, ".openclaw", ".dotagent", 1)
 	return path
 }
 

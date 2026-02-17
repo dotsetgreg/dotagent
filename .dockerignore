@@ -1,7 +1,7 @@
 .git
 .gitignore
 build/
-.picoclaw/
+.dotagent/
 config/
 .env
 .env.example

@@ -1,8 +1,8 @@
-// PicoClaw - Ultra-lightweight personal AI agent
+// DotAgent - Ultra-lightweight personal AI agent
 // Inspired by and based on nanobot: https://github.com/HKUDS/nanobot
 // License: MIT
 //
-// Copyright (c) 2026 PicoClaw contributors
+// Copyright (c) 2026 DotAgent contributors
 
 package main
 
@@ -22,22 +22,20 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
-	"github.com/sipeed/picoclaw/pkg/agent"
-	"github.com/sipeed/picoclaw/pkg/auth"
-	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/channels"
-	"github.com/sipeed/picoclaw/pkg/config"
-	"github.com/sipeed/picoclaw/pkg/cron"
-	"github.com/sipeed/picoclaw/pkg/devices"
-	"github.com/sipeed/picoclaw/pkg/health"
-	"github.com/sipeed/picoclaw/pkg/heartbeat"
-	"github.com/sipeed/picoclaw/pkg/logger"
-	"github.com/sipeed/picoclaw/pkg/migrate"
-	"github.com/sipeed/picoclaw/pkg/providers"
-	"github.com/sipeed/picoclaw/pkg/skills"
-	"github.com/sipeed/picoclaw/pkg/state"
-	"github.com/sipeed/picoclaw/pkg/tools"
-	"github.com/sipeed/picoclaw/pkg/voice"
+	"github.com/dotsetgreg/dotagent/pkg/agent"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/channels"
+	"github.com/dotsetgreg/dotagent/pkg/config"
+	"github.com/dotsetgreg/dotagent/pkg/cron"
+	"github.com/dotsetgreg/dotagent/pkg/devices"
+	"github.com/dotsetgreg/dotagent/pkg/health"
+	"github.com/dotsetgreg/dotagent/pkg/heartbeat"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
+	"github.com/dotsetgreg/dotagent/pkg/migrate"
+	"github.com/dotsetgreg/dotagent/pkg/providers"
+	"github.com/dotsetgreg/dotagent/pkg/skills"
+	"github.com/dotsetgreg/dotagent/pkg/state"
+	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
 
 //go:generate cp -r ../../workspace .
@@ -75,7 +73,7 @@ func formatBuildInfo() (build string, goVer string) {
 }
 
 func printVersion() {
-	fmt.Printf("%s picoclaw %s\n", logo, formatVersion())
+	fmt.Printf("%s dotagent %s\n", logo, formatVersion())
 	build, goVer := formatBuildInfo()
 	if build != "" {
 		fmt.Printf("  Build: %s\n", build)
@@ -138,8 +136,6 @@ func main() {
 		statusCmd()
 	case "migrate":
 		migrateCmd()
-	case "auth":
-		authCmd()
 	case "cron":
 		cronCmd()
 	case "skills":
@@ -158,10 +154,10 @@ func main() {
 
 		workspace := cfg.WorkspacePath()
 		installer := skills.NewSkillInstaller(workspace)
-		// 获取全局配置目录和内置 skills 目录
+		// Resolve global config directory and builtin skills directory.
 		globalDir := filepath.Dir(getConfigPath())
 		globalSkillsDir := filepath.Join(globalDir, "skills")
-		builtinSkillsDir := filepath.Join(globalDir, "picoclaw", "skills")
+		builtinSkillsDir := filepath.Join(globalDir, "dotagent", "skills")
 		skillsLoader := skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir)
 
 		switch subcommand {
@@ -171,7 +167,7 @@ func main() {
 			skillsInstallCmd(installer)
 		case "remove", "uninstall":
 			if len(os.Args) < 4 {
-				fmt.Println("Usage: picoclaw skills remove <skill-name>")
+				fmt.Println("Usage: dotagent skills remove <skill-name>")
 				return
 			}
 			skillsRemoveCmd(installer, os.Args[3])
@@ -183,7 +179,7 @@ func main() {
 			skillsSearchCmd(installer)
 		case "show":
 			if len(os.Args) < 4 {
-				fmt.Println("Usage: picoclaw skills show <skill-name>")
+				fmt.Println("Usage: dotagent skills show <skill-name>")
 				return
 			}
 			skillsShowCmd(skillsLoader, os.Args[3])
@@ -201,17 +197,16 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Printf("%s picoclaw - Personal AI Assistant v%s\n\n", logo, version)
-	fmt.Println("Usage: picoclaw <command>")
+	fmt.Printf("%s dotagent - Personal AI Assistant v%s\n\n", logo, version)
+	fmt.Println("Usage: dotagent <command>")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  onboard     Initialize picoclaw configuration and workspace")
+	fmt.Println("  onboard     Initialize dotagent configuration and workspace")
 	fmt.Println("  agent       Interact with the agent directly")
-	fmt.Println("  auth        Manage authentication (login, logout, status)")
-	fmt.Println("  gateway     Start picoclaw gateway")
-	fmt.Println("  status      Show picoclaw status")
+	fmt.Println("  gateway     Start dotagent gateway")
+	fmt.Println("  status      Show dotagent status")
 	fmt.Println("  cron        Manage scheduled tasks")
-	fmt.Println("  migrate     Migrate from OpenClaw to PicoClaw")
+	fmt.Println("  migrate     Migrate from OpenClaw to DotAgent")
 	fmt.Println("  skills      Manage skills (install, list, remove)")
 	fmt.Println("  version     Show version information")
 }
@@ -239,11 +234,11 @@ func onboard() {
 	workspace := cfg.WorkspacePath()
 	createWorkspaceTemplates(workspace)
 
-	fmt.Printf("%s picoclaw is ready!\n", logo)
+	fmt.Printf("%s dotagent is ready!\n", logo)
 	fmt.Println("\nNext steps:")
 	fmt.Println("  1. Add your API key to", configPath)
 	fmt.Println("     Get one at: https://openrouter.ai/keys")
-	fmt.Println("  2. Chat: picoclaw agent -m \"Hello!\"")
+	fmt.Println("  2. Chat: dotagent agent -m \"Hello!\"")
 }
 
 func copyEmbeddedToTarget(targetDir string) error {
@@ -326,9 +321,9 @@ func migrateCmd() {
 				opts.OpenClawHome = args[i+1]
 				i++
 			}
-		case "--picoclaw-home":
+		case "--dotagent-home":
 			if i+1 < len(args) {
-				opts.PicoClawHome = args[i+1]
+				opts.DotAgentHome = args[i+1]
 				i++
 			}
 		default:
@@ -350,9 +345,9 @@ func migrateCmd() {
 }
 
 func migrateHelp() {
-	fmt.Println("\nMigrate from OpenClaw to PicoClaw")
+	fmt.Println("\nMigrate from OpenClaw to DotAgent")
 	fmt.Println()
-	fmt.Println("Usage: picoclaw migrate [options]")
+	fmt.Println("Usage: dotagent migrate [options]")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  --dry-run          Show what would be migrated without making changes")
@@ -361,13 +356,13 @@ func migrateHelp() {
 	fmt.Println("  --workspace-only   Only migrate workspace files, skip config")
 	fmt.Println("  --force            Skip confirmation prompts")
 	fmt.Println("  --openclaw-home    Override OpenClaw home directory (default: ~/.openclaw)")
-	fmt.Println("  --picoclaw-home    Override PicoClaw home directory (default: ~/.picoclaw)")
+	fmt.Println("  --dotagent-home    Override DotAgent home directory (default: ~/.dotagent)")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  picoclaw migrate              Detect and migrate from OpenClaw")
-	fmt.Println("  picoclaw migrate --dry-run    Show what would be migrated")
-	fmt.Println("  picoclaw migrate --refresh    Re-sync workspace files")
-	fmt.Println("  picoclaw migrate --force      Migrate without confirmation")
+	fmt.Println("  dotagent migrate              Detect and migrate from OpenClaw")
+	fmt.Println("  dotagent migrate --dry-run    Show what would be migrated")
+	fmt.Println("  dotagent migrate --refresh    Re-sync workspace files")
+	fmt.Println("  dotagent migrate --force      Migrate without confirmation")
 }
 
 func agentCmd() {
@@ -436,7 +431,7 @@ func interactiveMode(agentLoop *agent.AgentLoop, sessionKey string) {
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          prompt,
-		HistoryFile:     filepath.Join(os.TempDir(), ".picoclaw_history"),
+		HistoryFile:     filepath.Join(os.TempDir(), ".dotagent_history"),
 		HistoryLimit:    100,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
@@ -597,33 +592,6 @@ func gatewayCmd() {
 	// Inject channel manager into agent loop for command handling
 	agentLoop.SetChannelManager(channelManager)
 
-	var transcriber *voice.GroqTranscriber
-	if cfg.Providers.Groq.APIKey != "" {
-		transcriber = voice.NewGroqTranscriber(cfg.Providers.Groq.APIKey)
-		logger.InfoC("voice", "Groq voice transcription enabled")
-	}
-
-	if transcriber != nil {
-		if telegramChannel, ok := channelManager.GetChannel("telegram"); ok {
-			if tc, ok := telegramChannel.(*channels.TelegramChannel); ok {
-				tc.SetTranscriber(transcriber)
-				logger.InfoC("voice", "Groq transcription attached to Telegram channel")
-			}
-		}
-		if discordChannel, ok := channelManager.GetChannel("discord"); ok {
-			if dc, ok := discordChannel.(*channels.DiscordChannel); ok {
-				dc.SetTranscriber(transcriber)
-				logger.InfoC("voice", "Groq transcription attached to Discord channel")
-			}
-		}
-		if slackChannel, ok := channelManager.GetChannel("slack"); ok {
-			if sc, ok := slackChannel.(*channels.SlackChannel); ok {
-				sc.SetTranscriber(transcriber)
-				logger.InfoC("voice", "Groq transcription attached to Slack channel")
-			}
-		}
-	}
-
 	enabledChannels := channelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
 		fmt.Printf("✓ Channels enabled: %s\n", enabledChannels)
@@ -697,7 +665,7 @@ func statusCmd() {
 
 	configPath := getConfigPath()
 
-	fmt.Printf("%s picoclaw Status\n", logo)
+	fmt.Printf("%s dotagent Status\n", logo)
 	fmt.Printf("Version: %s\n", formatVersion())
 	build, _ := formatBuildInfo()
 	if build != "" {
@@ -721,270 +689,19 @@ func statusCmd() {
 	if _, err := os.Stat(configPath); err == nil {
 		fmt.Printf("Model: %s\n", cfg.Agents.Defaults.Model)
 
-		hasOpenRouter := cfg.Providers.OpenRouter.APIKey != ""
-		hasAnthropic := cfg.Providers.Anthropic.APIKey != ""
-		hasOpenAI := cfg.Providers.OpenAI.APIKey != ""
-		hasGemini := cfg.Providers.Gemini.APIKey != ""
-		hasZhipu := cfg.Providers.Zhipu.APIKey != ""
-		hasGroq := cfg.Providers.Groq.APIKey != ""
-		hasVLLM := cfg.Providers.VLLM.APIBase != ""
-
 		status := func(enabled bool) string {
 			if enabled {
 				return "✓"
 			}
 			return "not set"
 		}
-		fmt.Println("OpenRouter API:", status(hasOpenRouter))
-		fmt.Println("Anthropic API:", status(hasAnthropic))
-		fmt.Println("OpenAI API:", status(hasOpenAI))
-		fmt.Println("Gemini API:", status(hasGemini))
-		fmt.Println("Zhipu API:", status(hasZhipu))
-		fmt.Println("Groq API:", status(hasGroq))
-		if hasVLLM {
-			fmt.Printf("vLLM/Local: ✓ %s\n", cfg.Providers.VLLM.APIBase)
-		} else {
-			fmt.Println("vLLM/Local: not set")
-		}
-
-		store, _ := auth.LoadStore()
-		if store != nil && len(store.Credentials) > 0 {
-			fmt.Println("\nOAuth/Token Auth:")
-			for provider, cred := range store.Credentials {
-				status := "authenticated"
-				if cred.IsExpired() {
-					status = "expired"
-				} else if cred.NeedsRefresh() {
-					status = "needs refresh"
-				}
-				fmt.Printf("  %s (%s): %s\n", provider, cred.AuthMethod, status)
-			}
-		}
-	}
-}
-
-func authCmd() {
-	if len(os.Args) < 3 {
-		authHelp()
-		return
-	}
-
-	switch os.Args[2] {
-	case "login":
-		authLoginCmd()
-	case "logout":
-		authLogoutCmd()
-	case "status":
-		authStatusCmd()
-	default:
-		fmt.Printf("Unknown auth command: %s\n", os.Args[2])
-		authHelp()
-	}
-}
-
-func authHelp() {
-	fmt.Println("\nAuth commands:")
-	fmt.Println("  login       Login via OAuth or paste token")
-	fmt.Println("  logout      Remove stored credentials")
-	fmt.Println("  status      Show current auth status")
-	fmt.Println()
-	fmt.Println("Login options:")
-	fmt.Println("  --provider <name>    Provider to login with (openai, anthropic)")
-	fmt.Println("  --device-code        Use device code flow (for headless environments)")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  picoclaw auth login --provider openai")
-	fmt.Println("  picoclaw auth login --provider openai --device-code")
-	fmt.Println("  picoclaw auth login --provider anthropic")
-	fmt.Println("  picoclaw auth logout --provider openai")
-	fmt.Println("  picoclaw auth status")
-}
-
-func authLoginCmd() {
-	provider := ""
-	useDeviceCode := false
-
-	args := os.Args[3:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--provider", "-p":
-			if i+1 < len(args) {
-				provider = args[i+1]
-				i++
-			}
-		case "--device-code":
-			useDeviceCode = true
-		}
-	}
-
-	if provider == "" {
-		fmt.Println("Error: --provider is required")
-		fmt.Println("Supported providers: openai, anthropic")
-		return
-	}
-
-	switch provider {
-	case "openai":
-		authLoginOpenAI(useDeviceCode)
-	case "anthropic":
-		authLoginPasteToken(provider)
-	default:
-		fmt.Printf("Unsupported provider: %s\n", provider)
-		fmt.Println("Supported providers: openai, anthropic")
-	}
-}
-
-func authLoginOpenAI(useDeviceCode bool) {
-	cfg := auth.OpenAIOAuthConfig()
-
-	var cred *auth.AuthCredential
-	var err error
-
-	if useDeviceCode {
-		cred, err = auth.LoginDeviceCode(cfg)
-	} else {
-		cred, err = auth.LoginBrowser(cfg)
-	}
-
-	if err != nil {
-		fmt.Printf("Login failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := auth.SetCredential("openai", cred); err != nil {
-		fmt.Printf("Failed to save credentials: %v\n", err)
-		os.Exit(1)
-	}
-
-	appCfg, err := loadConfig()
-	if err == nil {
-		appCfg.Providers.OpenAI.AuthMethod = "oauth"
-		if err := config.SaveConfig(getConfigPath(), appCfg); err != nil {
-			fmt.Printf("Warning: could not update config: %v\n", err)
-		}
-	}
-
-	fmt.Println("Login successful!")
-	if cred.AccountID != "" {
-		fmt.Printf("Account: %s\n", cred.AccountID)
-	}
-}
-
-func authLoginPasteToken(provider string) {
-	cred, err := auth.LoginPasteToken(provider, os.Stdin)
-	if err != nil {
-		fmt.Printf("Login failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := auth.SetCredential(provider, cred); err != nil {
-		fmt.Printf("Failed to save credentials: %v\n", err)
-		os.Exit(1)
-	}
-
-	appCfg, err := loadConfig()
-	if err == nil {
-		switch provider {
-		case "anthropic":
-			appCfg.Providers.Anthropic.AuthMethod = "token"
-		case "openai":
-			appCfg.Providers.OpenAI.AuthMethod = "token"
-		}
-		if err := config.SaveConfig(getConfigPath(), appCfg); err != nil {
-			fmt.Printf("Warning: could not update config: %v\n", err)
-		}
-	}
-
-	fmt.Printf("Token saved for %s!\n", provider)
-}
-
-func authLogoutCmd() {
-	provider := ""
-
-	args := os.Args[3:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--provider", "-p":
-			if i+1 < len(args) {
-				provider = args[i+1]
-				i++
-			}
-		}
-	}
-
-	if provider != "" {
-		if err := auth.DeleteCredential(provider); err != nil {
-			fmt.Printf("Failed to remove credentials: %v\n", err)
-			os.Exit(1)
-		}
-
-		appCfg, err := loadConfig()
-		if err == nil {
-			switch provider {
-			case "openai":
-				appCfg.Providers.OpenAI.AuthMethod = ""
-			case "anthropic":
-				appCfg.Providers.Anthropic.AuthMethod = ""
-			}
-			config.SaveConfig(getConfigPath(), appCfg)
-		}
-
-		fmt.Printf("Logged out from %s\n", provider)
-	} else {
-		if err := auth.DeleteAllCredentials(); err != nil {
-			fmt.Printf("Failed to remove credentials: %v\n", err)
-			os.Exit(1)
-		}
-
-		appCfg, err := loadConfig()
-		if err == nil {
-			appCfg.Providers.OpenAI.AuthMethod = ""
-			appCfg.Providers.Anthropic.AuthMethod = ""
-			config.SaveConfig(getConfigPath(), appCfg)
-		}
-
-		fmt.Println("Logged out from all providers")
-	}
-}
-
-func authStatusCmd() {
-	store, err := auth.LoadStore()
-	if err != nil {
-		fmt.Printf("Error loading auth store: %v\n", err)
-		return
-	}
-
-	if len(store.Credentials) == 0 {
-		fmt.Println("No authenticated providers.")
-		fmt.Println("Run: picoclaw auth login --provider <name>")
-		return
-	}
-
-	fmt.Println("\nAuthenticated Providers:")
-	fmt.Println("------------------------")
-	for provider, cred := range store.Credentials {
-		status := "active"
-		if cred.IsExpired() {
-			status = "expired"
-		} else if cred.NeedsRefresh() {
-			status = "needs refresh"
-		}
-
-		fmt.Printf("  %s:\n", provider)
-		fmt.Printf("    Method: %s\n", cred.AuthMethod)
-		fmt.Printf("    Status: %s\n", status)
-		if cred.AccountID != "" {
-			fmt.Printf("    Account: %s\n", cred.AccountID)
-		}
-		if !cred.ExpiresAt.IsZero() {
-			fmt.Printf("    Expires: %s\n", cred.ExpiresAt.Format("2006-01-02 15:04"))
-		}
+		fmt.Println("OpenRouter API:", status(cfg.Providers.OpenRouter.APIKey != ""))
 	}
 }
 
 func getConfigPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".picoclaw", "config.json")
+	return filepath.Join(home, ".dotagent", "config.json")
 }
 
 func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) *cron.CronService {
@@ -1034,7 +751,7 @@ func cronCmd() {
 		cronAddCmd(cronStorePath)
 	case "remove":
 		if len(os.Args) < 4 {
-			fmt.Println("Usage: picoclaw cron remove <job_id>")
+			fmt.Println("Usage: dotagent cron remove <job_id>")
 			return
 		}
 		cronRemoveCmd(cronStorePath, os.Args[3])
@@ -1204,7 +921,7 @@ func cronRemoveCmd(storePath, jobID string) {
 
 func cronEnableCmd(storePath string, disable bool) {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: picoclaw cron enable/disable <job_id>")
+		fmt.Println("Usage: dotagent cron enable/disable <job_id>")
 		return
 	}
 
@@ -1235,11 +952,11 @@ func skillsHelp() {
 	fmt.Println("  show <name>             Show skill details")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  picoclaw skills list")
-	fmt.Println("  picoclaw skills install sipeed/picoclaw-skills/weather")
-	fmt.Println("  picoclaw skills install-builtin")
-	fmt.Println("  picoclaw skills list-builtin")
-	fmt.Println("  picoclaw skills remove weather")
+	fmt.Println("  dotagent skills list")
+	fmt.Println("  dotagent skills install dotsetgreg/dotagent-skills/weather")
+	fmt.Println("  dotagent skills install-builtin")
+	fmt.Println("  dotagent skills list-builtin")
+	fmt.Println("  dotagent skills remove weather")
 }
 
 func skillsListCmd(loader *skills.SkillsLoader) {
@@ -1262,8 +979,8 @@ func skillsListCmd(loader *skills.SkillsLoader) {
 
 func skillsInstallCmd(installer *skills.SkillInstaller) {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: picoclaw skills install <github-repo>")
-		fmt.Println("Example: picoclaw skills install sipeed/picoclaw-skills/weather")
+		fmt.Println("Usage: dotagent skills install <github-repo>")
+		fmt.Println("Example: dotagent skills install dotsetgreg/dotagent-skills/weather")
 		return
 	}
 
@@ -1293,7 +1010,7 @@ func skillsRemoveCmd(installer *skills.SkillInstaller, skillName string) {
 }
 
 func skillsInstallBuiltinCmd(workspace string) {
-	builtinSkillsDir := "./picoclaw/skills"
+	builtinSkillsDir := "./dotagent/skills"
 	workspaceSkillsDir := filepath.Join(workspace, "skills")
 
 	fmt.Printf("Copying builtin skills to workspace...\n")
@@ -1334,7 +1051,7 @@ func skillsListBuiltinCmd() {
 		fmt.Printf("Error loading config: %v\n", err)
 		return
 	}
-	builtinSkillsDir := filepath.Join(filepath.Dir(cfg.WorkspacePath()), "picoclaw", "skills")
+	builtinSkillsDir := filepath.Join(filepath.Dir(cfg.WorkspacePath()), "dotagent", "skills")
 
 	fmt.Println("\nAvailable Builtin Skills:")
 	fmt.Println("-----------------------")

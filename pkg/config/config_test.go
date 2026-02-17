@@ -34,6 +34,9 @@ func TestDefaultConfig_Model(t *testing.T) {
 	if cfg.Agents.Defaults.Model == "" {
 		t.Error("Model should not be empty")
 	}
+	if cfg.Agents.Defaults.Model != "openai/gpt-5.2" {
+		t.Errorf("Model = %q, want %q", cfg.Agents.Defaults.Model, "openai/gpt-5.2")
+	}
 }
 
 // TestDefaultConfig_MaxTokens verifies max tokens has default value
@@ -79,27 +82,9 @@ func TestDefaultConfig_Gateway(t *testing.T) {
 func TestDefaultConfig_Providers(t *testing.T) {
 	cfg := DefaultConfig()
 
-	// Verify all providers are empty by default
-	if cfg.Providers.Anthropic.APIKey != "" {
-		t.Error("Anthropic API key should be empty by default")
-	}
-	if cfg.Providers.OpenAI.APIKey != "" {
-		t.Error("OpenAI API key should be empty by default")
-	}
+	// Verify OpenRouter provider is empty by default.
 	if cfg.Providers.OpenRouter.APIKey != "" {
 		t.Error("OpenRouter API key should be empty by default")
-	}
-	if cfg.Providers.Groq.APIKey != "" {
-		t.Error("Groq API key should be empty by default")
-	}
-	if cfg.Providers.Zhipu.APIKey != "" {
-		t.Error("Zhipu API key should be empty by default")
-	}
-	if cfg.Providers.VLLM.APIKey != "" {
-		t.Error("VLLM API key should be empty by default")
-	}
-	if cfg.Providers.Gemini.APIKey != "" {
-		t.Error("Gemini API key should be empty by default")
 	}
 }
 
@@ -107,30 +92,9 @@ func TestDefaultConfig_Providers(t *testing.T) {
 func TestDefaultConfig_Channels(t *testing.T) {
 	cfg := DefaultConfig()
 
-	// Verify all channels are disabled by default
-	if cfg.Channels.WhatsApp.Enabled {
-		t.Error("WhatsApp should be disabled by default")
-	}
-	if cfg.Channels.Telegram.Enabled {
-		t.Error("Telegram should be disabled by default")
-	}
-	if cfg.Channels.Feishu.Enabled {
-		t.Error("Feishu should be disabled by default")
-	}
+	// Verify Discord channel is disabled by default
 	if cfg.Channels.Discord.Enabled {
 		t.Error("Discord should be disabled by default")
-	}
-	if cfg.Channels.MaixCam.Enabled {
-		t.Error("MaixCam should be disabled by default")
-	}
-	if cfg.Channels.QQ.Enabled {
-		t.Error("QQ should be disabled by default")
-	}
-	if cfg.Channels.DingTalk.Enabled {
-		t.Error("DingTalk should be disabled by default")
-	}
-	if cfg.Channels.Slack.Enabled {
-		t.Error("Slack should be disabled by default")
 	}
 }
 

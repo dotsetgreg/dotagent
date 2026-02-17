@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/providers"
 )
 
 // MockLLMProvider is a test implementation of LLMProvider
@@ -131,7 +131,7 @@ func TestSubagentTool_Execute_Success(t *testing.T) {
 	msgBus := bus.NewMessageBus()
 	manager := NewSubagentManager(provider, "test-model", "/tmp/test", msgBus)
 	tool := NewSubagentTool(manager)
-	tool.SetContext("telegram", "chat-123")
+	tool.SetContext("discord", "chat-123")
 
 	ctx := context.Background()
 	args := map[string]interface{}{

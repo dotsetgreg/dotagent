@@ -1,8 +1,8 @@
-// PicoClaw - Ultra-lightweight personal AI agent
+// DotAgent - Ultra-lightweight personal AI agent
 // Inspired by and based on nanobot: https://github.com/HKUDS/nanobot
 // License: MIT
 //
-// Copyright (c) 2026 PicoClaw contributors
+// Copyright (c) 2026 DotAgent contributors
 
 package heartbeat
 
@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/constants"
-	"github.com/sipeed/picoclaw/pkg/logger"
-	"github.com/sipeed/picoclaw/pkg/state"
-	"github.com/sipeed/picoclaw/pkg/tools"
+	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/constants"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
+	"github.com/dotsetgreg/dotagent/pkg/state"
+	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
 
 const (
@@ -259,7 +259,7 @@ This file contains tasks for the heartbeat service to check periodically.
 
 - Check for unread messages
 - Review upcoming calendar events
-- Check device status (e.g., MaixCam)
+- Check device status
 
 ## Instructions
 
@@ -323,7 +323,7 @@ func (hs *HeartbeatService) parseLastChannel(lastChannel string) (platform, user
 		return "", ""
 	}
 
-	// Parse channel format: "platform:user_id" (e.g., "telegram:123456")
+	// Parse channel format: "platform:user_id" (e.g., "discord:123456")
 	parts := strings.SplitN(lastChannel, ":", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		hs.logError("Invalid last channel format: %s", lastChannel)

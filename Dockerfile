@@ -1,5 +1,5 @@
 # ============================================================
-# Stage 1: Build the picoclaw binary
+# Stage 1: Build the dotagent binary
 # ============================================================
 FROM golang:1.26.0-alpine AS builder
 
@@ -27,10 +27,10 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget -q --spider http://localhost:18790/health || exit 1
 
 # Copy binary
-COPY --from=builder /src/build/picoclaw /usr/local/bin/picoclaw
+COPY --from=builder /src/build/dotagent /usr/local/bin/dotagent
 
-# Create picoclaw home directory
-RUN /usr/local/bin/picoclaw onboard
+# Create dotagent home directory
+RUN /usr/local/bin/dotagent onboard
 
-ENTRYPOINT ["picoclaw"]
+ENTRYPOINT ["dotagent"]
 CMD ["gateway"]
