@@ -110,11 +110,12 @@ type ConsolidationOp struct {
 
 // PromptContext is the memory context assembled for each LLM turn.
 type PromptContext struct {
-	History      []Message
-	Summary      string
-	RecallCards  []MemoryCard
-	RecallPrompt string
-	Budget       ContextBudget
+	History       []Message
+	Summary       string
+	PersonaPrompt string
+	RecallCards   []MemoryCard
+	RecallPrompt  string
+	Budget        ContextBudget
 }
 
 // Message is provider-agnostic prompt message representation.
@@ -135,8 +136,9 @@ type ContextBudget struct {
 
 // JobType values for background memory workers.
 const (
-	JobConsolidate = "consolidate"
-	JobCompact     = "compact"
+	JobConsolidate  = "consolidate"
+	JobPersonaApply = "persona_apply"
+	JobCompact      = "compact"
 )
 
 // JobStatus values.

@@ -149,15 +149,59 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		return strings.TrimSpace(resp.Content), nil
 	}
 
+	personaExtractFn := func(ctx context.Context, req memory.PersonaExtractionRequest) ([]memory.PersonaUpdateCandidate, error) {
+		existingRaw, _ := json.Marshal(req.ExistingProfile)
+		prompt := strings.TrimSpace(`Extract persona update candidates from this conversation turn.
+
+Return strict JSON only. No prose.
+Allowed schema:
+{
+  "candidates": [
+    {
+      "field_path": "user.name | user.timezone | user.location | user.language | user.communication_style | user.session_intent | user.goals | user.preferences.<key> | identity.goals | identity.boundaries | soul.voice | soul.communication_style | soul.values | soul.behavioral_rules",
+      "operation": "set | append | delete",
+      "value": "string (empty for delete)",
+      "confidence": 0.0,
+      "evidence": "short quote/paraphrase from turn"
+    }
+  ]
+}
+
+Rules:
+- Include only durable user personalization and stable behavior instructions.
+- Ignore secrets, credentials, or sensitive tokens.
+- Prefer fewer high-confidence candidates over many weak ones.
+- Do not emit duplicates.
+
+EXISTING PROFILE JSON:
+` + string(existingRaw) + `
+
+TURN TRANSCRIPT:
+` + req.Transcript)
+
+		resp, err := provider.Chat(ctx, []providers.Message{
+			{Role: "user", Content: prompt},
+		}, nil, cfg.Agents.Defaults.Model, map[string]interface{}{
+			"max_tokens":  900,
+			"temperature": 0.1,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return parsePersonaCandidatesResponse(resp.Content), nil
+	}
+
 	memSvc, err := memory.NewService(memory.Config{
-		Workspace:        workspace,
-		AgentID:          "dotagent",
-		MaxContextTokens: cfg.Agents.Defaults.MaxTokens,
-		MaxRecallItems:   cfg.Memory.MaxRecallItems,
-		CandidateLimit:   cfg.Memory.CandidateLimit,
-		RetrievalCache:   time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
-		WorkerLease:      time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
-		WorkerPoll:       time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+		Workspace:         workspace,
+		AgentID:           "dotagent",
+		MaxContextTokens:  cfg.Agents.Defaults.MaxTokens,
+		MaxRecallItems:    cfg.Memory.MaxRecallItems,
+		CandidateLimit:    cfg.Memory.CandidateLimit,
+		RetrievalCache:    time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
+		WorkerLease:       time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
+		WorkerPoll:        time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+		PersonaCardTokens: 480,
+		PersonaExtractor:  personaExtractFn,
 	}, summarizeFn)
 	if err != nil {
 		return nil, fmt.Errorf("initialize memory service: %w", err)
@@ -822,6 +866,79 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	}
 	result += "]"
 	return result
+}
+
+func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	type candidate struct {
+		FieldPath  string  `json:"field_path"`
+		Operation  string  `json:"operation"`
+		Value      string  `json:"value"`
+		Confidence float64 `json:"confidence"`
+		Evidence   string  `json:"evidence"`
+	}
+	type envelope struct {
+		Candidates []candidate `json:"candidates"`
+	}
+
+	parseCandidates := func(cands []candidate) []memory.PersonaUpdateCandidate {
+		out := make([]memory.PersonaUpdateCandidate, 0, len(cands))
+		for _, c := range cands {
+			field := strings.ToLower(strings.TrimSpace(c.FieldPath))
+			op := strings.ToLower(strings.TrimSpace(c.Operation))
+			if field == "" || op == "" {
+				continue
+			}
+			if op != "set" && op != "append" && op != "delete" {
+				continue
+			}
+			conf := c.Confidence
+			if conf <= 0 {
+				conf = 0.6
+			}
+			if conf > 1 {
+				conf = 1
+			}
+			out = append(out, memory.PersonaUpdateCandidate{
+				FieldPath:  field,
+				Operation:  op,
+				Value:      strings.TrimSpace(c.Value),
+				Confidence: conf,
+				Evidence:   strings.TrimSpace(c.Evidence),
+				Source:     "llm",
+			})
+		}
+		return out
+	}
+
+	var env envelope
+	if err := json.Unmarshal([]byte(raw), &env); err == nil && len(env.Candidates) > 0 {
+		return parseCandidates(env.Candidates)
+	}
+
+	var arr []candidate
+	if err := json.Unmarshal([]byte(raw), &arr); err == nil && len(arr) > 0 {
+		return parseCandidates(arr)
+	}
+
+	// Best effort extraction from markdown code fences or mixed output.
+	start := strings.IndexAny(raw, "[{")
+	end := strings.LastIndexAny(raw, "]}")
+	if start >= 0 && end > start {
+		candidateRaw := raw[start : end+1]
+		if err := json.Unmarshal([]byte(candidateRaw), &env); err == nil && len(env.Candidates) > 0 {
+			return parseCandidates(env.Candidates)
+		}
+		if err := json.Unmarshal([]byte(candidateRaw), &arr); err == nil && len(arr) > 0 {
+			return parseCandidates(arr)
+		}
+	}
+
+	return nil
 }
 
 func toProviderMessages(messages []memory.Message) []providers.Message {

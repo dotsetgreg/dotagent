@@ -22,11 +22,9 @@ INSTALL_PREFIX?=$(HOME)/.local
 INSTALL_BIN_DIR=$(INSTALL_PREFIX)/bin
 INSTALL_MAN_DIR=$(INSTALL_PREFIX)/share/man/man1
 
-# Workspace and Skills
+# Workspace
 DOTAGENT_HOME?=$(HOME)/.dotagent
 WORKSPACE_DIR?=$(DOTAGENT_HOME)/workspace
-WORKSPACE_SKILLS_DIR=$(WORKSPACE_DIR)/skills
-BUILTIN_SKILLS_DIR=$(CURDIR)/skills
 
 # OS detection
 UNAME_S:=$(shell uname -s)
@@ -89,7 +87,7 @@ build-all: generate
 	GOOS=windows GOARCH=amd64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./$(CMD_DIR)
 	@echo "All builds complete"
 
-## install: Install dotagent to system and copy builtin skills
+## install: Install dotagent to system
 install: build
 	@echo "Installing $(BINARY_NAME)..."
 	@mkdir -p $(INSTALL_BIN_DIR)
@@ -162,7 +160,6 @@ help:
 	@echo "  make build              # Build for current platform"
 	@echo "  make install            # Install to ~/.local/bin"
 	@echo "  make uninstall          # Remove from /usr/local/bin"
-	@echo "  make install-skills     # Install skills to workspace"
 	@echo ""
 	@echo "Environment Variables:"
 	@echo "  INSTALL_PREFIX          # Installation prefix (default: ~/.local)"

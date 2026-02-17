@@ -10,7 +10,6 @@ build/
 *.out
 /dotagent
 /dotagent-test
-cmd/dotagent/workspace
 
 # DotAgent specific
 

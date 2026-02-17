@@ -162,6 +162,64 @@ func (s *SQLiteStore) init() error {
 			created_at_ms INTEGER NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS memory_metrics_metric_idx ON memory_metrics(metric, created_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS persona_profiles (
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL,
+			profile_json TEXT NOT NULL,
+			revision INTEGER NOT NULL DEFAULT 1,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(user_id, agent_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS persona_candidates (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL,
+			session_key TEXT NOT NULL DEFAULT '',
+			turn_id TEXT NOT NULL DEFAULT '',
+			source_event_id TEXT NOT NULL DEFAULT '',
+			field_path TEXT NOT NULL,
+			operation TEXT NOT NULL,
+			value TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			evidence TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			rejected_reason TEXT NOT NULL DEFAULT '',
+			applied_revision_id TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			applied_at_ms INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE INDEX IF NOT EXISTS persona_candidates_status_idx ON persona_candidates(user_id, agent_id, status, created_at_ms DESC);`,
+		`CREATE INDEX IF NOT EXISTS persona_candidates_turn_idx ON persona_candidates(user_id, agent_id, session_key, turn_id, status, created_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS persona_revisions (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL,
+			session_key TEXT NOT NULL DEFAULT '',
+			turn_id TEXT NOT NULL DEFAULT '',
+			candidate_id TEXT NOT NULL DEFAULT '',
+			field_path TEXT NOT NULL,
+			operation TEXT NOT NULL,
+			old_value TEXT NOT NULL DEFAULT '',
+			new_value TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			evidence TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			profile_before_json TEXT NOT NULL DEFAULT '{}',
+			profile_after_json TEXT NOT NULL DEFAULT '{}',
+			created_at_ms INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS persona_revisions_profile_idx ON persona_revisions(user_id, agent_id, created_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS persona_signals (
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL,
+			field_path TEXT NOT NULL,
+			value_hash TEXT NOT NULL,
+			hits INTEGER NOT NULL DEFAULT 0,
+			last_seen_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(user_id, agent_id, field_path, value_hash)
+		);`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(item_id UNINDEXED, content, tokenize='unicode61 remove_diacritics 2');`,
 		`CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
 			INSERT INTO memory_items_fts(item_id, content) VALUES (new.id, new.content);
@@ -475,59 +533,21 @@ WHERE id = ?`, JobFailed, nowMS(), errMsg, compactionID)
 }
 
 func (s *SQLiteStore) UpsertMemoryItem(ctx context.Context, item MemoryItem) (MemoryItem, error) {
-	now := nowMS()
-	if item.ID == "" {
-		item.ID = "mem-" + uuid.NewString()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MemoryItem{}, fmt.Errorf("upsert memory item begin tx: %w", err)
 	}
-	if item.AgentID == "" {
-		item.AgentID = "dotagent"
-	}
-	if item.Key == "" {
-		item.Key = strings.ToLower(strings.TrimSpace(item.Content))
-	}
-	if item.FirstSeenAtMS == 0 {
-		item.FirstSeenAtMS = now
-	}
-	if item.LastSeenAtMS == 0 {
-		item.LastSeenAtMS = now
-	}
+	defer func() { _ = tx.Rollback() }()
 
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO memory_items(id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-ON CONFLICT(user_id, agent_id, kind, item_key) DO UPDATE SET
-	session_key = CASE WHEN excluded.session_key <> '' THEN excluded.session_key ELSE memory_items.session_key END,
-	content = excluded.content,
-	confidence = CASE WHEN excluded.confidence > memory_items.confidence THEN excluded.confidence ELSE memory_items.confidence END,
-	weight = (memory_items.weight + excluded.weight) / 2.0,
-	source_event_id = CASE WHEN excluded.source_event_id <> '' THEN excluded.source_event_id ELSE memory_items.source_event_id END,
-	last_seen_at_ms = excluded.last_seen_at_ms,
-	expires_at_ms = CASE WHEN excluded.expires_at_ms > 0 THEN excluded.expires_at_ms ELSE memory_items.expires_at_ms END,
-	deleted_at_ms = 0,
-	metadata_json = excluded.metadata_json`,
-		item.ID,
-		item.UserID,
-		item.AgentID,
-		item.SessionKey,
-		string(item.Kind),
-		item.Key,
-		item.Content,
-		item.Confidence,
-		item.Weight,
-		item.SourceEventID,
-		item.FirstSeenAtMS,
-		item.LastSeenAtMS,
-		item.ExpiresAtMS,
-		encodeMap(item.Metadata),
-	)
+	id, err := upsertMemoryItemTx(ctx, tx, item)
 	if err != nil {
 		return MemoryItem{}, fmt.Errorf("upsert memory item: %w", err)
 	}
 
-	row := s.db.QueryRowContext(ctx, `
+	row := tx.QueryRowContext(ctx, `
 SELECT id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
 FROM memory_items
-WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`, item.UserID, item.AgentID, string(item.Kind), item.Key)
+WHERE id = ?`, id)
 
 	var out MemoryItem
 	var kind string
@@ -553,6 +573,9 @@ WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`, item.UserID, 
 	}
 	out.Kind = MemoryItemKind(kind)
 	out.Metadata = decodeMap(metadataRaw)
+	if err := tx.Commit(); err != nil {
+		return MemoryItem{}, fmt.Errorf("upsert memory item commit: %w", err)
+	}
 	return out, nil
 }
 
@@ -928,4 +951,586 @@ VALUES(?, ?, ?, ?)`, metric, value, encodeMap(labels), nowMS())
 		return fmt.Errorf("add metric: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) GetPersonaProfile(ctx context.Context, userID, agentID string) (PersonaProfile, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT profile_json
+FROM persona_profiles
+WHERE user_id = ? AND agent_id = ?`, userID, agentID)
+	var raw string
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return defaultPersonaProfile(userID, agentID), nil
+		}
+		return PersonaProfile{}, fmt.Errorf("get persona profile: %w", err)
+	}
+	return profileFromJSON(raw, userID, agentID), nil
+}
+
+func (s *SQLiteStore) UpsertPersonaProfile(ctx context.Context, profile PersonaProfile) error {
+	if strings.TrimSpace(profile.UserID) == "" || strings.TrimSpace(profile.AgentID) == "" {
+		return fmt.Errorf("upsert persona profile: missing user_id/agent_id")
+	}
+	if profile.Revision <= 0 {
+		profile.Revision = 1
+	}
+	if profile.UpdatedAtMS <= 0 {
+		profile.UpdatedAtMS = nowMS()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO persona_profiles(user_id, agent_id, profile_json, revision, updated_at_ms)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(user_id, agent_id) DO UPDATE SET
+	profile_json = excluded.profile_json,
+	revision = excluded.revision,
+	updated_at_ms = excluded.updated_at_ms`,
+		profile.UserID,
+		profile.AgentID,
+		profileToJSON(profile),
+		profile.Revision,
+		profile.UpdatedAtMS,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert persona profile: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) InsertPersonaCandidates(ctx context.Context, candidates []PersonaUpdateCandidate) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("insert persona candidates begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO persona_candidates(
+	id, user_id, agent_id, session_key, turn_id, source_event_id,
+	field_path, operation, value, confidence, evidence, source, status,
+	rejected_reason, applied_revision_id, created_at_ms, applied_at_ms
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	confidence = CASE WHEN excluded.confidence > persona_candidates.confidence THEN excluded.confidence ELSE persona_candidates.confidence END,
+	evidence = CASE WHEN excluded.evidence <> '' THEN excluded.evidence ELSE persona_candidates.evidence END,
+	status = CASE WHEN persona_candidates.status = ? THEN persona_candidates.status ELSE excluded.status END`)
+	if err != nil {
+		return fmt.Errorf("insert persona candidates prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, c := range candidates {
+		if c.ID == "" {
+			c.ID = "pcd-" + uuid.NewString()
+		}
+		if c.Status == "" {
+			c.Status = personaCandidatePending
+		}
+		if c.CreatedAtMS == 0 {
+			c.CreatedAtMS = nowMS()
+		}
+		if _, err := stmt.ExecContext(
+			ctx,
+			c.ID,
+			c.UserID,
+			c.AgentID,
+			c.SessionKey,
+			c.TurnID,
+			c.SourceEventID,
+			c.FieldPath,
+			c.Operation,
+			c.Value,
+			c.Confidence,
+			c.Evidence,
+			c.Source,
+			c.Status,
+			c.RejectedReason,
+			c.AppliedRevisionID,
+			c.CreatedAtMS,
+			c.AppliedAtMS,
+			personaCandidateApplied,
+		); err != nil {
+			return fmt.Errorf("insert persona candidate: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("insert persona candidates commit: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListPersonaCandidates(ctx context.Context, userID, agentID, sessionKey, turnID, status string, limit int) ([]PersonaUpdateCandidate, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, user_id, agent_id, session_key, turn_id, source_event_id,
+	field_path, operation, value, confidence, evidence, source, status,
+	rejected_reason, applied_revision_id, created_at_ms, applied_at_ms
+FROM persona_candidates
+WHERE user_id = ? AND agent_id = ?
+AND (? = '' OR session_key = ?)
+AND (? = '' OR turn_id = ?)
+AND (? = '' OR status = ?)
+ORDER BY created_at_ms ASC
+LIMIT ?`,
+		userID, agentID,
+		sessionKey, sessionKey,
+		turnID, turnID,
+		status, status,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list persona candidates: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]PersonaUpdateCandidate, 0, limit)
+	for rows.Next() {
+		var c PersonaUpdateCandidate
+		if err := rows.Scan(
+			&c.ID,
+			&c.UserID,
+			&c.AgentID,
+			&c.SessionKey,
+			&c.TurnID,
+			&c.SourceEventID,
+			&c.FieldPath,
+			&c.Operation,
+			&c.Value,
+			&c.Confidence,
+			&c.Evidence,
+			&c.Source,
+			&c.Status,
+			&c.RejectedReason,
+			&c.AppliedRevisionID,
+			&c.CreatedAtMS,
+			&c.AppliedAtMS,
+		); err != nil {
+			return nil, fmt.Errorf("scan persona candidate: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate persona candidates: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) UpdatePersonaCandidateStatus(ctx context.Context, id, status, reason, revisionID string, appliedAtMS int64) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("update persona candidate status: empty id")
+	}
+	if strings.TrimSpace(status) == "" {
+		status = personaCandidateRejected
+	}
+	if appliedAtMS < 0 {
+		appliedAtMS = 0
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE persona_candidates
+SET status = ?, rejected_reason = ?, applied_revision_id = ?, applied_at_ms = ?
+WHERE id = ?`,
+		status, reason, revisionID, appliedAtMS, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update persona candidate status: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) BumpPersonaSignal(ctx context.Context, userID, agentID, fieldPath, valueHash string, atMS int64) (int, error) {
+	if atMS == 0 {
+		atMS = nowMS()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("bump persona signal begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO persona_signals(user_id, agent_id, field_path, value_hash, hits, last_seen_at_ms)
+VALUES(?, ?, ?, ?, 1, ?)
+ON CONFLICT(user_id, agent_id, field_path, value_hash) DO UPDATE SET
+	hits = persona_signals.hits + 1,
+	last_seen_at_ms = excluded.last_seen_at_ms`,
+		userID, agentID, fieldPath, valueHash, atMS,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("bump persona signal upsert: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, `
+SELECT hits
+FROM persona_signals
+WHERE user_id = ? AND agent_id = ? AND field_path = ? AND value_hash = ?`,
+		userID, agentID, fieldPath, valueHash,
+	)
+	var hits int
+	if err := row.Scan(&hits); err != nil {
+		return 0, fmt.Errorf("bump persona signal read: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("bump persona signal commit: %w", err)
+	}
+	return hits, nil
+}
+
+func (s *SQLiteStore) InsertPersonaRevision(ctx context.Context, rev PersonaRevision) error {
+	if rev.ID == "" {
+		rev.ID = "prv-" + uuid.NewString()
+	}
+	if rev.CreatedAtMS == 0 {
+		rev.CreatedAtMS = nowMS()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO persona_revisions(
+	id, user_id, agent_id, session_key, turn_id, candidate_id, field_path, operation,
+	old_value, new_value, confidence, evidence, reason, source,
+	profile_before_json, profile_after_json, created_at_ms
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rev.ID,
+		rev.UserID,
+		rev.AgentID,
+		rev.SessionKey,
+		rev.TurnID,
+		rev.CandidateID,
+		rev.FieldPath,
+		rev.Operation,
+		rev.OldValue,
+		rev.NewValue,
+		rev.Confidence,
+		rev.Evidence,
+		rev.Reason,
+		rev.Source,
+		rev.ProfileBeforeJSON,
+		rev.ProfileAfterJSON,
+		rev.CreatedAtMS,
+	)
+	if err != nil {
+		return fmt.Errorf("insert persona revision: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListPersonaRevisions(ctx context.Context, userID, agentID string, limit int) ([]PersonaRevision, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, user_id, agent_id, session_key, turn_id, candidate_id, field_path, operation,
+	old_value, new_value, confidence, evidence, reason, source,
+	profile_before_json, profile_after_json, created_at_ms
+FROM persona_revisions
+WHERE user_id = ? AND agent_id = ?
+ORDER BY created_at_ms DESC
+LIMIT ?`, userID, agentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list persona revisions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]PersonaRevision, 0, limit)
+	for rows.Next() {
+		var rev PersonaRevision
+		if err := rows.Scan(
+			&rev.ID,
+			&rev.UserID,
+			&rev.AgentID,
+			&rev.SessionKey,
+			&rev.TurnID,
+			&rev.CandidateID,
+			&rev.FieldPath,
+			&rev.Operation,
+			&rev.OldValue,
+			&rev.NewValue,
+			&rev.Confidence,
+			&rev.Evidence,
+			&rev.Reason,
+			&rev.Source,
+			&rev.ProfileBeforeJSON,
+			&rev.ProfileAfterJSON,
+			&rev.CreatedAtMS,
+		); err != nil {
+			return nil, fmt.Errorf("scan persona revision: %w", err)
+		}
+		out = append(out, rev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate persona revisions: %w", err)
+	}
+	return out, nil
+}
+
+// ApplyPersonaMutation atomically writes profile + revision + candidate status + memory links.
+func (s *SQLiteStore) ApplyPersonaMutation(ctx context.Context, profile PersonaProfile, candidate PersonaUpdateCandidate, revision PersonaRevision, memoryOps []ConsolidationOp) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("apply persona mutation begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if profile.Revision <= 0 {
+		profile.Revision = 1
+	}
+	if profile.UpdatedAtMS <= 0 {
+		profile.UpdatedAtMS = nowMS()
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO persona_profiles(user_id, agent_id, profile_json, revision, updated_at_ms)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(user_id, agent_id) DO UPDATE SET
+	profile_json = excluded.profile_json,
+	revision = excluded.revision,
+	updated_at_ms = excluded.updated_at_ms`,
+		profile.UserID,
+		profile.AgentID,
+		profileToJSON(profile),
+		profile.Revision,
+		profile.UpdatedAtMS,
+	); err != nil {
+		return fmt.Errorf("apply persona mutation profile: %w", err)
+	}
+
+	if revision.ID == "" {
+		revision.ID = "prv-" + uuid.NewString()
+	}
+	if revision.CreatedAtMS == 0 {
+		revision.CreatedAtMS = nowMS()
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO persona_revisions(
+	id, user_id, agent_id, session_key, turn_id, candidate_id, field_path, operation,
+	old_value, new_value, confidence, evidence, reason, source,
+	profile_before_json, profile_after_json, created_at_ms
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		revision.ID,
+		revision.UserID,
+		revision.AgentID,
+		revision.SessionKey,
+		revision.TurnID,
+		revision.CandidateID,
+		revision.FieldPath,
+		revision.Operation,
+		revision.OldValue,
+		revision.NewValue,
+		revision.Confidence,
+		revision.Evidence,
+		revision.Reason,
+		revision.Source,
+		revision.ProfileBeforeJSON,
+		revision.ProfileAfterJSON,
+		revision.CreatedAtMS,
+	); err != nil {
+		return fmt.Errorf("apply persona mutation revision: %w", err)
+	}
+
+	if candidate.ID != "" {
+		appliedAt := nowMS()
+		if _, err := tx.ExecContext(ctx, `
+UPDATE persona_candidates
+SET status = ?, rejected_reason = '', applied_revision_id = ?, applied_at_ms = ?
+WHERE id = ?`, personaCandidateApplied, revision.ID, appliedAt, candidate.ID); err != nil {
+			return fmt.Errorf("apply persona mutation candidate status: %w", err)
+		}
+	}
+
+	if len(memoryOps) > 0 {
+		rootKey := "persona/profile"
+		rootContent := "Persona profile revision: " + fmt.Sprintf("%d", profile.Revision)
+		rootID, err := upsertMemoryItemTx(ctx, tx, MemoryItem{
+			ID:            "mem-" + uuid.NewString(),
+			UserID:        profile.UserID,
+			AgentID:       profile.AgentID,
+			SessionKey:    candidate.SessionKey,
+			Kind:          MemoryProcedural,
+			Key:           rootKey,
+			Content:       rootContent,
+			Confidence:    0.9,
+			Weight:        1.0,
+			SourceEventID: candidate.SourceEventID,
+			FirstSeenAtMS: nowMS(),
+			LastSeenAtMS:  nowMS(),
+			Metadata:      map[string]string{"source": "persona"},
+		})
+		if err != nil {
+			return fmt.Errorf("apply persona mutation root memory item: %w", err)
+		}
+
+		for _, op := range memoryOps {
+			if op.Action == "delete" {
+				if _, err := tx.ExecContext(ctx, `
+UPDATE memory_items
+SET deleted_at_ms = ?
+WHERE user_id = ? AND agent_id = ? AND kind = ?
+AND (item_key = ? OR item_key LIKE ?)`,
+					nowMS(), profile.UserID, profile.AgentID, string(op.Kind), op.Key, op.Key+"/%"); err != nil {
+					return fmt.Errorf("apply persona mutation delete memory: %w", err)
+				}
+				continue
+			}
+
+			memID, err := upsertMemoryItemTx(ctx, tx, MemoryItem{
+				ID:            "mem-" + uuid.NewString(),
+				UserID:        profile.UserID,
+				AgentID:       profile.AgentID,
+				SessionKey:    candidate.SessionKey,
+				Kind:          op.Kind,
+				Key:           op.Key,
+				Content:       op.Content,
+				Confidence:    op.Confidence,
+				Weight:        1.0,
+				SourceEventID: candidate.SourceEventID,
+				FirstSeenAtMS: nowMS(),
+				LastSeenAtMS:  nowMS(),
+				Metadata:      op.Metadata,
+			})
+			if err != nil {
+				return fmt.Errorf("apply persona mutation memory item: %w", err)
+			}
+
+			if rootID != "" && rootID != memID {
+				linkID := "lnk-" + uuid.NewString()
+				if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_links(id, from_item_id, to_item_id, relation, weight, created_at_ms)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(from_item_id, to_item_id, relation) DO UPDATE SET
+	weight = excluded.weight`,
+					linkID, rootID, memID, "persona_field", 1.0, nowMS(),
+				); err != nil {
+					return fmt.Errorf("apply persona mutation memory link: %w", err)
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("apply persona mutation commit: %w", err)
+	}
+	return nil
+}
+
+func upsertMemoryItemTx(ctx context.Context, tx *sql.Tx, item MemoryItem) (string, error) {
+	if item.ID == "" {
+		item.ID = "mem-" + uuid.NewString()
+	}
+	if item.AgentID == "" {
+		item.AgentID = "dotagent"
+	}
+	if item.Key == "" {
+		item.Key = strings.ToLower(strings.TrimSpace(item.Content))
+	}
+	if item.FirstSeenAtMS == 0 {
+		item.FirstSeenAtMS = nowMS()
+	}
+	if item.LastSeenAtMS == 0 {
+		item.LastSeenAtMS = nowMS()
+	}
+
+	var existingID string
+	var existingConfidence float64
+	var existingWeight float64
+	var existingSource string
+	var existingSession string
+	var existingMeta string
+	row := tx.QueryRowContext(ctx, `
+SELECT id, confidence, weight, source_event_id, session_key, metadata_json
+FROM memory_items
+WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`,
+		item.UserID, item.AgentID, string(item.Kind), item.Key,
+	)
+	switch err := row.Scan(&existingID, &existingConfidence, &existingWeight, &existingSource, &existingSession, &existingMeta); {
+	case err == nil:
+		confidence := existingConfidence
+		if item.Confidence > confidence {
+			confidence = item.Confidence
+		}
+		weight := existingWeight
+		if weight == 0 {
+			weight = item.Weight
+		} else if item.Weight > 0 {
+			weight = (existingWeight + item.Weight) / 2.0
+		}
+		source := existingSource
+		if strings.TrimSpace(item.SourceEventID) != "" {
+			source = item.SourceEventID
+		}
+		session := existingSession
+		if strings.TrimSpace(item.SessionKey) != "" {
+			session = item.SessionKey
+		}
+		meta := existingMeta
+		if len(item.Metadata) > 0 {
+			meta = encodeMap(item.Metadata)
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE memory_items
+SET session_key = ?, confidence = ?, weight = ?, source_event_id = ?, last_seen_at_ms = ?, expires_at_ms = ?, deleted_at_ms = 0, metadata_json = ?
+WHERE id = ?`,
+			session,
+			confidence,
+			weight,
+			source,
+			item.LastSeenAtMS,
+			item.ExpiresAtMS,
+			meta,
+			existingID,
+		); err != nil {
+			return "", err
+		}
+		return existingID, nil
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_items(id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+			item.ID,
+			item.UserID,
+			item.AgentID,
+			item.SessionKey,
+			string(item.Kind),
+			item.Key,
+			item.Content,
+			item.Confidence,
+			item.Weight,
+			item.SourceEventID,
+			item.FirstSeenAtMS,
+			item.LastSeenAtMS,
+			item.ExpiresAtMS,
+			encodeMap(item.Metadata),
+		); err != nil {
+			return "", err
+		}
+		return item.ID, nil
+	default:
+		return "", err
+	}
+}
+
+func (s *SQLiteStore) RollbackPersonaToRevision(ctx context.Context, userID, agentID, revisionID string) (PersonaProfile, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT profile_before_json
+FROM persona_revisions
+WHERE id = ? AND user_id = ? AND agent_id = ?`, revisionID, userID, agentID)
+	var beforeRaw string
+	if err := row.Scan(&beforeRaw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PersonaProfile{}, fmt.Errorf("rollback persona: revision not found")
+		}
+		return PersonaProfile{}, fmt.Errorf("rollback persona: %w", err)
+	}
+	profile := profileFromJSON(beforeRaw, userID, agentID)
+	profile.Revision++
+	profile.UpdatedAtMS = nowMS()
+	if err := s.UpsertPersonaProfile(ctx, profile); err != nil {
+		return PersonaProfile{}, err
+	}
+	return profile, nil
 }

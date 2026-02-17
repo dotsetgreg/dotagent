@@ -130,22 +130,18 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 }
 
 func (cb *ContextBuilder) LoadBootstrapFiles() string {
-	bootstrapFiles := []string{
-		"AGENTS.md",
-		"SOUL.md",
-		"USER.md",
-		"IDENTITY.md",
-	}
-
-	var result string
-	for _, filename := range bootstrapFiles {
+	// Keep bootstrap static and minimal. Dynamic persona data is injected from
+	// memory/persona context to avoid duplicating identity content in prompts.
+	agentCandidates := []string{"AGENT.md", "AGENTS.md"}
+	for _, filename := range agentCandidates {
 		filePath := filepath.Join(cb.workspace, filename)
-		if data, err := os.ReadFile(filePath); err == nil {
-			result += fmt.Sprintf("## %s\n\n%s\n\n", filename, string(data))
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			continue
 		}
+		return fmt.Sprintf("## %s\n\n%s", filename, strings.TrimSpace(string(data)))
 	}
-
-	return result
+	return ""
 }
 
 func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary string, recalledMemory string, currentMessage string, media []string, channel, chatID string) []providers.Message {

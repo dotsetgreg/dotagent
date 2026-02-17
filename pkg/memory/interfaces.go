@@ -38,6 +38,17 @@ type Store interface {
 	RequeueExpiredJobs(ctx context.Context, nowMS int64) error
 
 	AddMetric(ctx context.Context, metric string, value float64, labels map[string]string) error
+
+	GetPersonaProfile(ctx context.Context, userID, agentID string) (PersonaProfile, error)
+	UpsertPersonaProfile(ctx context.Context, profile PersonaProfile) error
+	InsertPersonaCandidates(ctx context.Context, candidates []PersonaUpdateCandidate) error
+	ListPersonaCandidates(ctx context.Context, userID, agentID, sessionKey, turnID, status string, limit int) ([]PersonaUpdateCandidate, error)
+	UpdatePersonaCandidateStatus(ctx context.Context, id, status, reason, revisionID string, appliedAtMS int64) error
+	BumpPersonaSignal(ctx context.Context, userID, agentID, fieldPath, valueHash string, atMS int64) (int, error)
+	InsertPersonaRevision(ctx context.Context, rev PersonaRevision) error
+	ListPersonaRevisions(ctx context.Context, userID, agentID string, limit int) ([]PersonaRevision, error)
+	ApplyPersonaMutation(ctx context.Context, profile PersonaProfile, candidate PersonaUpdateCandidate, revision PersonaRevision, memoryOps []ConsolidationOp) error
+	RollbackPersonaToRevision(ctx context.Context, userID, agentID, revisionID string) (PersonaProfile, error)
 }
 
 // Retriever recalls memories for prompt construction.

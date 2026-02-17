@@ -151,7 +151,7 @@ func main() {
 
 		workspace := cfg.WorkspacePath()
 		installer := skills.NewSkillInstaller(workspace)
-		// Resolve global config directory and builtin skills directory.
+		// Resolve global config directory and optional bundled skills directory.
 		globalDir := filepath.Dir(getConfigPath())
 		globalSkillsDir := filepath.Join(globalDir, "skills")
 		builtinSkillsDir := filepath.Join(globalDir, "dotagent", "skills")
@@ -168,10 +168,6 @@ func main() {
 				return
 			}
 			skillsRemoveCmd(installer, os.Args[3])
-		case "install-builtin":
-			skillsInstallBuiltinCmd(workspace)
-		case "list-builtin":
-			skillsListBuiltinCmd()
 		case "search":
 			skillsSearchCmd(installer)
 		case "show":
@@ -913,19 +909,15 @@ func cronEnableCmd(storePath string, disable bool) {
 
 func skillsHelp() {
 	fmt.Println("\nSkills commands:")
-	fmt.Println("  list                    List installed skills")
-	fmt.Println("  install <repo>          Install skill from GitHub")
-	fmt.Println("  install-builtin          Install all builtin skills to workspace")
-	fmt.Println("  list-builtin             List available builtin skills")
-	fmt.Println("  remove <name>           Remove installed skill")
-	fmt.Println("  search                  Search available skills")
-	fmt.Println("  show <name>             Show skill details")
+	fmt.Println("  list            List installed skills")
+	fmt.Println("  install <repo>  Install skill from GitHub")
+	fmt.Println("  remove <name>   Remove installed skill")
+	fmt.Println("  search          Search available skills")
+	fmt.Println("  show <name>     Show skill details")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  dotagent skills list")
 	fmt.Println("  dotagent skills install dotsetgreg/dotagent-skills/weather")
-	fmt.Println("  dotagent skills install-builtin")
-	fmt.Println("  dotagent skills list-builtin")
 	fmt.Println("  dotagent skills remove weather")
 }
 
@@ -977,94 +969,6 @@ func skillsRemoveCmd(installer *skills.SkillInstaller, skillName string) {
 	}
 
 	fmt.Printf("✓ Skill '%s' removed successfully!\n", skillName)
-}
-
-func skillsInstallBuiltinCmd(workspace string) {
-	builtinSkillsDir := "./dotagent/skills"
-	workspaceSkillsDir := filepath.Join(workspace, "skills")
-
-	fmt.Printf("Copying builtin skills to workspace...\n")
-
-	skillsToInstall := []string{
-		"weather",
-		"news",
-		"stock",
-		"calculator",
-	}
-
-	for _, skillName := range skillsToInstall {
-		builtinPath := filepath.Join(builtinSkillsDir, skillName)
-		workspacePath := filepath.Join(workspaceSkillsDir, skillName)
-
-		if _, err := os.Stat(builtinPath); err != nil {
-			fmt.Printf("⊘ Builtin skill '%s' not found: %v\n", skillName, err)
-			continue
-		}
-
-		if err := os.MkdirAll(workspacePath, 0755); err != nil {
-			fmt.Printf("✗ Failed to create directory for %s: %v\n", skillName, err)
-			continue
-		}
-
-		if err := copyDirectory(builtinPath, workspacePath); err != nil {
-			fmt.Printf("✗ Failed to copy %s: %v\n", skillName, err)
-		}
-	}
-
-	fmt.Println("\n✓ All builtin skills installed!")
-	fmt.Println("Now you can use them in your workspace.")
-}
-
-func skillsListBuiltinCmd() {
-	cfg, err := loadConfig()
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		return
-	}
-	builtinSkillsDir := filepath.Join(filepath.Dir(cfg.WorkspacePath()), "dotagent", "skills")
-
-	fmt.Println("\nAvailable Builtin Skills:")
-	fmt.Println("-----------------------")
-
-	entries, err := os.ReadDir(builtinSkillsDir)
-	if err != nil {
-		fmt.Printf("Error reading builtin skills: %v\n", err)
-		return
-	}
-
-	if len(entries) == 0 {
-		fmt.Println("No builtin skills available.")
-		return
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			skillName := entry.Name()
-			skillFile := filepath.Join(builtinSkillsDir, skillName, "SKILL.md")
-
-			description := "No description"
-			if _, err := os.Stat(skillFile); err == nil {
-				data, err := os.ReadFile(skillFile)
-				if err == nil {
-					content := string(data)
-					if idx := strings.Index(content, "\n"); idx > 0 {
-						firstLine := content[:idx]
-						if strings.Contains(firstLine, "description:") {
-							descLine := strings.Index(content[idx:], "\n")
-							if descLine > 0 {
-								description = strings.TrimSpace(content[idx+descLine : idx+descLine])
-							}
-						}
-					}
-				}
-			}
-			status := "✓"
-			fmt.Printf("  %s  %s\n", status, entry.Name())
-			if description != "" {
-				fmt.Printf("     %s\n", description)
-			}
-		}
-	}
 }
 
 func skillsSearchCmd(installer *skills.SkillInstaller) {

@@ -179,7 +179,7 @@ func TestScheduleTurnMaintenance_DeduplicatesJobs(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM memory_jobs`).Scan(&jobs); err != nil {
 		t.Fatalf("count jobs: %v", err)
 	}
-	if jobs != 3 {
-		t.Fatalf("expected 3 deduplicated jobs (2 consolidate + 1 compact), got %d", jobs)
+	if jobs != 5 {
+		t.Fatalf("expected 5 deduplicated jobs (2 consolidate + 2 persona_apply + 1 compact), got %d", jobs)
 	}
 }

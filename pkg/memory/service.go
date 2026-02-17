@@ -13,14 +13,16 @@ import (
 
 // Config configures the memory subsystem.
 type Config struct {
-	Workspace        string
-	AgentID          string
-	MaxContextTokens int
-	MaxRecallItems   int
-	CandidateLimit   int
-	RetrievalCache   time.Duration
-	WorkerLease      time.Duration
-	WorkerPoll       time.Duration
+	Workspace         string
+	AgentID           string
+	MaxContextTokens  int
+	MaxRecallItems    int
+	CandidateLimit    int
+	RetrievalCache    time.Duration
+	WorkerLease       time.Duration
+	WorkerPoll        time.Duration
+	PersonaCardTokens int
+	PersonaExtractor  PersonaExtractionFunc
 }
 
 // Service is the orchestrator for memory capture, retrieval and compaction.
@@ -31,6 +33,7 @@ type Service struct {
 	consolidator Consolidator
 	compactor    Compactor
 	policy       Policy
+	persona      *PersonaManager
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -64,6 +67,9 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if cfg.WorkerPoll <= 0 {
 		cfg.WorkerPoll = 800 * time.Millisecond
 	}
+	if cfg.PersonaCardTokens <= 0 {
+		cfg.PersonaCardTokens = 480
+	}
 
 	dbPath := filepath.Join(cfg.Workspace, "state", "memory.db")
 	store, err := NewSQLiteStore(dbPath)
@@ -79,6 +85,7 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 		retriever:    NewHybridRetriever(store, policy),
 		consolidator: NewHeuristicConsolidator(store, policy),
 		compactor:    NewSessionCompactor(store, summarize),
+		persona:      NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor),
 		stopCh:       make(chan struct{}),
 	}
 
@@ -146,18 +153,43 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		"user_id":     userID,
 	})
 
+	personaPrompt := ""
+	if s.persona != nil {
+		pp, pErr := s.persona.BuildPrompt(ctx, userID, s.cfg.AgentID, query, s.cfg.PersonaCardTokens)
+		if pErr == nil {
+			personaPrompt = strings.TrimSpace(pp)
+		}
+	}
+
+	recallPrompt := formatRecallCards(recallCards, budget.MemoryTokens)
+	if personaPrompt != "" {
+		if recallPrompt != "" {
+			recallPrompt = personaPrompt + "\n\n" + recallPrompt
+		} else {
+			recallPrompt = personaPrompt
+		}
+	}
+
 	return PromptContext{
-		History:      history,
-		Summary:      summary,
-		RecallCards:  recallCards,
-		RecallPrompt: formatRecallCards(recallCards, budget.MemoryTokens),
-		Budget:       budget,
+		History:       history,
+		Summary:       summary,
+		PersonaPrompt: personaPrompt,
+		RecallCards:   recallCards,
+		RecallPrompt:  recallPrompt,
+		Budget:        budget,
 	}, nil
 }
 
 func (s *Service) ForceCompact(ctx context.Context, sessionKey, userID string, maxTokens int) error {
 	budget := DeriveContextBudget(maxTokens)
 	return s.compactor.CompactSession(ctx, sessionKey, userID, s.cfg.AgentID, budget)
+}
+
+func (s *Service) RollbackPersona(ctx context.Context, userID string) error {
+	if s.persona == nil {
+		return nil
+	}
+	return s.persona.RollbackLastRevision(ctx, userID, s.cfg.AgentID)
 }
 
 func (s *Service) ScheduleTurnMaintenance(ctx context.Context, sessionKey, turnID, userID string) {
@@ -173,6 +205,20 @@ func (s *Service) ScheduleTurnMaintenance(ctx context.Context, sessionKey, turnI
 			"user_id": userID,
 		},
 		RunAfterMS:  now,
+		CreatedAtMS: now,
+		UpdatedAtMS: now,
+	})
+	_ = s.store.EnqueueJob(ctx, Job{
+		ID:         maintenanceJobID(JobPersonaApply, sessionKey, turnID),
+		JobType:    JobPersonaApply,
+		SessionKey: sessionKey,
+		Status:     JobPending,
+		Priority:   55,
+		Payload: map[string]string{
+			"turn_id": turnID,
+			"user_id": userID,
+		},
+		RunAfterMS:  now + 200,
 		CreatedAtMS: now,
 		UpdatedAtMS: now,
 	})
@@ -245,7 +291,23 @@ func (s *Service) handleJob(ctx context.Context, job Job) error {
 		if strings.TrimSpace(turnID) == "" || strings.TrimSpace(userID) == "" {
 			return fmt.Errorf("invalid consolidate job payload")
 		}
-		return s.consolidator.ConsolidateTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
+		if err := s.consolidator.ConsolidateTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID); err != nil {
+			return err
+		}
+		if s.persona != nil {
+			return s.persona.EmitCandidatesForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
+		}
+		return nil
+	case JobPersonaApply:
+		turnID := job.Payload["turn_id"]
+		userID := job.Payload["user_id"]
+		if strings.TrimSpace(turnID) == "" || strings.TrimSpace(userID) == "" {
+			return fmt.Errorf("invalid persona apply job payload")
+		}
+		if s.persona == nil {
+			return nil
+		}
+		return s.persona.ApplyPendingForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
 	case JobCompact:
 		userID := job.Payload["user_id"]
 		if strings.TrimSpace(userID) == "" {

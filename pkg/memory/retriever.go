@@ -27,6 +27,7 @@ func (r *HybridRetriever) Recall(ctx context.Context, query string, opts Retriev
 	if query == "" {
 		return nil, nil
 	}
+	intent := detectQueryIntent(query)
 	if opts.NowMS == 0 {
 		opts.NowMS = time.Now().UnixMilli()
 	}
@@ -115,7 +116,40 @@ func (r *HybridRetriever) Recall(ctx context.Context, query string, opts Retriev
 
 	ordered := make([]*scored, 0, len(scores))
 	for _, s := range scores {
-		s.score = 0.45*s.lexical + 0.45*s.vector + 0.10*s.recency
+		lexicalWeight := 0.45
+		vectorWeight := 0.45
+		recencyWeight := 0.10
+		switch intent {
+		case "task":
+			lexicalWeight = 0.40
+			vectorWeight = 0.35
+			recencyWeight = 0.25
+		case "preference":
+			lexicalWeight = 0.38
+			vectorWeight = 0.42
+			recencyWeight = 0.20
+		case "identity", "style":
+			lexicalWeight = 0.48
+			vectorWeight = 0.42
+			recencyWeight = 0.10
+		}
+
+		s.score = lexicalWeight*s.lexical + vectorWeight*s.vector + recencyWeight*s.recency
+
+		switch intent {
+		case "task":
+			if s.item.Kind == MemoryTaskState {
+				s.score += 0.18
+			}
+		case "preference":
+			if s.item.Kind == MemoryUserPreference {
+				s.score += 0.18
+			}
+		case "identity", "style":
+			if s.item.Kind == MemorySemanticFact || s.item.Kind == MemoryProcedural {
+				s.score += 0.14
+			}
+		}
 		if s.item.Weight > 0 {
 			s.score *= math.Min(1.5, 0.9+0.1*s.item.Weight)
 		}

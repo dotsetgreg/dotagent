@@ -4,6 +4,7 @@ DotAgent is a Go-based personal agent runtime with:
 - Messaging: Discord
 - LLM provider: OpenRouter
 - Memory: unified SQLite store (`workspace/state/memory.db`)
+- Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 
 ## Requirements
 
@@ -52,12 +53,45 @@ Discord gateway:
 ./dotagent gateway
 ```
 
+Headless gateway management with Docker Compose:
+
+```bash
+# Start in background
+docker compose --profile gateway up -d dotagent-gateway
+
+# Check service status
+docker compose ps dotagent-gateway
+
+# Stream logs
+docker compose logs -f dotagent-gateway
+
+# Restart
+docker compose restart dotagent-gateway
+
+# Stop / start
+docker compose stop dotagent-gateway
+docker compose start dotagent-gateway
+```
+
 ## Config Notes
 
 - Provider is OpenRouter (`agents.defaults.provider=openrouter`)
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2`
 - Canonical memory DB: `~/.dotagent/workspace/state/memory.db`
+- Canonical persona profile and revision history are stored in the same SQLite DB
+
+## Persona System
+
+DotAgent now runs a first-class persona layer that is fully integrated with memory:
+
+- Canonical persona profile in SQLite (single source of truth)
+- Automatic candidate extraction from conversation turns (heuristic + model-assisted)
+- Stability checks, contradiction checks, and sensitive-data guardrails before applying updates
+- Revision log with rollback support
+- Deterministic rendering of `IDENTITY.md`, `SOUL.md`, and `USER.md`
+- Reverse import: manual edits to those files are merged back into canonical profile
+- Persona prompt card is injected into context with token budgeting and cache
 
 ## Environment Variables
 
@@ -88,6 +122,10 @@ dotagent cron
 dotagent skills
 dotagent version
 ```
+
+Skill notes:
+- DotAgent no longer ships pre-bundled workspace skills.
+- Install skills when needed with `dotagent skills install <owner/repo-or-path>`.
 
 ## Test
 
