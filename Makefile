@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall clean help test test-memory memory-eval memory-canary
+.PHONY: all build install uninstall clean help test test-memory test-persona memory-eval memory-canary
 
 # Build variables
 BINARY_NAME=dotagent
@@ -128,6 +128,10 @@ test:
 ## test-memory: Run memory + agent continuity tests
 test-memory:
 	@$(GO) test ./pkg/memory ./pkg/agent
+
+## test-persona: Run persona-focused reliability tests
+test-persona:
+	@$(GO) test ./pkg/memory -run "TestPersona|TestPersonalizationEval|TestPersonaApplySync" -count=1
 
 ## memory-eval: Run long-horizon continuity evaluation suite
 memory-eval:

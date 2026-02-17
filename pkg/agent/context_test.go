@@ -47,3 +47,12 @@ func TestLoadBootstrapFiles_FallbacksToAgentsMD(t *testing.T) {
 		t.Fatalf("expected AGENTS.md fallback content to load")
 	}
 }
+
+func TestBuildSystemPrompt_DoesNotHardcodeAssistantName(t *testing.T) {
+	ws := t.TempDir()
+	cb := NewContextBuilder(ws)
+	prompt := cb.BuildSystemPrompt()
+	if strings.Contains(strings.ToLower(prompt), "you are dotagent") {
+		t.Fatalf("expected system prompt to avoid hardcoded assistant identity, got: %s", prompt)
+	}
+}

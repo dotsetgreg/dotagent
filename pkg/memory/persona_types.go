@@ -14,6 +14,25 @@ const (
 	personaCandidateDeferred = "deferred"
 )
 
+type PersonaFileSyncMode string
+
+const (
+	PersonaFileSyncExportOnly   PersonaFileSyncMode = "export_only"
+	PersonaFileSyncImportExport PersonaFileSyncMode = "import_export"
+	PersonaFileSyncDisabled     PersonaFileSyncMode = "disabled"
+)
+
+func NormalizePersonaFileSyncMode(raw string) PersonaFileSyncMode {
+	switch PersonaFileSyncMode(strings.ToLower(strings.TrimSpace(raw))) {
+	case PersonaFileSyncImportExport:
+		return PersonaFileSyncImportExport
+	case PersonaFileSyncDisabled:
+		return PersonaFileSyncDisabled
+	default:
+		return PersonaFileSyncExportOnly
+	}
+}
+
 // PersonaProfile is the canonical user-facing personalization document.
 // It is the single durable source of truth for persona state.
 type PersonaProfile struct {
@@ -29,18 +48,20 @@ type PersonaProfile struct {
 }
 
 type PersonaIdentity struct {
-	AgentName  string   `json:"agent_name"`
-	Role       string   `json:"role"`
-	Purpose    string   `json:"purpose"`
-	Goals      []string `json:"goals"`
-	Boundaries []string `json:"boundaries"`
+	AgentName  string            `json:"agent_name"`
+	Role       string            `json:"role"`
+	Purpose    string            `json:"purpose"`
+	Goals      []string          `json:"goals"`
+	Boundaries []string          `json:"boundaries"`
+	Attributes map[string]string `json:"attributes"`
 }
 
 type PersonaSoul struct {
-	Voice           string   `json:"voice"`
-	Communication   string   `json:"communication_style"`
-	Values          []string `json:"values"`
-	BehavioralRules []string `json:"behavioral_rules"`
+	Voice           string            `json:"voice"`
+	Communication   string            `json:"communication_style"`
+	Values          []string          `json:"values"`
+	BehavioralRules []string          `json:"behavioral_rules"`
+	Attributes      map[string]string `json:"attributes"`
 }
 
 type PersonaUser struct {
@@ -52,6 +73,7 @@ type PersonaUser struct {
 	Goals              []string          `json:"goals"`
 	Preferences        map[string]string `json:"preferences"`
 	SessionIntent      string            `json:"session_intent"`
+	Attributes         map[string]string `json:"attributes"`
 }
 
 func defaultPersonaProfile(userID, agentID string) PersonaProfile {
@@ -73,6 +95,7 @@ func defaultPersonaProfile(userID, agentID string) PersonaProfile {
 				"Never fabricate actions",
 				"Never expose or retain sensitive secrets",
 			},
+			Attributes: map[string]string{},
 		},
 		Soul: PersonaSoul{
 			Voice:         "Grounded, direct, and helpful",
@@ -86,9 +109,11 @@ func defaultPersonaProfile(userID, agentID string) PersonaProfile {
 				"State assumptions explicitly",
 				"Prefer deterministic and testable behavior",
 			},
+			Attributes: map[string]string{},
 		},
 		User: PersonaUser{
 			Preferences: map[string]string{},
+			Attributes:  map[string]string{},
 		},
 	}
 }
@@ -99,12 +124,86 @@ func (p PersonaProfile) clone() PersonaProfile {
 	out.Identity.Boundaries = append([]string{}, p.Identity.Boundaries...)
 	out.Soul.Values = append([]string{}, p.Soul.Values...)
 	out.Soul.BehavioralRules = append([]string{}, p.Soul.BehavioralRules...)
+	out.Identity.Attributes = map[string]string{}
+	for k, v := range p.Identity.Attributes {
+		out.Identity.Attributes[k] = v
+	}
+	out.Soul.Attributes = map[string]string{}
+	for k, v := range p.Soul.Attributes {
+		out.Soul.Attributes[k] = v
+	}
 	out.User.Goals = append([]string{}, p.User.Goals...)
 	out.User.Preferences = map[string]string{}
 	for k, v := range p.User.Preferences {
 		out.User.Preferences[k] = v
 	}
+	out.User.Attributes = map[string]string{}
+	for k, v := range p.User.Attributes {
+		out.User.Attributes[k] = v
+	}
 	return out
+}
+
+type PersonaDecision string
+
+const (
+	PersonaDecisionAccepted PersonaDecision = "accepted"
+	PersonaDecisionRejected PersonaDecision = "rejected"
+	PersonaDecisionDeferred PersonaDecision = "deferred"
+)
+
+type PersonaCandidateDecision struct {
+	CandidateID string          `json:"candidate_id"`
+	FieldPath   string          `json:"field_path"`
+	Operation   string          `json:"operation"`
+	Value       string          `json:"value"`
+	Confidence  float64         `json:"confidence"`
+	Decision    PersonaDecision `json:"decision"`
+	ReasonCode  string          `json:"reason_code"`
+	Source      string          `json:"source"`
+}
+
+type PersonaApplyReport struct {
+	SessionKey string                     `json:"session_key"`
+	TurnID     string                     `json:"turn_id"`
+	UserID     string                     `json:"user_id"`
+	AgentID    string                     `json:"agent_id"`
+	Decisions  []PersonaCandidateDecision `json:"decisions"`
+	AppliedAt  int64                      `json:"applied_at_ms"`
+}
+
+func (r PersonaApplyReport) AcceptedCount() int {
+	total := 0
+	for _, d := range r.Decisions {
+		if d.Decision == PersonaDecisionAccepted {
+			total++
+		}
+	}
+	return total
+}
+
+func (r PersonaApplyReport) RejectedCount() int {
+	total := 0
+	for _, d := range r.Decisions {
+		if d.Decision == PersonaDecisionRejected {
+			total++
+		}
+	}
+	return total
+}
+
+func (r PersonaApplyReport) DeferredCount() int {
+	total := 0
+	for _, d := range r.Decisions {
+		if d.Decision == PersonaDecisionDeferred {
+			total++
+		}
+	}
+	return total
+}
+
+func (r PersonaApplyReport) HasAccepted() bool {
+	return r.AcceptedCount() > 0
 }
 
 // PersonaUpdateCandidate is a proposed profile mutation extracted from a turn.
@@ -190,8 +289,17 @@ func profileFromJSON(raw string, userID, agentID string) PersonaProfile {
 	if strings.TrimSpace(p.AgentID) == "" {
 		p.AgentID = agentID
 	}
+	if p.Identity.Attributes == nil {
+		p.Identity.Attributes = map[string]string{}
+	}
+	if p.Soul.Attributes == nil {
+		p.Soul.Attributes = map[string]string{}
+	}
 	if p.User.Preferences == nil {
 		p.User.Preferences = map[string]string{}
+	}
+	if p.User.Attributes == nil {
+		p.User.Attributes = map[string]string{}
 	}
 	if p.Revision <= 0 {
 		p.Revision = 1

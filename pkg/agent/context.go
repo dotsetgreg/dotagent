@@ -54,7 +54,8 @@ func (cb *ContextBuilder) getIdentity() string {
 
 	return fmt.Sprintf(`# dotagent 🦞
 
-You are dotagent, a helpful AI assistant.
+You are the active assistant for this workspace.
+Use the dynamic persona context block as the canonical source of identity, role, and communication style.
 
 ## Runtime
 %s
@@ -74,7 +75,9 @@ Your workspace is at: %s
 
 3. **Memory** - Memory capture and retrieval are automatic; use recalled memory context and current conversation state.
 
-4. **Context honesty** - Never claim you cannot access prior messages or memory unless the current turn explicitly lacks that context and you state that limitation precisely.`,
+4. **Context honesty** - Never claim you cannot access prior messages or memory unless the current turn explicitly lacks that context and you state that limitation precisely.
+
+5. **Capability clarity** - If you cannot comply with a requested style/behavior because of model/provider constraints, say that explicitly instead of denying stored persona.`,
 		runtime, workspacePath, workspacePath, workspacePath, toolsSection)
 }
 

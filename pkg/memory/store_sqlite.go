@@ -238,6 +238,13 @@ func (s *SQLiteStore) init() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS persona_candidates_status_idx ON persona_candidates(user_id, agent_id, status, created_at_ms DESC);`,
 		`CREATE INDEX IF NOT EXISTS persona_candidates_turn_idx ON persona_candidates(user_id, agent_id, session_key, turn_id, status, created_at_ms DESC);`,
+		`DELETE FROM persona_candidates
+WHERE rowid NOT IN (
+	SELECT MAX(rowid)
+	FROM persona_candidates
+	GROUP BY user_id, agent_id, session_key, turn_id, field_path, operation, value
+);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS persona_candidates_unique_key ON persona_candidates(user_id, agent_id, session_key, turn_id, field_path, operation, value);`,
 		`CREATE TABLE IF NOT EXISTS persona_revisions (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL,
@@ -1664,9 +1671,11 @@ INSERT INTO persona_candidates(
 	rejected_reason, applied_revision_id, created_at_ms, applied_at_ms
 )
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
+ON CONFLICT(user_id, agent_id, session_key, turn_id, field_path, operation, value) DO UPDATE SET
 	confidence = CASE WHEN excluded.confidence > persona_candidates.confidence THEN excluded.confidence ELSE persona_candidates.confidence END,
 	evidence = CASE WHEN excluded.evidence <> '' THEN excluded.evidence ELSE persona_candidates.evidence END,
+	source_event_id = CASE WHEN excluded.source_event_id <> '' THEN excluded.source_event_id ELSE persona_candidates.source_event_id END,
+	source = CASE WHEN excluded.source <> '' THEN excluded.source ELSE persona_candidates.source END,
 	status = CASE WHEN persona_candidates.status = ? THEN persona_candidates.status ELSE excluded.status END`)
 	if err != nil {
 		return fmt.Errorf("insert persona candidates prepare: %w", err)

@@ -17,19 +17,23 @@ import (
 
 // Config configures the memory subsystem.
 type Config struct {
-	Workspace         string
-	AgentID           string
-	EmbeddingModel    string
-	MaxContextTokens  int
-	MaxRecallItems    int
-	CandidateLimit    int
-	RetrievalCache    time.Duration
-	WorkerLease       time.Duration
-	WorkerPoll        time.Duration
-	PersonaCardTokens int
-	PersonaExtractor  PersonaExtractionFunc
-	EventRetention    time.Duration
-	AuditRetention    time.Duration
+	Workspace            string
+	AgentID              string
+	EmbeddingModel       string
+	MaxContextTokens     int
+	MaxRecallItems       int
+	CandidateLimit       int
+	RetrievalCache       time.Duration
+	WorkerLease          time.Duration
+	WorkerPoll           time.Duration
+	PersonaCardTokens    int
+	PersonaExtractor     PersonaExtractionFunc
+	PersonaSyncApply     bool
+	PersonaFileSync      PersonaFileSyncMode
+	PersonaPolicyMode    string
+	PersonaMinConfidence float64
+	EventRetention       time.Duration
+	AuditRetention       time.Duration
 }
 
 // Service is the orchestrator for memory capture, retrieval and compaction.
@@ -85,6 +89,15 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if cfg.PersonaCardTokens <= 0 {
 		cfg.PersonaCardTokens = 480
 	}
+	if cfg.PersonaFileSync == "" {
+		cfg.PersonaFileSync = PersonaFileSyncExportOnly
+	}
+	if strings.TrimSpace(cfg.PersonaPolicyMode) == "" {
+		cfg.PersonaPolicyMode = "balanced"
+	}
+	if cfg.PersonaMinConfidence <= 0 {
+		cfg.PersonaMinConfidence = 0.52
+	}
 	if cfg.EventRetention <= 0 {
 		cfg.EventRetention = 90 * 24 * time.Hour
 	}
@@ -100,6 +113,11 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	}
 	policy := NewDefaultPolicy()
 
+	personaPolicy := NewPersonaPolicyEngine(PersonaPolicyConfig{
+		Mode:          cfg.PersonaPolicyMode,
+		MinConfidence: cfg.PersonaMinConfidence,
+	})
+
 	svc := &Service{
 		cfg:           cfg,
 		store:         store,
@@ -107,7 +125,7 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 		retriever:     NewHybridRetriever(store, policy),
 		consolidator:  NewHeuristicConsolidator(store, policy),
 		compactor:     NewSessionCompactor(store, summarize),
-		persona:       NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor),
+		persona:       NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor, cfg.PersonaFileSync, personaPolicy),
 		stopCh:        make(chan struct{}),
 		snapshots:     map[string][]Event{},
 		snapshotLimit: 128,
@@ -398,6 +416,88 @@ func (s *Service) RollbackPersona(ctx context.Context, userID string) error {
 	return s.persona.RollbackLastRevision(ctx, userID, s.cfg.AgentID)
 }
 
+func (s *Service) GetPersonaProfile(ctx context.Context, userID string) (PersonaProfile, error) {
+	if s.persona == nil {
+		return defaultPersonaProfile(userID, s.cfg.AgentID), nil
+	}
+	return s.store.GetPersonaProfile(ctx, userID, s.cfg.AgentID)
+}
+
+func (s *Service) ListPersonaCandidates(ctx context.Context, userID, sessionKey, turnID, status string, limit int) ([]PersonaUpdateCandidate, error) {
+	return s.store.ListPersonaCandidates(ctx, userID, s.cfg.AgentID, sessionKey, turnID, status, limit)
+}
+
+func (s *Service) ListPersonaRevisions(ctx context.Context, userID string, limit int) ([]PersonaRevision, error) {
+	return s.store.ListPersonaRevisions(ctx, userID, s.cfg.AgentID, limit)
+}
+
+func (s *Service) ApplyPersonaDirectivesSync(ctx context.Context, sessionKey, turnID, userID string) (PersonaApplyReport, error) {
+	report := PersonaApplyReport{
+		SessionKey: sessionKey,
+		TurnID:     turnID,
+		UserID:     userID,
+		AgentID:    s.cfg.AgentID,
+		AppliedAt:  time.Now().UnixMilli(),
+	}
+	if s.persona == nil || !s.cfg.PersonaSyncApply {
+		return report, nil
+	}
+	start := time.Now()
+	if err := s.persona.EmitCandidatesForTurn(ctx, sessionKey, turnID, userID, s.cfg.AgentID); err != nil {
+		_ = s.store.AddMetric(ctx, "memory.persona.apply_sync.error", 1, map[string]string{
+			"session_key": sessionKey,
+			"user_id":     userID,
+			"stage":       "emit",
+		})
+		return report, err
+	}
+	applyReport, err := s.persona.ApplyPendingForTurn(ctx, sessionKey, turnID, userID, s.cfg.AgentID)
+	if err != nil {
+		_ = s.store.AddMetric(ctx, "memory.persona.apply_sync.error", 1, map[string]string{
+			"session_key": sessionKey,
+			"user_id":     userID,
+			"stage":       "apply",
+		})
+		return report, err
+	}
+	if applyReport.SessionKey == "" {
+		applyReport.SessionKey = sessionKey
+	}
+	if applyReport.TurnID == "" {
+		applyReport.TurnID = turnID
+	}
+	if applyReport.UserID == "" {
+		applyReport.UserID = userID
+	}
+	if applyReport.AgentID == "" {
+		applyReport.AgentID = s.cfg.AgentID
+	}
+	if applyReport.AppliedAt == 0 {
+		applyReport.AppliedAt = time.Now().UnixMilli()
+	}
+	_ = s.store.AddMetric(ctx, "memory.persona.apply.attempted", float64(len(applyReport.Decisions)), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	_ = s.store.AddMetric(ctx, "memory.persona.apply.accepted", float64(applyReport.AcceptedCount()), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	_ = s.store.AddMetric(ctx, "memory.persona.apply.rejected", float64(applyReport.RejectedCount()), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	_ = s.store.AddMetric(ctx, "memory.persona.apply.deferred", float64(applyReport.DeferredCount()), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	_ = s.store.AddMetric(ctx, "memory.persona.apply_sync.latency_ms", float64(time.Since(start).Milliseconds()), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	return applyReport, nil
+}
+
 func (s *Service) ScheduleTurnMaintenance(ctx context.Context, sessionKey, turnID, userID string) {
 	now := time.Now().UnixMilli()
 	_ = s.store.EnqueueJob(ctx, Job{
@@ -532,7 +632,13 @@ func (s *Service) handleJob(ctx context.Context, job Job) error {
 		if s.persona == nil {
 			return nil
 		}
-		return s.persona.ApplyPendingForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
+		// Ensure deterministic per-turn ordering by deriving candidates again before apply.
+		// This makes persona_apply idempotent even if consolidate has not run yet.
+		if err := s.persona.EmitCandidatesForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID); err != nil {
+			return err
+		}
+		_, err := s.persona.ApplyPendingForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
+		return err
 	case JobCompact:
 		userID := job.Payload["user_id"]
 		if strings.TrimSpace(userID) == "" {

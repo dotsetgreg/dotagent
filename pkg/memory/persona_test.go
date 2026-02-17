@@ -25,9 +25,10 @@ func TestPersonaApplyAndRender(t *testing.T) {
 	ctx := context.Background()
 	ws := t.TempDir()
 	svc, err := NewService(Config{
-		Workspace:  ws,
-		AgentID:    "dotagent",
-		WorkerPoll: 40 * time.Millisecond,
+		Workspace:       ws,
+		AgentID:         "dotagent",
+		WorkerPoll:      40 * time.Millisecond,
+		PersonaFileSync: PersonaFileSyncImportExport,
 	}, nil)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -155,9 +156,10 @@ func TestPersonaRollback(t *testing.T) {
 	ctx := context.Background()
 	ws := t.TempDir()
 	svc, err := NewService(Config{
-		Workspace:  ws,
-		AgentID:    "dotagent",
-		WorkerPoll: 40 * time.Millisecond,
+		Workspace:       ws,
+		AgentID:         "dotagent",
+		WorkerPoll:      40 * time.Millisecond,
+		PersonaFileSync: PersonaFileSyncImportExport,
 	}, nil)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -202,9 +204,10 @@ func TestPersonaFileImportMerge(t *testing.T) {
 	ctx := context.Background()
 	ws := t.TempDir()
 	svc, err := NewService(Config{
-		Workspace:  ws,
-		AgentID:    "dotagent",
-		WorkerPoll: 40 * time.Millisecond,
+		Workspace:       ws,
+		AgentID:         "dotagent",
+		WorkerPoll:      40 * time.Millisecond,
+		PersonaFileSync: PersonaFileSyncImportExport,
 	}, nil)
 	if err != nil {
 		t.Fatalf("new service: %v", err)

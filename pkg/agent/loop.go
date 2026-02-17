@@ -158,19 +158,20 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 Return strict JSON only. No prose.
 Allowed schema:
 {
-  "candidates": [
-    {
-      "field_path": "user.name | user.timezone | user.location | user.language | user.communication_style | user.session_intent | user.goals | user.preferences.<key> | identity.goals | identity.boundaries | soul.voice | soul.communication_style | soul.values | soul.behavioral_rules",
-      "operation": "set | append | delete",
-      "value": "string (empty for delete)",
-      "confidence": 0.0,
-      "evidence": "short quote/paraphrase from turn"
+	  "candidates": [
+	    {
+	      "field_path": "user.name | user.timezone | user.location | user.language | user.communication_style | user.session_intent | user.goals | user.preferences.<key> | user.attributes.<key> | identity.agent_name | identity.role | identity.purpose | identity.goals | identity.boundaries | identity.attributes.<key> | soul.voice | soul.communication_style | soul.values | soul.behavioral_rules | soul.attributes.<key>",
+	      "operation": "set | append | delete",
+	      "value": "string (empty for delete)",
+	      "confidence": 0.0,
+	      "evidence": "short quote/paraphrase from turn"
     }
   ]
 }
 
 Rules:
 - Include only durable user personalization and stable behavior instructions.
+- Capture explicit second-person directives when the user sets assistant identity/style.
 - Ignore secrets, credentials, or sensitive tokens.
 - Prefer fewer high-confidence candidates over many weak ones.
 - Do not emit duplicates.
@@ -194,19 +195,23 @@ TURN TRANSCRIPT:
 	}
 
 	memSvc, err := memory.NewService(memory.Config{
-		Workspace:         workspace,
-		AgentID:           "dotagent",
-		EmbeddingModel:    cfg.Memory.EmbeddingModel,
-		MaxContextTokens:  cfg.Agents.Defaults.MaxTokens,
-		MaxRecallItems:    cfg.Memory.MaxRecallItems,
-		CandidateLimit:    cfg.Memory.CandidateLimit,
-		RetrievalCache:    time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
-		WorkerLease:       time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
-		WorkerPoll:        time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
-		EventRetention:    time.Duration(cfg.Memory.EventRetentionDays) * 24 * time.Hour,
-		AuditRetention:    time.Duration(cfg.Memory.AuditRetentionDays) * 24 * time.Hour,
-		PersonaCardTokens: 480,
-		PersonaExtractor:  personaExtractFn,
+		Workspace:            workspace,
+		AgentID:              "dotagent",
+		EmbeddingModel:       cfg.Memory.EmbeddingModel,
+		MaxContextTokens:     cfg.Agents.Defaults.MaxTokens,
+		MaxRecallItems:       cfg.Memory.MaxRecallItems,
+		CandidateLimit:       cfg.Memory.CandidateLimit,
+		RetrievalCache:       time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
+		WorkerLease:          time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
+		WorkerPoll:           time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+		EventRetention:       time.Duration(cfg.Memory.EventRetentionDays) * 24 * time.Hour,
+		AuditRetention:       time.Duration(cfg.Memory.AuditRetentionDays) * 24 * time.Hour,
+		PersonaCardTokens:    480,
+		PersonaExtractor:     personaExtractFn,
+		PersonaSyncApply:     cfg.Memory.PersonaSyncApply,
+		PersonaFileSync:      memory.NormalizePersonaFileSyncMode(cfg.Memory.PersonaFileSyncMode),
+		PersonaPolicyMode:    cfg.Memory.PersonaPolicyMode,
+		PersonaMinConfidence: cfg.Memory.PersonaMinConfidence,
 	}, summarizeFn)
 	if err != nil {
 		return nil, fmt.Errorf("initialize memory service: %w", err)
@@ -458,7 +463,50 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		}
 	}
 
-	// 2. Build messages (skip history for heartbeat)
+	// 2. Persist user event immediately (before prompt assembly) so same-turn
+	// persona directives can be applied synchronously and reflected in the next response.
+	turnID := "turn-" + uuid.NewString()
+	seq := 1
+	recordedUserTurn := false
+	var syncPersonaReport memory.PersonaApplyReport
+	if !opts.NoHistory {
+		if _, _, err := al.memory.RecordUserTurn(ctx, memory.Event{
+			SessionKey: opts.SessionKey,
+			TurnID:     turnID,
+			Seq:        seq,
+			Role:       "user",
+			Content:    opts.UserMessage,
+			Metadata: map[string]string{
+				"channel": opts.Channel,
+				"chat_id": opts.ChatID,
+				"user_id": opts.UserID,
+			},
+		}, opts.UserID); err != nil {
+			logger.ErrorCF("agent", "Failed to record user turn", map[string]interface{}{
+				"error":       err.Error(),
+				"session_key": opts.SessionKey,
+				"turn_id":     turnID,
+			})
+		} else {
+			recordedUserTurn = true
+		}
+		seq++
+
+		if recordedUserTurn {
+			report, applyErr := al.memory.ApplyPersonaDirectivesSync(ctx, opts.SessionKey, turnID, opts.UserID)
+			if applyErr != nil {
+				logger.WarnCF("agent", "Synchronous persona apply failed", map[string]interface{}{
+					"error":       applyErr.Error(),
+					"session_key": opts.SessionKey,
+					"turn_id":     turnID,
+				})
+			} else {
+				syncPersonaReport = report
+			}
+		}
+	}
+
+	// 3. Build messages (skip history for heartbeat)
 	var history []providers.Message
 	var summary string
 	var recall string
@@ -479,43 +527,26 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 			recall = promptCtx.RecallPrompt
 		}
 	}
+	currentUserPrompt := opts.UserMessage
+	if !opts.NoHistory && recordedUserTurn && historyContainsUserMessage(history, opts.UserMessage) {
+		// Current user turn is already in persisted history; avoid duplicate copy.
+		currentUserPrompt = ""
+	}
 	messages := al.contextBuilder.BuildMessages(
 		history,
 		summary,
 		recall,
-		opts.UserMessage,
+		currentUserPrompt,
 		nil,
 		opts.Channel,
 		opts.ChatID,
 	)
-
-	// 3. Persist user event immediately
-	turnID := "turn-" + uuid.NewString()
-	seq := 1
-	if !opts.NoHistory {
-		if _, _, err := al.memory.RecordUserTurn(ctx, memory.Event{
-			SessionKey: opts.SessionKey,
-			TurnID:     turnID,
-			Seq:        seq,
-			Role:       "user",
-			Content:    opts.UserMessage,
-			Metadata: map[string]string{
-				"channel": opts.Channel,
-				"chat_id": opts.ChatID,
-				"user_id": opts.UserID,
-			},
-		}, opts.UserID); err != nil {
-			logger.ErrorCF("agent", "Failed to record user turn", map[string]interface{}{
-				"error":       err.Error(),
-				"session_key": opts.SessionKey,
-				"turn_id":     turnID,
-			})
-		}
-		seq++
+	if note := buildPersonaDecisionSystemNote(syncPersonaReport); note != "" {
+		messages = injectSystemNote(messages, note)
 	}
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq)
+	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt)
 	if err != nil {
 		return "", err
 	}
@@ -578,7 +609,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 // runLLMIteration executes the LLM call loop with tool handling.
 // Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int) (string, int, error) {
+func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt string) (string, int, error) {
 	iteration := 0
 	var finalContent string
 	providerStateID := ""
@@ -681,7 +712,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 						toProviderMessages(rebuilt.History),
 						rebuilt.Summary,
 						rebuilt.RecallPrompt,
-						opts.UserMessage,
+						currentUserPrompt,
 						nil,
 						opts.Channel,
 						opts.ChatID,
@@ -1031,6 +1062,72 @@ func toProviderMessages(messages []memory.Message) []providers.Message {
 	return out
 }
 
+func injectSystemNote(messages []providers.Message, note string) []providers.Message {
+	note = strings.TrimSpace(note)
+	if note == "" || len(messages) == 0 {
+		return messages
+	}
+	insertAt := 0
+	for insertAt < len(messages) && messages[insertAt].Role == "system" {
+		insertAt++
+	}
+	out := make([]providers.Message, 0, len(messages)+1)
+	out = append(out, messages[:insertAt]...)
+	out = append(out, providers.Message{
+		Role:    "system",
+		Content: note,
+	})
+	out = append(out, messages[insertAt:]...)
+	return out
+}
+
+func buildPersonaDecisionSystemNote(report memory.PersonaApplyReport) string {
+	if len(report.Decisions) == 0 {
+		return ""
+	}
+	accepted := report.AcceptedCount()
+	rejected := report.RejectedCount()
+	deferred := report.DeferredCount()
+	lines := []string{
+		"## Persona Mutation Decisions (Current Turn)",
+		fmt.Sprintf("- Accepted: %d", accepted),
+		fmt.Sprintf("- Rejected: %d", rejected),
+		fmt.Sprintf("- Deferred: %d", deferred),
+	}
+	if accepted > 0 {
+		lines = append(lines, "- Accepted persona updates are active in local context for this turn.")
+	}
+	if rejected > 0 || deferred > 0 {
+		lines = append(lines,
+			"- Do not claim rejected/deferred persona changes were applied.",
+			"- If asked about rejected changes, explain they were not persisted due to policy/evidence checks.",
+			"- If requested behavior is blocked despite accepted updates, attribute that to model/provider constraints.",
+		)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func valueOr(v, fallback string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func historyContainsUserMessage(history []providers.Message, content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	for _, m := range history {
+		if m.Role == "user" && strings.TrimSpace(m.Content) == content {
+			return true
+		}
+	}
+	return false
+}
+
 func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) (string, bool) {
 	content := strings.TrimSpace(msg.Content)
 	if !strings.HasPrefix(content, "/") {
@@ -1107,6 +1204,79 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 			return fmt.Sprintf("Switched target channel to %s (Note: this currently only validates existence)", value), true
 		default:
 			return fmt.Sprintf("Unknown switch target: %s", target), true
+		}
+
+	case "/persona":
+		if len(args) < 1 {
+			return "Usage: /persona [show|revisions|candidates|rollback]", true
+		}
+		userID := strings.TrimSpace(msg.SenderID)
+		if userID == "" {
+			userID = "local-user"
+		}
+		resolvedSessionKey := strings.TrimSpace(msg.SessionKey)
+		if resolvedSessionKey == "" {
+			if sk, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, userID); err == nil {
+				resolvedSessionKey = sk
+			}
+		}
+		switch args[0] {
+		case "show":
+			profile, err := al.memory.GetPersonaProfile(ctx, userID)
+			if err != nil {
+				return fmt.Sprintf("Failed to load persona profile: %v", err), true
+			}
+			return fmt.Sprintf(
+				"Persona revision %d\n- Agent name: %s\n- Role: %s\n- Purpose: %s\n- User name: %s\n- User timezone: %s\n- User location: %s\n- User language: %s",
+				profile.Revision,
+				valueOr(profile.Identity.AgentName, "(unset)"),
+				valueOr(profile.Identity.Role, "(unset)"),
+				valueOr(profile.Identity.Purpose, "(unset)"),
+				valueOr(profile.User.Name, "(unset)"),
+				valueOr(profile.User.Timezone, "(unset)"),
+				valueOr(profile.User.Location, "(unset)"),
+				valueOr(profile.User.Language, "(unset)"),
+			), true
+		case "revisions":
+			revs, err := al.memory.ListPersonaRevisions(ctx, userID, 10)
+			if err != nil {
+				return fmt.Sprintf("Failed to list persona revisions: %v", err), true
+			}
+			if len(revs) == 0 {
+				return "No persona revisions found.", true
+			}
+			lines := []string{"Recent persona revisions:"}
+			for i, rev := range revs {
+				if i >= 10 {
+					break
+				}
+				lines = append(lines, fmt.Sprintf("- %s %s %s -> %s (%s)", rev.ID, rev.FieldPath, rev.Operation, valueOr(rev.NewValue, "(empty)"), valueOr(rev.Source, "unknown")))
+			}
+			return strings.Join(lines, "\n"), true
+		case "candidates":
+			status := ""
+			if len(args) > 1 {
+				status = strings.TrimSpace(args[1])
+			}
+			cands, err := al.memory.ListPersonaCandidates(ctx, userID, resolvedSessionKey, "", status, 20)
+			if err != nil {
+				return fmt.Sprintf("Failed to list persona candidates: %v", err), true
+			}
+			if len(cands) == 0 {
+				return "No persona candidates found.", true
+			}
+			lines := []string{"Recent persona candidates:"}
+			for _, c := range cands {
+				lines = append(lines, fmt.Sprintf("- %s %s=%s (%s, %.2f)", c.FieldPath, c.Operation, valueOr(c.Value, "(empty)"), c.Status, c.Confidence))
+			}
+			return strings.Join(lines, "\n"), true
+		case "rollback":
+			if err := al.memory.RollbackPersona(ctx, userID); err != nil {
+				return fmt.Sprintf("Failed to rollback persona: %v", err), true
+			}
+			return "Rolled back the most recent persona revision.", true
+		default:
+			return "Usage: /persona [show|revisions|candidates|rollback]", true
 		}
 	}
 

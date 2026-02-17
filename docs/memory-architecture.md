@@ -31,6 +31,13 @@ Prompt assembly is split into:
 
 This improves cacheability and makes debugging context composition easier.
 
+Persona precedence contract (highest to lowest):
+
+1. model/provider safety constraints
+2. accepted explicit current-turn persona directives
+3. persisted persona profile (`persona_profiles`)
+4. default bootstrap persona
+
 ## Durable Data Model
 
 - `events`: canonical append-only conversational history
@@ -81,6 +88,20 @@ User turn ingestion is transactional:
 
 All in one DB transaction.
 
+## Persona Mutation Pipeline
+
+- Current-turn persona directives are applied synchronously before final response generation
+  when `persona_sync_apply` is enabled.
+- Worker jobs still run for durable maintenance (`consolidate`, `persona_apply`, `compact`)
+  and are idempotent per turn.
+- Candidate decisions are explicit: `accepted`, `rejected`, `deferred` with reason codes.
+- Persona file sync modes:
+  - `export_only` (default): profile writes files, no reverse-import
+  - `import_export`: bidirectional sync
+  - `disabled`: file sync disabled
+
+This prevents contradictory identity messages and enables immediate same-turn updates.
+
 ## Retention And Governance
 
 - Sensitive content is filtered from durable memory capture.
@@ -89,4 +110,3 @@ All in one DB transaction.
   - deleted/expired memory items
   - expired retrieval cache rows
   - aged audit logs
-

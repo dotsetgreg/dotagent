@@ -799,6 +799,86 @@ func TestAgentLoop_DerivesSessionKeyFromChannelContext(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_AppliesPersonaSyncBeforeResponseGeneration(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Memory: config.MemoryConfig{
+			PersonaSyncApply:     true,
+			PersonaFileSyncMode:  "export_only",
+			PersonaPolicyMode:    "balanced",
+			PersonaMinConfidence: 0.52,
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &historyCaptureProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	userMsg := "Your name is Luna. Confirm your name in one sentence."
+	if _, err := al.ProcessDirectWithChannel(context.Background(), userMsg, "persona-sync-session", "discord", "chat-sync"); err != nil {
+		t.Fatalf("process failed: %v", err)
+	}
+
+	if len(provider.calls) == 0 {
+		t.Fatalf("expected provider calls")
+	}
+
+	foundPersona := false
+	for _, call := range provider.calls {
+		systemJoined := ""
+		exactUserMatches := 0
+		for _, m := range call {
+			if m.Role == "system" {
+				systemJoined += "\n" + strings.ToLower(m.Content)
+			}
+			if m.Role == "user" && m.Content == userMsg {
+				exactUserMatches++
+			}
+		}
+		if exactUserMatches > 1 {
+			t.Fatalf("expected at most one current user message in a request, got %d", exactUserMatches)
+		}
+		if strings.Contains(systemJoined, "agent name: luna") {
+			foundPersona = true
+		}
+	}
+	if !foundPersona {
+		t.Fatalf("expected at least one LLM request to include updated persona agent name Luna")
+	}
+}
+
+func TestAgentLoop_PersonaCommandShow(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &mockProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	resp, err := al.ProcessDirectWithChannel(context.Background(), "/persona show", "", "cli", "direct")
+	if err != nil {
+		t.Fatalf("persona show command failed: %v", err)
+	}
+	if !strings.Contains(resp, "Persona revision") {
+		t.Fatalf("expected persona summary response, got: %s", resp)
+	}
+}
+
 func TestAgentLoop_RejectsMissingSessionWhenContextUnavailable(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{

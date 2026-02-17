@@ -88,11 +88,12 @@ docker compose start dotagent-gateway
 DotAgent now runs a first-class persona layer that is fully integrated with memory:
 
 - Canonical persona profile in SQLite (single source of truth)
+- Synchronous same-turn persona apply path for explicit directives (optional via config)
 - Automatic candidate extraction from conversation turns (heuristic + model-assisted)
-- Stability checks, contradiction checks, and sensitive-data guardrails before applying updates
+- Policy-driven acceptance/rejection with stable-field conflict handling and reason codes
 - Revision log with rollback support
 - Deterministic rendering of `IDENTITY.md`, `SOUL.md`, and `USER.md`
-- Reverse import: manual edits to those files are merged back into canonical profile
+- Configurable file sync mode: `export_only` (default), `import_export`, `disabled`
 - Persona prompt card is injected into context with token budgeting and cache
 
 ## Context + Memory Architecture
@@ -107,6 +108,7 @@ DotAgent uses a tiered, durable context system:
 Key guarantees:
 
 - Atomic user-turn persistence: user event and immediate memory capture are written transactionally
+- Persona precedence is deterministic: provider safety constraints > accepted current-turn directives > persisted profile > defaults
 - Scope-aware long-term memory:
   - `session` scope for episodic/task state
   - `user` scope for durable preferences/facts across sessions
@@ -139,6 +141,10 @@ DOTAGENT_MEMORY_WORKER_LEASE_SECONDS=60
 DOTAGENT_MEMORY_EMBEDDING_MODEL=dotagent-chargram-384-v1
 DOTAGENT_MEMORY_EVENT_RETENTION_DAYS=90
 DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS=365
+DOTAGENT_MEMORY_PERSONA_SYNC_APPLY=true
+DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE=export_only
+DOTAGENT_MEMORY_PERSONA_POLICY_MODE=balanced
+DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE=0.52
 ```
 
 ## Commands
@@ -151,6 +157,11 @@ dotagent status
 dotagent cron
 dotagent skills
 dotagent version
+# In-chat persona diagnostics:
+/persona show
+/persona revisions
+/persona candidates [status]
+/persona rollback
 ```
 
 Skill notes:

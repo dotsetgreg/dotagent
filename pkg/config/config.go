@@ -124,14 +124,18 @@ type ToolsConfig struct {
 }
 
 type MemoryConfig struct {
-	MaxRecallItems        int    `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
-	CandidateLimit        int    `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
-	RetrievalCacheSeconds int    `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
-	WorkerPollMS          int    `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
-	WorkerLeaseSeconds    int    `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
-	EmbeddingModel        string `json:"embedding_model" env:"DOTAGENT_MEMORY_EMBEDDING_MODEL"`
-	EventRetentionDays    int    `json:"event_retention_days" env:"DOTAGENT_MEMORY_EVENT_RETENTION_DAYS"`
-	AuditRetentionDays    int    `json:"audit_retention_days" env:"DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS"`
+	MaxRecallItems        int     `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
+	CandidateLimit        int     `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
+	RetrievalCacheSeconds int     `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
+	WorkerPollMS          int     `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
+	WorkerLeaseSeconds    int     `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
+	EmbeddingModel        string  `json:"embedding_model" env:"DOTAGENT_MEMORY_EMBEDDING_MODEL"`
+	EventRetentionDays    int     `json:"event_retention_days" env:"DOTAGENT_MEMORY_EVENT_RETENTION_DAYS"`
+	AuditRetentionDays    int     `json:"audit_retention_days" env:"DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS"`
+	PersonaSyncApply      bool    `json:"persona_sync_apply" env:"DOTAGENT_MEMORY_PERSONA_SYNC_APPLY"`
+	PersonaFileSyncMode   string  `json:"persona_file_sync_mode" env:"DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE"`
+	PersonaPolicyMode     string  `json:"persona_policy_mode" env:"DOTAGENT_MEMORY_PERSONA_POLICY_MODE"`
+	PersonaMinConfidence  float64 `json:"persona_min_confidence" env:"DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE"`
 }
 
 func DefaultConfig() *Config {
@@ -182,6 +186,10 @@ func DefaultConfig() *Config {
 			EmbeddingModel:        "dotagent-chargram-384-v1",
 			EventRetentionDays:    90,
 			AuditRetentionDays:    365,
+			PersonaSyncApply:      true,
+			PersonaFileSyncMode:   "export_only",
+			PersonaPolicyMode:     "balanced",
+			PersonaMinConfidence:  0.52,
 		},
 		Heartbeat: HeartbeatConfig{
 			Enabled:  true,
