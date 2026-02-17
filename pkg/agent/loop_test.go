@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -583,6 +584,48 @@ func (m *captureRetryProvider) GetDefaultModel() string {
 	return "mock-capture-retry"
 }
 
+type historyCaptureProvider struct {
+	calls [][]providers.Message
+}
+
+func (m *historyCaptureProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	cp := append([]providers.Message(nil), messages...)
+	m.calls = append(m.calls, cp)
+	return &providers.LLMResponse{
+		Content:   "ok",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *historyCaptureProvider) GetDefaultModel() string {
+	return "mock-history-capture"
+}
+
+type statefulCaptureProvider struct {
+	receivedStateIDs []string
+	call             int
+}
+
+func (m *statefulCaptureProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	return &providers.LLMResponse{
+		Content:   "fallback",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *statefulCaptureProvider) ChatWithState(ctx context.Context, stateID string, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, string, error) {
+	m.receivedStateIDs = append(m.receivedStateIDs, stateID)
+	m.call++
+	return &providers.LLMResponse{
+		Content:   "ok",
+		ToolCalls: []providers.ToolCall{},
+	}, fmt.Sprintf("state-%d", m.call), nil
+}
+
+func (m *statefulCaptureProvider) GetDefaultModel() string {
+	return "mock-stateful"
+}
+
 // TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -712,5 +755,111 @@ func TestAgentLoop_ContextRetryPreservesCurrentUserMessage(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("retry request did not include original user message")
+	}
+}
+
+func TestAgentLoop_DerivesSessionKeyFromChannelContext(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &historyCaptureProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	_, err := al.ProcessDirectWithChannel(context.Background(), "Remember this detail: I like Ethiopian coffee.", "", "discord", "chat-123")
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	_, err = al.ProcessDirectWithChannel(context.Background(), "What coffee did I mention?", "", "discord", "chat-123")
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+	if len(provider.calls) < 2 {
+		t.Fatalf("expected at least 2 provider calls, got %d", len(provider.calls))
+	}
+
+	second := provider.calls[1]
+	foundPriorUser := false
+	for _, m := range second {
+		if m.Role == "user" && strings.Contains(m.Content, "Remember this detail") {
+			foundPriorUser = true
+			break
+		}
+	}
+	if !foundPriorUser {
+		t.Fatalf("derived session key did not preserve prior history")
+	}
+}
+
+func TestAgentLoop_RejectsMissingSessionWhenContextUnavailable(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &simpleMockProvider{response: "ok"}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	_, err := al.runAgentLoop(context.Background(), processOptions{
+		SessionKey:      "",
+		Channel:         "",
+		ChatID:          "",
+		UserID:          "u1",
+		UserMessage:     "test",
+		DefaultResponse: "ok",
+		EnableSummary:   true,
+		SendResponse:    false,
+		NoHistory:       false,
+	})
+	if err == nil {
+		t.Fatalf("expected error when session cannot be derived")
+	}
+}
+
+func TestAgentLoop_UsesProviderStateAcrossTurns(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &statefulCaptureProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	if _, err := al.ProcessDirectWithChannel(context.Background(), "first", "", "discord", "chat-state"); err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	if _, err := al.ProcessDirectWithChannel(context.Background(), "second", "", "discord", "chat-state"); err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+	if len(provider.receivedStateIDs) < 2 {
+		t.Fatalf("expected at least 2 stateful calls, got %d", len(provider.receivedStateIDs))
+	}
+	if provider.receivedStateIDs[0] != "" {
+		t.Fatalf("expected empty state for first call, got %q", provider.receivedStateIDs[0])
+	}
+	if provider.receivedStateIDs[1] != "state-1" {
+		t.Fatalf("expected persisted state_id on second call, got %q", provider.receivedStateIDs[1])
 	}
 }

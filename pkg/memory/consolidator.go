@@ -5,19 +5,10 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-)
-
-var (
-	prefRegex      = regexp.MustCompile(`(?i)\b(i (?:really )?(?:like|love|prefer|hate|dislike)\b[^.!?\n]*)`)
-	identityRegex  = regexp.MustCompile(`(?i)\b(?:my name is|i am|i'm)\s+([A-Za-z0-9 _\-]{2,50})`)
-	timezoneRegex  = regexp.MustCompile(`(?i)\b(?:my timezone is|i am in|i'm in|i live in)\s+([A-Za-z0-9_\-/:+ ]{2,80})`)
-	taskStateRegex = regexp.MustCompile(`(?i)\b(remind me|schedule|todo|task|deadline)\b([^.!?\n]*)`)
-	forgetRegex    = regexp.MustCompile(`(?i)\bforget(?: that| this| about)?\s+(.+)$`)
 )
 
 // HeuristicConsolidator extracts durable memories from turns.
@@ -89,74 +80,7 @@ func (c *HeuristicConsolidator) ConsolidateTurn(ctx context.Context, sessionKey,
 					}
 				}
 			}
-
-			for _, m := range prefRegex.FindAllStringSubmatch(content, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				entry := strings.TrimSpace(m[1])
-				ops = append(ops, ConsolidationOp{
-					Action:      "upsert",
-					Kind:        MemoryUserPreference,
-					Key:         contentKey("pref", entry),
-					Content:     entry,
-					Confidence:  0.8,
-					SourceEvent: ev.ID,
-					Metadata:    map[string]string{"source_role": ev.Role},
-				})
-			}
-
-			for _, m := range identityRegex.FindAllStringSubmatch(content, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				identity := strings.TrimSpace(m[1])
-				if len(identity) < 2 {
-					continue
-				}
-				ops = append(ops, ConsolidationOp{
-					Action:      "upsert",
-					Kind:        MemorySemanticFact,
-					Key:         "identity/name",
-					Content:     "User identity hint: " + identity,
-					Confidence:  0.75,
-					SourceEvent: ev.ID,
-					Metadata:    map[string]string{"source_role": ev.Role},
-				})
-			}
-
-			for _, m := range timezoneRegex.FindAllStringSubmatch(content, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				tz := strings.TrimSpace(m[1])
-				ops = append(ops, ConsolidationOp{
-					Action:      "upsert",
-					Kind:        MemorySemanticFact,
-					Key:         "profile/timezone_or_location",
-					Content:     "User timezone/location: " + tz,
-					Confidence:  0.7,
-					SourceEvent: ev.ID,
-					Metadata:    map[string]string{"source_role": ev.Role},
-				})
-			}
-
-			for _, m := range taskStateRegex.FindAllStringSubmatch(content, -1) {
-				if len(m) < 2 {
-					continue
-				}
-				task := strings.TrimSpace(strings.Join(m[1:], " "))
-				ops = append(ops, ConsolidationOp{
-					Action:      "upsert",
-					Kind:        MemoryTaskState,
-					Key:         contentKey("task", task),
-					Content:     "Open task intent: " + task,
-					Confidence:  0.6,
-					SourceEvent: ev.ID,
-					TTL:         14 * 24 * time.Hour,
-					Metadata:    map[string]string{"source_role": ev.Role},
-				})
-			}
+			ops = append(ops, extractUserContentUpsertOps(content, ev.ID)...)
 		}
 	}
 
@@ -191,11 +115,14 @@ func (c *HeuristicConsolidator) ConsolidateTurn(ctx context.Context, sessionKey,
 		if c.policy != nil && op.Confidence < c.policy.MinConfidence(op.Kind) {
 			continue
 		}
+		scopeType, scopeID := deriveScopeForOp(op.Kind, sessionKey, userID, op.Metadata)
 
 		item, err := c.store.UpsertMemoryItem(ctx, MemoryItem{
 			ID:            "mem-" + uuid.NewString(),
 			UserID:        userID,
 			AgentID:       agentID,
+			ScopeType:     scopeType,
+			ScopeID:       scopeID,
 			SessionKey:    sessionKey,
 			Kind:          op.Kind,
 			Key:           op.Key,
@@ -212,7 +139,7 @@ func (c *HeuristicConsolidator) ConsolidateTurn(ctx context.Context, sessionKey,
 			return err
 		}
 		vec := embedText(item.Content)
-		if err := c.store.UpsertEmbedding(ctx, item.ID, embeddingModel, vec); err != nil {
+		if err := c.store.UpsertEmbedding(ctx, item.ID, currentEmbeddingModel(), vec); err != nil {
 			return err
 		}
 		inserted = append(inserted, item)

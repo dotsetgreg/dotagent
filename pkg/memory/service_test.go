@@ -2,7 +2,10 @@ package memory
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -181,5 +184,223 @@ func TestScheduleTurnMaintenance_DeduplicatesJobs(t *testing.T) {
 	}
 	if jobs != 5 {
 		t.Fatalf("expected 5 deduplicated jobs (2 consolidate + 2 persona_apply + 1 compact), got %d", jobs)
+	}
+}
+
+type failingRetriever struct{}
+
+func (f failingRetriever) Recall(ctx context.Context, query string, opts RetrievalOptions) ([]MemoryCard, error) {
+	return nil, fmt.Errorf("forced recall failure")
+}
+
+func TestBuildPromptContext_DegradesGracefullyOnRecallFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	svc, err := NewService(Config{
+		Workspace:  dir,
+		AgentID:    "dotagent",
+		WorkerPoll: 10 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:degrade"
+	userID := "u-degrade"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "degrade", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if err := svc.AppendEvent(ctx, Event{SessionKey: sessionKey, TurnID: "t1", Seq: 1, Role: "user", Content: "I prefer pour over coffee."}); err != nil {
+		t.Fatalf("append user event: %v", err)
+	}
+	if err := svc.AppendEvent(ctx, Event{SessionKey: sessionKey, TurnID: "t1", Seq: 2, Role: "assistant", Content: "Noted."}); err != nil {
+		t.Fatalf("append assistant event: %v", err)
+	}
+
+	// Force recall path failure; context building should still succeed using history.
+	svc.retriever = failingRetriever{}
+	pc, err := svc.BuildPromptContext(ctx, sessionKey, userID, "what coffee do I prefer?", 2048)
+	if err != nil {
+		t.Fatalf("build prompt context should not fail on recall error: %v", err)
+	}
+	if len(pc.History) == 0 {
+		t.Fatalf("expected history to remain available under recall failure")
+	}
+}
+
+func TestBuildPromptContext_FailClosedWhenContinuityUnavailable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	svc, err := NewService(Config{
+		Workspace:  dir,
+		AgentID:    "dotagent",
+		WorkerPoll: 10 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	sessionKey := "discord:fail-closed"
+	userID := "u-fail-closed"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "fail-closed", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if err := svc.AppendEvent(ctx, Event{SessionKey: sessionKey, TurnID: "t1", Seq: 1, Role: "user", Content: "I like Ethiopian coffee."}); err != nil {
+		t.Fatalf("append user event: %v", err)
+	}
+	if err := svc.AppendEvent(ctx, Event{SessionKey: sessionKey, TurnID: "t1", Seq: 2, Role: "assistant", Content: "Noted."}); err != nil {
+		t.Fatalf("append assistant event: %v", err)
+	}
+	if _, err := svc.store.ArchiveEventsBefore(ctx, sessionKey, 0); err != nil {
+		t.Fatalf("archive events: %v", err)
+	}
+	if err := svc.store.SetSessionSummary(ctx, sessionKey, ""); err != nil {
+		t.Fatalf("clear summary: %v", err)
+	}
+	if err := svc.Close(); err != nil {
+		t.Fatalf("close initial service: %v", err)
+	}
+
+	// Re-open service so volatile snapshots are empty and continuity depends on durable artifacts.
+	svc2, err := NewService(Config{
+		Workspace:  dir,
+		AgentID:    "dotagent",
+		WorkerPoll: 10 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("reopen service: %v", err)
+	}
+	defer svc2.Close()
+
+	_, err = svc2.BuildPromptContext(ctx, sessionKey, userID, "you already know this, what coffee did I say?", 2048)
+	if !errors.Is(err, ErrContinuityUnavailable) {
+		t.Fatalf("expected ErrContinuityUnavailable, got %v", err)
+	}
+}
+
+func TestRecordUserTurn_PersistsUserScopedMemoryAcrossSessions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:  dir,
+		AgentID:    "dotagent",
+		WorkerPoll: 10 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	userID := "u-shared"
+	s1 := "discord:one"
+	s2 := "discord:two"
+	if err := svc.EnsureSession(ctx, s1, "discord", "one", userID); err != nil {
+		t.Fatalf("ensure session one: %v", err)
+	}
+	if err := svc.EnsureSession(ctx, s2, "discord", "two", userID); err != nil {
+		t.Fatalf("ensure session two: %v", err)
+	}
+
+	_, inserted, err := svc.RecordUserTurn(ctx, Event{
+		SessionKey: s1,
+		TurnID:     "turn-1",
+		Seq:        1,
+		Role:       "user",
+		Content:    "I really prefer pour-over coffee.",
+	}, userID)
+	if err != nil {
+		t.Fatalf("record user turn: %v", err)
+	}
+	if inserted == 0 {
+		t.Fatalf("expected immediate memory capture inserts")
+	}
+
+	pc, err := svc.BuildPromptContext(ctx, s2, userID, "what coffee do I prefer?", 2048)
+	if err != nil {
+		t.Fatalf("build prompt context on second session: %v", err)
+	}
+	found := false
+	for _, card := range pc.RecallCards {
+		if card.Kind == MemoryUserPreference && strings.Contains(strings.ToLower(card.Content), "pour-over") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected user-scoped preference recall across sessions")
+	}
+}
+
+func TestSQLiteStore_SessionProviderStateRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(filepath.Join(dir, "state", "memory.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	sessionKey := "discord:provider-state"
+	if err := store.EnsureSession(ctx, sessionKey, "discord", "provider-state", "u1"); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if err := store.SetSessionProviderState(ctx, sessionKey, "state-123"); err != nil {
+		t.Fatalf("set provider state: %v", err)
+	}
+	got, err := store.GetSessionProviderState(ctx, sessionKey)
+	if err != nil {
+		t.Fatalf("get provider state: %v", err)
+	}
+	if got != "state-123" {
+		t.Fatalf("expected provider state state-123, got %q", got)
+	}
+}
+
+func TestCompactor_WritesStructuredSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(filepath.Join(dir, "state", "memory.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	sessionKey := "discord:snapshot"
+	if err := store.EnsureSession(ctx, sessionKey, "discord", "snapshot", "u1"); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		role := "user"
+		content := "I really prefer pour-over coffee and need to finish my migration task."
+		if i%2 == 1 {
+			role = "assistant"
+			content = "Acknowledged."
+		}
+		if err := store.AppendEvent(ctx, Event{
+			SessionKey: sessionKey,
+			TurnID:     fmt.Sprintf("turn-%d", i/2),
+			Seq:        i + 1,
+			Role:       role,
+			Content:    content,
+		}); err != nil {
+			t.Fatalf("append event %d: %v", i, err)
+		}
+	}
+	comp := NewSessionCompactor(store, nil)
+	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(1024)); err != nil {
+		t.Fatalf("compact session: %v", err)
+	}
+	snap, err := store.GetLatestSessionSnapshot(ctx, sessionKey)
+	if err != nil {
+		t.Fatalf("get latest snapshot: %v", err)
+	}
+	if snap.Revision == 0 {
+		t.Fatalf("expected non-zero snapshot revision")
+	}
+	if len(snap.Preferences) == 0 {
+		t.Fatalf("expected snapshot preferences")
 	}
 }

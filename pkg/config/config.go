@@ -124,11 +124,14 @@ type ToolsConfig struct {
 }
 
 type MemoryConfig struct {
-	MaxRecallItems        int `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
-	CandidateLimit        int `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
-	RetrievalCacheSeconds int `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
-	WorkerPollMS          int `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
-	WorkerLeaseSeconds    int `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
+	MaxRecallItems        int    `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
+	CandidateLimit        int    `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
+	RetrievalCacheSeconds int    `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
+	WorkerPollMS          int    `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
+	WorkerLeaseSeconds    int    `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
+	EmbeddingModel        string `json:"embedding_model" env:"DOTAGENT_MEMORY_EMBEDDING_MODEL"`
+	EventRetentionDays    int    `json:"event_retention_days" env:"DOTAGENT_MEMORY_EVENT_RETENTION_DAYS"`
+	AuditRetentionDays    int    `json:"audit_retention_days" env:"DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS"`
 }
 
 func DefaultConfig() *Config {
@@ -176,6 +179,9 @@ func DefaultConfig() *Config {
 			RetrievalCacheSeconds: 20,
 			WorkerPollMS:          700,
 			WorkerLeaseSeconds:    60,
+			EmbeddingModel:        "dotagent-chargram-384-v1",
+			EventRetentionDays:    90,
+			AuditRetentionDays:    365,
 		},
 		Heartbeat: HeartbeatConfig{
 			Enabled:  true,

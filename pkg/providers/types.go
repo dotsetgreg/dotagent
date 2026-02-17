@@ -40,6 +40,13 @@ type LLMProvider interface {
 	GetDefaultModel() string
 }
 
+// StatefulLLMProvider is an optional extension for providers that support
+// server-managed conversation state identifiers.
+type StatefulLLMProvider interface {
+	LLMProvider
+	ChatWithState(ctx context.Context, stateID string, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}) (*LLMResponse, string, error)
+}
+
 type ToolDefinition struct {
 	Type     string                 `json:"type"`
 	Function ToolFunctionDefinition `json:"function"`

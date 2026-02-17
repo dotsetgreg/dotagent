@@ -6,15 +6,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Config configures the memory subsystem.
 type Config struct {
 	Workspace         string
 	AgentID           string
+	EmbeddingModel    string
 	MaxContextTokens  int
 	MaxRecallItems    int
 	CandidateLimit    int
@@ -23,6 +28,8 @@ type Config struct {
 	WorkerPoll        time.Duration
 	PersonaCardTokens int
 	PersonaExtractor  PersonaExtractionFunc
+	EventRetention    time.Duration
+	AuditRetention    time.Duration
 }
 
 // Service is the orchestrator for memory capture, retrieval and compaction.
@@ -40,7 +47,15 @@ type Service struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	snapshotMu    sync.RWMutex
+	snapshots     map[string][]Event
+	snapshotLimit int
+
+	lastRetentionSweep int64
 }
+
+var continuationCueRegex = regexp.MustCompile(`(?i)\b(already|earlier|before|as i (?:said|mentioned)|you (?:already )?(?:know|have)|that context|you remember|previously)\b`)
 
 func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if strings.TrimSpace(cfg.Workspace) == "" {
@@ -70,6 +85,13 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if cfg.PersonaCardTokens <= 0 {
 		cfg.PersonaCardTokens = 480
 	}
+	if cfg.EventRetention <= 0 {
+		cfg.EventRetention = 90 * 24 * time.Hour
+	}
+	if cfg.AuditRetention <= 0 {
+		cfg.AuditRetention = 365 * 24 * time.Hour
+	}
+	SetEmbedderByName(cfg.EmbeddingModel)
 
 	dbPath := filepath.Join(cfg.Workspace, "state", "memory.db")
 	store, err := NewSQLiteStore(dbPath)
@@ -79,14 +101,16 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	policy := NewDefaultPolicy()
 
 	svc := &Service{
-		cfg:          cfg,
-		store:        store,
-		policy:       policy,
-		retriever:    NewHybridRetriever(store, policy),
-		consolidator: NewHeuristicConsolidator(store, policy),
-		compactor:    NewSessionCompactor(store, summarize),
-		persona:      NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor),
-		stopCh:       make(chan struct{}),
+		cfg:           cfg,
+		store:         store,
+		policy:        policy,
+		retriever:     NewHybridRetriever(store, policy),
+		consolidator:  NewHeuristicConsolidator(store, policy),
+		compactor:     NewSessionCompactor(store, summarize),
+		persona:       NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor),
+		stopCh:        make(chan struct{}),
+		snapshots:     map[string][]Event{},
+		snapshotLimit: 128,
 	}
 
 	svc.wg.Add(1)
@@ -108,7 +132,16 @@ func (s *Service) EnsureSession(ctx context.Context, sessionKey, channel, chatID
 }
 
 func (s *Service) AppendEvent(ctx context.Context, ev Event) error {
-	return s.store.AppendEvent(ctx, ev)
+	ev = normalizeEvent(ev)
+	s.appendSnapshot(ev)
+	if err := s.store.AppendEvent(ctx, ev); err != nil {
+		_ = s.store.AddMetric(ctx, "memory.append_event.error", 1, map[string]string{
+			"session_key": ev.SessionKey,
+			"role":        ev.Role,
+		})
+		return err
+	}
+	return nil
 }
 
 func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, query string, maxTokens int) (PromptContext, error) {
@@ -116,19 +149,41 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		maxTokens = s.cfg.MaxContextTokens
 	}
 	budget := DeriveContextBudget(maxTokens)
+	degradedReasons := []string{}
+	continuity := PromptContinuity{}
+
+	session, sessErr := s.store.GetSession(ctx, sessionKey)
+	if sessErr == nil && session.MessageCount > 0 {
+		continuity.HasPriorTurns = true
+	}
 
 	summary, err := s.store.GetSessionSummary(ctx, sessionKey)
 	if err != nil {
-		return PromptContext{}, err
+		degradedReasons = append(degradedReasons, "summary")
+		summary = ""
 	}
+	snapshot, snapErr := s.store.GetLatestSessionSnapshot(ctx, sessionKey)
+	if snapErr != nil {
+		degradedReasons = append(degradedReasons, "snapshot")
+	}
+	if strings.TrimSpace(summary) == "" && strings.TrimSpace(snapshot.Summary) != "" {
+		summary = strings.TrimSpace(snapshot.Summary)
+	}
+	continuity.HasSummary = strings.TrimSpace(summary) != ""
 
 	events, err := s.store.ListRecentEvents(ctx, sessionKey, 96, false)
 	if err != nil {
-		return PromptContext{}, err
+		degradedReasons = append(degradedReasons, "history")
+		events = s.getSnapshotEvents(sessionKey, 96)
+	} else {
+		events = mergeEventStreams(events, s.getSnapshotEvents(sessionKey, 96), 96)
 	}
-	history := selectHistoryWithinBudget(events, budget.ThreadTokens)
+	if len(events) == 0 {
+		events = s.getSnapshotEvents(sessionKey, 96)
+	}
 
-	recallCards, err := s.retriever.Recall(ctx, query, RetrievalOptions{
+	recallCards := []MemoryCard{}
+	recallOut, err := s.retriever.Recall(ctx, query, RetrievalOptions{
 		SessionKey:      sessionKey,
 		UserID:          userID,
 		AgentID:         s.cfg.AgentID,
@@ -138,12 +193,24 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		CacheTTL:        s.cfg.RetrievalCache,
 		NowMS:           time.Now().UnixMilli(),
 		IncludeSession:  true,
+		IncludeUser:     true,
 		IncludeGlobal:   true,
 		RecencyHalfLife: 14 * 24 * time.Hour,
 	})
 	if err != nil {
-		return PromptContext{}, err
+		degradedReasons = append(degradedReasons, "recall")
+	} else {
+		recallCards = recallOut
 	}
+	continuity.HasRecall = len(recallCards) > 0
+	budget = DeriveAdaptiveContextBudget(maxTokens, BudgetSignals{
+		RecentEventCount: len(events),
+		Query:            query,
+		HasSummary:       continuity.HasSummary,
+		HasRecall:        continuity.HasRecall,
+	})
+	history := selectHistoryWithinBudget(events, budget.ThreadTokens)
+	continuity.HasHistory = len(history) > 0
 	_ = s.store.AddMetric(ctx, "memory.recall.cards", float64(len(recallCards)), map[string]string{
 		"session_key": sessionKey,
 		"user_id":     userID,
@@ -158,16 +225,45 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		pp, pErr := s.persona.BuildPrompt(ctx, userID, s.cfg.AgentID, query, s.cfg.PersonaCardTokens)
 		if pErr == nil {
 			personaPrompt = strings.TrimSpace(pp)
+		} else {
+			degradedReasons = append(degradedReasons, "persona")
 		}
 	}
 
-	recallPrompt := formatRecallCards(recallCards, budget.MemoryTokens)
+	recallPrompt := formatSnapshotAndRecall(snapshot, recallCards, budget.MemoryTokens)
 	if personaPrompt != "" {
 		if recallPrompt != "" {
 			recallPrompt = personaPrompt + "\n\n" + recallPrompt
 		} else {
 			recallPrompt = personaPrompt
 		}
+	}
+	if len(degradedReasons) > 0 {
+		_ = s.store.AddMetric(ctx, "memory.context.degraded", float64(len(degradedReasons)), map[string]string{
+			"session_key": sessionKey,
+			"user_id":     userID,
+			"reasons":     strings.Join(dedupeStrings(degradedReasons), ","),
+		})
+	}
+	continuity.Degraded = len(degradedReasons) > 0
+	continuity.DegradedBy = dedupeStrings(degradedReasons)
+
+	hasContinuityArtifacts := continuity.HasHistory || continuity.HasSummary || continuity.HasRecall
+	if continuity.HasPriorTurns && !hasContinuityArtifacts {
+		_ = s.store.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
+			"session_key": sessionKey,
+			"user_id":     userID,
+			"reason":      "no_continuity_artifacts",
+		})
+		return PromptContext{}, ErrContinuityUnavailable
+	}
+	if continuity.HasPriorTurns && continuationCueRegex.MatchString(query) && !hasContinuityArtifacts {
+		_ = s.store.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
+			"session_key": sessionKey,
+			"user_id":     userID,
+			"reason":      "continuation_cue_without_context",
+		})
+		return PromptContext{}, ErrContinuityUnavailable
 	}
 
 	return PromptContext{
@@ -177,7 +273,117 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		RecallCards:   recallCards,
 		RecallPrompt:  recallPrompt,
 		Budget:        budget,
+		Continuity:    continuity,
 	}, nil
+}
+
+func (s *Service) RecordUserTurn(ctx context.Context, ev Event, userID string) (Event, int, error) {
+	ev = normalizeEvent(ev)
+	ev.Role = "user"
+	if strings.TrimSpace(userID) == "" {
+		userID = "local-user"
+	}
+
+	ops := extractUserContentUpsertOps(ev.Content, ev.ID)
+	filtered := make([]ConsolidationOp, 0, len(ops))
+	for _, op := range ops {
+		op.Confidence = calibrateSignalConfidence(op)
+		if containsSensitiveContent(op.Content) {
+			continue
+		}
+		if s.policy != nil && op.Confidence < s.policy.MinConfidence(op.Kind) {
+			continue
+		}
+		filtered = append(filtered, op)
+	}
+
+	inserted, err := s.store.AppendUserEventAndMemories(ctx, ev, userID, s.cfg.AgentID, filtered)
+	if err != nil {
+		_ = s.store.AddMetric(ctx, "memory.record_user_turn.error", 1, map[string]string{
+			"session_key": ev.SessionKey,
+			"user_id":     userID,
+		})
+		return Event{}, 0, err
+	}
+	s.appendSnapshot(ev)
+	_ = s.store.AddMetric(ctx, "memory.record_user_turn.memories", float64(inserted), map[string]string{
+		"session_key": ev.SessionKey,
+		"user_id":     userID,
+	})
+	return ev, inserted, nil
+}
+
+func (s *Service) CaptureImmediateUserSignals(ctx context.Context, sessionKey, userID, sourceEventID, content string) error {
+	ops := extractUserContentUpsertOps(content, sourceEventID)
+	if len(ops) == 0 {
+		return nil
+	}
+
+	now := time.Now().UnixMilli()
+	inserted := 0
+	for _, op := range ops {
+		if op.Action != "upsert" {
+			continue
+		}
+		if (op.Kind == MemorySemanticFact || op.Kind == MemoryUserPreference) && op.Confidence < 0.88 {
+			op.Confidence = 0.88
+		}
+		if s.policy != nil && op.Confidence < s.policy.MinConfidence(op.Kind) {
+			continue
+		}
+		scopeType, scopeID := deriveScopeForOp(op.Kind, sessionKey, userID, op.Metadata)
+		item, err := s.store.UpsertMemoryItem(ctx, MemoryItem{
+			ID:            "mem-" + uuid.NewString(),
+			UserID:        userID,
+			AgentID:       s.cfg.AgentID,
+			ScopeType:     scopeType,
+			ScopeID:       scopeID,
+			SessionKey:    sessionKey,
+			Kind:          op.Kind,
+			Key:           op.Key,
+			Content:       strings.TrimSpace(op.Content),
+			Confidence:    op.Confidence,
+			Weight:        1.2,
+			SourceEventID: sourceEventID,
+			FirstSeenAtMS: now,
+			LastSeenAtMS:  now,
+			ExpiresAtMS:   s.ttlFor(op.Kind, op.TTL),
+			Metadata:      op.Metadata,
+		})
+		if err != nil {
+			_ = s.store.AddMetric(ctx, "memory.capture.immediate.error", 1, map[string]string{
+				"session_key": sessionKey,
+				"user_id":     userID,
+			})
+			return err
+		}
+		vec := embedText(item.Content)
+		if err := s.store.UpsertEmbedding(ctx, item.ID, currentEmbeddingModel(), vec); err != nil {
+			_ = s.store.AddMetric(ctx, "memory.capture.immediate.error", 1, map[string]string{
+				"session_key": sessionKey,
+				"user_id":     userID,
+			})
+			return err
+		}
+		inserted++
+	}
+	_ = s.store.AddMetric(ctx, "memory.capture.immediate.items", float64(inserted), map[string]string{
+		"session_key": sessionKey,
+		"user_id":     userID,
+	})
+	return nil
+}
+
+func (s *Service) AddMetric(ctx context.Context, metric string, value float64, labels map[string]string) error {
+	return s.store.AddMetric(ctx, metric, value, labels)
+}
+
+func (s *Service) GetProviderState(ctx context.Context, sessionKey string) (string, error) {
+	return s.store.GetSessionProviderState(ctx, sessionKey)
+}
+
+func (s *Service) SetProviderState(ctx context.Context, sessionKey, stateID string) error {
+	return s.store.SetSessionProviderState(ctx, sessionKey, stateID)
 }
 
 func (s *Service) ForceCompact(ctx context.Context, sessionKey, userID string, maxTokens int) error {
@@ -260,6 +466,7 @@ func (s *Service) processPendingJobs() {
 	const maxBatch = 32
 	now := time.Now().UnixMilli()
 	ctx := context.Background()
+	s.runRetentionSweepIfDue(ctx, now)
 	_ = s.store.RequeueExpiredJobs(ctx, now)
 
 	leaseForMS := int64(s.cfg.WorkerLease / time.Millisecond)
@@ -281,6 +488,24 @@ func (s *Service) processPendingJobs() {
 		_ = s.store.CompleteJob(ctx, job.ID)
 		_ = s.store.AddMetric(ctx, "memory.job.completed", 1, map[string]string{"type": job.JobType})
 	}
+}
+
+func (s *Service) runRetentionSweepIfDue(ctx context.Context, nowMS int64) {
+	const minIntervalMS = int64((6 * time.Hour) / time.Millisecond)
+	if s.lastRetentionSweep > 0 && nowMS-s.lastRetentionSweep < minIntervalMS {
+		return
+	}
+	eventRetentionMS := int64(s.cfg.EventRetention / time.Millisecond)
+	auditRetentionMS := int64(s.cfg.AuditRetention / time.Millisecond)
+	if eventRetentionMS <= 0 && auditRetentionMS <= 0 {
+		return
+	}
+	if err := s.store.SweepRetention(ctx, nowMS, eventRetentionMS, auditRetentionMS); err != nil {
+		_ = s.store.AddMetric(ctx, "memory.retention.sweep.error", 1, nil)
+		return
+	}
+	s.lastRetentionSweep = nowMS
+	_ = s.store.AddMetric(ctx, "memory.retention.sweep.ok", 1, nil)
 }
 
 func (s *Service) handleJob(ctx context.Context, job Job) error {
@@ -322,6 +547,162 @@ func (s *Service) handleJob(ctx context.Context, job Job) error {
 func maintenanceJobID(jobType, sessionKey, turnID string) string {
 	h := sha1.Sum([]byte(jobType + "|" + sessionKey + "|" + turnID))
 	return "job-" + hex.EncodeToString(h[:8])
+}
+
+func normalizeEvent(ev Event) Event {
+	if strings.TrimSpace(ev.ID) == "" {
+		ev.ID = "evt-" + uuid.NewString()
+	}
+	if strings.TrimSpace(ev.TurnID) == "" {
+		ev.TurnID = "turn-" + uuid.NewString()
+	}
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = time.Now()
+	}
+	return ev
+}
+
+func (s *Service) appendSnapshot(ev Event) {
+	if strings.TrimSpace(ev.SessionKey) == "" {
+		return
+	}
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	stream := append(s.snapshots[ev.SessionKey], ev)
+	if len(stream) > s.snapshotLimit {
+		stream = stream[len(stream)-s.snapshotLimit:]
+	}
+	s.snapshots[ev.SessionKey] = stream
+}
+
+func (s *Service) getSnapshotEvents(sessionKey string, limit int) []Event {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 96
+	}
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+	stream := s.snapshots[sessionKey]
+	if len(stream) == 0 {
+		return nil
+	}
+	start := 0
+	if len(stream) > limit {
+		start = len(stream) - limit
+	}
+	out := make([]Event, len(stream[start:]))
+	copy(out, stream[start:])
+	return out
+}
+
+func mergeEventStreams(primary, secondary []Event, limit int) []Event {
+	if len(primary) == 0 {
+		if limit > 0 && len(secondary) > limit {
+			return append([]Event(nil), secondary[len(secondary)-limit:]...)
+		}
+		return append([]Event(nil), secondary...)
+	}
+	if len(secondary) == 0 {
+		if limit > 0 && len(primary) > limit {
+			return append([]Event(nil), primary[len(primary)-limit:]...)
+		}
+		return primary
+	}
+	seen := map[string]struct{}{}
+	out := make([]Event, 0, len(primary)+len(secondary))
+	appendUnique := func(ev Event) {
+		key := strings.TrimSpace(ev.ID)
+		if key == "" {
+			key = fmt.Sprintf("%s|%d|%s|%s", ev.TurnID, ev.Seq, ev.Role, strings.TrimSpace(ev.Content))
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, ev)
+	}
+	for _, ev := range primary {
+		appendUnique(ev)
+	}
+	for _, ev := range secondary {
+		appendUnique(ev)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ti := out[i].CreatedAt.UnixMilli()
+		tj := out[j].CreatedAt.UnixMilli()
+		if ti == tj {
+			return out[i].Seq < out[j].Seq
+		}
+		return ti < tj
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func (s *Service) ttlFor(kind MemoryItemKind, override time.Duration) int64 {
+	if override > 0 {
+		return time.Now().Add(override).UnixMilli()
+	}
+	if s.policy == nil {
+		return 0
+	}
+	return s.policy.TTLFor(kind)
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func calibrateSignalConfidence(op ConsolidationOp) float64 {
+	conf := clampConfidence(op.Confidence)
+	if conf == 0 {
+		switch op.Kind {
+		case MemoryUserPreference:
+			conf = 0.78
+		case MemorySemanticFact:
+			conf = 0.72
+		case MemoryTaskState:
+			conf = 0.62
+		default:
+			conf = 0.58
+		}
+	}
+	if op.Action == "delete" {
+		return 1.0
+	}
+	return conf
+}
+
+func containsSensitiveContent(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if personaSensitiveRegex.MatchString(content) {
+		return true
+	}
+	lower := strings.ToLower(content)
+	return strings.Contains(lower, "password") ||
+		strings.Contains(lower, "api key") ||
+		strings.Contains(lower, "private key") ||
+		strings.Contains(lower, "secret token")
 }
 
 func selectHistoryWithinBudget(events []Event, tokenBudget int) []Message {
@@ -372,6 +753,59 @@ func estimateMessageTokens(content string) int {
 		return 8
 	}
 	return tokens
+}
+
+func formatSnapshotAndRecall(snapshot SessionSnapshot, cards []MemoryCard, budgetTokens int) string {
+	sections := []string{}
+	if block := formatSessionSnapshot(snapshot, budgetTokens/2); block != "" {
+		sections = append(sections, block)
+	}
+	if block := formatRecallCards(cards, budgetTokens); block != "" {
+		sections = append(sections, block)
+	}
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func formatSessionSnapshot(snapshot SessionSnapshot, budgetTokens int) string {
+	if snapshot.Revision == 0 {
+		return ""
+	}
+	if budgetTokens <= 0 {
+		budgetTokens = 256
+	}
+	lines := []string{"## Structured Session Snapshot"}
+	if strings.TrimSpace(snapshot.Summary) != "" {
+		lines = append(lines, "- Summary: "+strings.TrimSpace(snapshot.Summary))
+	}
+	appendList := func(label string, values []string, max int) {
+		if len(values) == 0 {
+			return
+		}
+		if len(values) > max {
+			values = values[:max]
+		}
+		lines = append(lines, "- "+label+":")
+		for _, v := range values {
+			lines = append(lines, "  - "+strings.TrimSpace(v))
+		}
+	}
+	appendList("Facts", snapshot.Facts, 4)
+	appendList("Preferences", snapshot.Preferences, 4)
+	appendList("Open Tasks", snapshot.Tasks, 4)
+	appendList("Open Loops", snapshot.OpenLoops, 4)
+	appendList("Constraints", snapshot.Constraints, 4)
+
+	used := 0
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		tokens := estimateMessageTokens(line)
+		if used+tokens > budgetTokens && used > 0 {
+			break
+		}
+		out = append(out, line)
+		used += tokens
+	}
+	return strings.Join(out, "\n")
 }
 
 func formatRecallCards(cards []MemoryCard, budgetTokens int) string {

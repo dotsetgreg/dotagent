@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -32,6 +33,7 @@ type AgentLoop struct {
 	bus            *bus.MessageBus
 	provider       providers.LLMProvider
 	workspace      string
+	workspaceID    string
 	model          string
 	contextWindow  int // Maximum context window size in tokens
 	maxIterations  int
@@ -194,12 +196,15 @@ TURN TRANSCRIPT:
 	memSvc, err := memory.NewService(memory.Config{
 		Workspace:         workspace,
 		AgentID:           "dotagent",
+		EmbeddingModel:    cfg.Memory.EmbeddingModel,
 		MaxContextTokens:  cfg.Agents.Defaults.MaxTokens,
 		MaxRecallItems:    cfg.Memory.MaxRecallItems,
 		CandidateLimit:    cfg.Memory.CandidateLimit,
 		RetrievalCache:    time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
 		WorkerLease:       time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
 		WorkerPoll:        time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+		EventRetention:    time.Duration(cfg.Memory.EventRetentionDays) * 24 * time.Hour,
+		AuditRetention:    time.Duration(cfg.Memory.AuditRetentionDays) * 24 * time.Hour,
 		PersonaCardTokens: 480,
 		PersonaExtractor:  personaExtractFn,
 	}, summarizeFn)
@@ -211,6 +216,7 @@ TURN TRANSCRIPT:
 		bus:            msgBus,
 		provider:       provider,
 		workspace:      workspace,
+		workspaceID:    workspaceNamespace(workspace),
 		model:          cfg.Agents.Defaults.Model,
 		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
@@ -430,6 +436,21 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	// 1. Update tool contexts
 	al.updateToolContexts(opts.Channel, opts.ChatID)
 
+	if !opts.NoHistory {
+		normalizedSessionKey, skErr := resolveSessionKey(opts.SessionKey, al.workspaceID, opts.Channel, opts.ChatID, opts.UserID)
+		if skErr != nil {
+			_ = al.memory.AddMetric(ctx, "memory.session_key.missing", 1, map[string]string{
+				"channel": opts.Channel,
+				"chat_id": opts.ChatID,
+				"user_id": opts.UserID,
+			})
+			return "", skErr
+		}
+		opts.SessionKey = normalizedSessionKey
+	} else if strings.TrimSpace(opts.SessionKey) == "" {
+		opts.SessionKey = "ephemeral:no_history"
+	}
+
 	// 1.5 Ensure memory session exists
 	if !opts.NoHistory {
 		if err := al.memory.EnsureSession(ctx, opts.SessionKey, opts.Channel, opts.ChatID, opts.UserID); err != nil {
@@ -444,6 +465,13 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	if !opts.NoHistory {
 		promptCtx, err := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
 		if err != nil {
+			if errors.Is(err, memory.ErrContinuityUnavailable) {
+				_ = al.memory.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
+					"session_key": opts.SessionKey,
+					"user_id":     opts.UserID,
+				})
+				return "I can’t safely continue this thread right now because prior context is temporarily unavailable. Please retry in a moment.", nil
+			}
 			logger.WarnCF("agent", "Failed to build memory prompt context", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
 		} else {
 			history = toProviderMessages(promptCtx.History)
@@ -465,7 +493,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	turnID := "turn-" + uuid.NewString()
 	seq := 1
 	if !opts.NoHistory {
-		_ = al.memory.AppendEvent(ctx, memory.Event{
+		if _, _, err := al.memory.RecordUserTurn(ctx, memory.Event{
 			SessionKey: opts.SessionKey,
 			TurnID:     turnID,
 			Seq:        seq,
@@ -476,7 +504,13 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 				"chat_id": opts.ChatID,
 				"user_id": opts.UserID,
 			},
-		})
+		}, opts.UserID); err != nil {
+			logger.ErrorCF("agent", "Failed to record user turn", map[string]interface{}{
+				"error":       err.Error(),
+				"session_key": opts.SessionKey,
+				"turn_id":     turnID,
+			})
+		}
 		seq++
 	}
 
@@ -496,7 +530,8 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 	// 6. Save final assistant event and schedule memory maintenance
 	if !opts.NoHistory {
-		_ = al.memory.AppendEvent(ctx, memory.Event{
+		if err := al.memory.AppendEvent(ctx, memory.Event{
+			ID:         "evt-" + uuid.NewString(),
 			SessionKey: opts.SessionKey,
 			TurnID:     turnID,
 			Seq:        seq,
@@ -507,7 +542,13 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 				"chat_id": opts.ChatID,
 				"user_id": opts.UserID,
 			},
-		})
+		}); err != nil {
+			logger.ErrorCF("agent", "Failed to append final assistant event", map[string]interface{}{
+				"error":       err.Error(),
+				"session_key": opts.SessionKey,
+				"turn_id":     turnID,
+			})
+		}
 		seq++
 		if opts.EnableSummary {
 			al.memory.ScheduleTurnMaintenance(ctx, opts.SessionKey, turnID, opts.UserID)
@@ -540,6 +581,12 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int) (string, int, error) {
 	iteration := 0
 	var finalContent string
+	providerStateID := ""
+	if !opts.NoHistory {
+		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey); err == nil {
+			providerStateID = strings.TrimSpace(sid)
+		}
+	}
 
 	for iteration < al.maxIterations {
 		iteration++
@@ -579,10 +626,23 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		// Retry loop for context/token errors
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
-			response, err = al.provider.Chat(ctx, messages, providerToolDefs, al.model, map[string]interface{}{
+			callOpts := map[string]interface{}{
 				"max_tokens":  8192,
 				"temperature": 0.7,
-			})
+			}
+			if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
+				var newState string
+				response, newState, err = stateful.ChatWithState(ctx, providerStateID, messages, providerToolDefs, al.model, callOpts)
+				if err == nil {
+					newState = strings.TrimSpace(newState)
+					if newState != "" && newState != providerStateID {
+						providerStateID = newState
+						_ = al.memory.SetProviderState(ctx, opts.SessionKey, newState)
+					}
+				}
+			} else {
+				response, err = al.provider.Chat(ctx, messages, providerToolDefs, al.model, callOpts)
+			}
 
 			if err == nil {
 				break // Success
@@ -646,7 +706,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 		// Check if no tool calls - we're done
 		if len(response.ToolCalls) == 0 {
-			finalContent = response.Content
+			finalContent = strings.TrimSpace(response.Content)
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]interface{}{
 					"iteration":     iteration,
@@ -686,7 +746,8 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		messages = append(messages, assistantMsg)
 
 		if !opts.NoHistory {
-			_ = al.memory.AppendEvent(ctx, memory.Event{
+			if err := al.memory.AppendEvent(ctx, memory.Event{
+				ID:         "evt-" + uuid.NewString(),
 				SessionKey: opts.SessionKey,
 				TurnID:     turnID,
 				Seq:        *seq,
@@ -698,7 +759,13 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					"user_id":         opts.UserID,
 					"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
 				},
-			})
+			}); err != nil {
+				logger.ErrorCF("agent", "Failed to append assistant tool-call event", map[string]interface{}{
+					"error":       err.Error(),
+					"session_key": opts.SessionKey,
+					"turn_id":     turnID,
+				})
+			}
 			*seq = *seq + 1
 		}
 
@@ -758,7 +825,8 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			messages = append(messages, toolResultMsg)
 
 			if !opts.NoHistory {
-				_ = al.memory.AppendEvent(ctx, memory.Event{
+				if err := al.memory.AppendEvent(ctx, memory.Event{
+					ID:         "evt-" + uuid.NewString(),
 					SessionKey: opts.SessionKey,
 					TurnID:     turnID,
 					Seq:        *seq,
@@ -771,7 +839,14 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 						"chat_id": opts.ChatID,
 						"user_id": opts.UserID,
 					},
-				})
+				}); err != nil {
+					logger.ErrorCF("agent", "Failed to append tool event", map[string]interface{}{
+						"error":       err.Error(),
+						"session_key": opts.SessionKey,
+						"turn_id":     turnID,
+						"tool_name":   tc.Name,
+					})
+				}
 				*seq = *seq + 1
 			}
 		}

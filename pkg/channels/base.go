@@ -74,7 +74,8 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		return
 	}
 
-	// Build session key: channel:chatID
+	// Legacy session key fallback. Canonical v2 identity keys are derived
+	// in the agent loop from workspace+channel+chat+actor.
 	sessionKey := fmt.Sprintf("%s:%s", c.name, chatID)
 
 	msg := bus.InboundMessage{

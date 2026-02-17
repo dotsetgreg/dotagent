@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/dotsetgreg/dotagent/pkg/logger"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
@@ -47,7 +46,6 @@ func (cb *ContextBuilder) SetToolsRegistry(registry *tools.ToolRegistry) {
 }
 
 func (cb *ContextBuilder) getIdentity() string {
-	now := time.Now().Format("2006-01-02 15:04 (Monday)")
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
 	runtime := fmt.Sprintf("%s %s, Go %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
 
@@ -57,9 +55,6 @@ func (cb *ContextBuilder) getIdentity() string {
 	return fmt.Sprintf(`# dotagent 🦞
 
 You are dotagent, a helpful AI assistant.
-
-## Current Time
-%s
 
 ## Runtime
 %s
@@ -77,8 +72,10 @@ Your workspace is at: %s
 
 2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
-3. **Memory** - Memory capture and retrieval are automatic; use recalled memory context and current conversation state.`,
-		now, runtime, workspacePath, workspacePath, workspacePath, toolsSection)
+3. **Memory** - Memory capture and retrieval are automatic; use recalled memory context and current conversation state.
+
+4. **Context honesty** - Never claim you cannot access prior messages or memory unless the current turn explicitly lacks that context and you state that limitation precisely.`,
+		runtime, workspacePath, workspacePath, workspacePath, toolsSection)
 }
 
 func (cb *ContextBuilder) buildToolsSection() string {
@@ -149,11 +146,6 @@ func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary str
 
 	systemPrompt := cb.BuildSystemPrompt()
 
-	// Add Current Session info if provided
-	if channel != "" && chatID != "" {
-		systemPrompt += fmt.Sprintf("\n\n## Current Session\nChannel: %s\nChat ID: %s", channel, chatID)
-	}
-
 	// Log system prompt summary for debugging (debug mode only)
 	logger.DebugCF("agent", "System prompt built",
 		map[string]interface{}{
@@ -172,13 +164,6 @@ func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary str
 			"preview": preview,
 		})
 
-	if summary != "" {
-		systemPrompt += "\n\n## Summary of Previous Conversation\n\n" + summary
-	}
-	if strings.TrimSpace(recalledMemory) != "" {
-		systemPrompt += "\n\n" + strings.TrimSpace(recalledMemory)
-	}
-
 	// Drop leading orphaned tool messages because providers require a matching
 	// assistant tool call before any tool role message.
 	for len(history) > 0 && (history[0].Role == "tool") {
@@ -191,6 +176,22 @@ func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary str
 		Role:    "system",
 		Content: systemPrompt,
 	})
+	dynamicBlocks := make([]string, 0, 3)
+	if channel != "" && chatID != "" {
+		dynamicBlocks = append(dynamicBlocks, fmt.Sprintf("## Current Session\nChannel: %s\nChat ID: %s", channel, chatID))
+	}
+	if strings.TrimSpace(summary) != "" {
+		dynamicBlocks = append(dynamicBlocks, "## Summary of Previous Conversation\n\n"+strings.TrimSpace(summary))
+	}
+	if strings.TrimSpace(recalledMemory) != "" {
+		dynamicBlocks = append(dynamicBlocks, strings.TrimSpace(recalledMemory))
+	}
+	if len(dynamicBlocks) > 0 {
+		messages = append(messages, providers.Message{
+			Role:    "system",
+			Content: strings.Join(dynamicBlocks, "\n\n"),
+		})
+	}
 
 	messages = append(messages, history...)
 

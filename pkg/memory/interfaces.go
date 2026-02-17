@@ -10,9 +10,15 @@ type Store interface {
 	MarkSessionConsolidated(ctx context.Context, sessionKey string, atMS int64) error
 	GetSessionSummary(ctx context.Context, sessionKey string) (string, error)
 	SetSessionSummary(ctx context.Context, sessionKey, summary string) error
+	GetSessionProviderState(ctx context.Context, sessionKey string) (string, error)
+	SetSessionProviderState(ctx context.Context, sessionKey, stateID string) error
+	GetLatestSessionSnapshot(ctx context.Context, sessionKey string) (SessionSnapshot, error)
+	UpsertSessionSnapshot(ctx context.Context, snap SessionSnapshot) error
 	AppendEvent(ctx context.Context, ev Event) error
+	AppendUserEventAndMemories(ctx context.Context, ev Event, userID, agentID string, ops []ConsolidationOp) (memoryCount int, err error)
 	ListRecentEvents(ctx context.Context, sessionKey string, limit int, includeArchived bool) ([]Event, error)
 	ArchiveEventsBefore(ctx context.Context, sessionKey string, keepLatest int) (archivedCount int, err error)
+	ArchiveEventsExceptTurns(ctx context.Context, sessionKey string, keepTurnIDs []string) (archivedCount int, err error)
 	StartCompaction(ctx context.Context, sessionKey string, sourceCount, retainedCount int, checkpoint map[string]string) (string, error)
 	CheckpointCompaction(ctx context.Context, compactionID string, checkpoint map[string]string) error
 	CompleteCompaction(ctx context.Context, compactionID, summary string) error
@@ -24,6 +30,7 @@ type Store interface {
 	SearchMemoryFTS(ctx context.Context, userID, agentID, sessionKey, query string, limit int) ([]MemoryItem, error)
 	UpsertMemoryLink(ctx context.Context, link MemoryLink) error
 	ListMemoryLinks(ctx context.Context, itemID string, limit int) ([]MemoryLink, error)
+	ListMemoryObservations(ctx context.Context, itemID string, limit int) ([]MemoryObservation, error)
 
 	UpsertEmbedding(ctx context.Context, itemID, model string, vector []float32) error
 	GetEmbeddings(ctx context.Context, itemIDs []string) (map[string][]float32, error)
@@ -36,6 +43,7 @@ type Store interface {
 	CompleteJob(ctx context.Context, id string) error
 	FailJob(ctx context.Context, id, errMsg string) error
 	RequeueExpiredJobs(ctx context.Context, nowMS int64) error
+	SweepRetention(ctx context.Context, nowMS, eventRetentionMS, auditRetentionMS int64) error
 
 	AddMetric(ctx context.Context, metric string, value float64, labels map[string]string) error
 

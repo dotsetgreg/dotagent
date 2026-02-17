@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall clean help test
+.PHONY: all build install uninstall clean help test test-memory memory-eval memory-canary
 
 # Build variables
 BINARY_NAME=dotagent
@@ -124,6 +124,19 @@ vet:
 ## fmt: Format Go code
 test:
 	@$(GO) test ./...
+
+## test-memory: Run memory + agent continuity tests
+test-memory:
+	@$(GO) test ./pkg/memory ./pkg/agent
+
+## memory-eval: Run long-horizon continuity evaluation suite
+memory-eval:
+	@$(GO) test ./pkg/memory -run TestContinuityEval_LongHorizonSynthetic -count=1
+
+## memory-canary: Regression gate for memory changes (unit + eval)
+memory-canary:
+	@$(GO) test ./pkg/memory ./pkg/agent
+	@$(GO) test ./pkg/memory -run TestContinuityEval_LongHorizonSynthetic -count=1
 
 ## fmt: Format Go code
 fmt:

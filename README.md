@@ -5,6 +5,8 @@ DotAgent is a Go-based personal agent runtime with:
 - LLM provider: OpenRouter
 - Memory: unified SQLite store (`workspace/state/memory.db`)
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
+- Context continuity: strict fail-closed checks when durable context is unavailable
+- Session identity: canonical v2 session keys derived from workspace/channel/conversation/actor
 
 ## Requirements
 
@@ -93,6 +95,31 @@ DotAgent now runs a first-class persona layer that is fully integrated with memo
 - Reverse import: manual edits to those files are merged back into canonical profile
 - Persona prompt card is injected into context with token budgeting and cache
 
+## Context + Memory Architecture
+
+DotAgent uses a tiered, durable context system:
+
+- Tier 0: recent verbatim turn history
+- Tier 1: session summary + structured session snapshot
+- Tier 2: recalled long-term memory cards (hybrid lexical + embedding + rerank)
+- Tier 3: persona profile prompt block
+
+Key guarantees:
+
+- Atomic user-turn persistence: user event and immediate memory capture are written transactionally
+- Scope-aware long-term memory:
+  - `session` scope for episodic/task state
+  - `user` scope for durable preferences/facts across sessions
+  - `global` scope for shared procedural/system memory
+- Continuity fail-closed: if prior-session continuity artifacts are missing, agent processing stops safely rather than hallucinating continuity
+- Provider-state hooks: optional support for provider-managed conversation state IDs, while still keeping local canonical event logs
+
+Operational safeguards:
+
+- Sensitive-content filtering before durable memory writes
+- Durable audit log (`memory_audit_log`) for memory upserts/deletes
+- Retention sweeps for archived events, expired/deleted memory, cache, and audit records
+
 ## Environment Variables
 
 ```bash
@@ -109,6 +136,9 @@ DOTAGENT_MEMORY_CANDIDATE_LIMIT=80
 DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS=20
 DOTAGENT_MEMORY_WORKER_POLL_MS=700
 DOTAGENT_MEMORY_WORKER_LEASE_SECONDS=60
+DOTAGENT_MEMORY_EMBEDDING_MODEL=dotagent-chargram-384-v1
+DOTAGENT_MEMORY_EVENT_RETENTION_DAYS=90
+DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS=365
 ```
 
 ## Commands
@@ -132,3 +162,16 @@ Skill notes:
 ```bash
 GOCACHE=/tmp/go-build go test ./...
 ```
+
+Memory-focused regression gates:
+
+```bash
+make test-memory
+make memory-eval
+make memory-canary
+```
+
+Reference docs:
+
+- `docs/memory-architecture.md`
+- `docs/memory-runbook.md`

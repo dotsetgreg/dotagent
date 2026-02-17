@@ -68,6 +68,11 @@ func (s *SQLiteStore) init() error {
 			summary TEXT NOT NULL DEFAULT '',
 			last_consolidated_ms INTEGER NOT NULL DEFAULT 0
 		);`,
+		`CREATE TABLE IF NOT EXISTS session_provider_state (
+			session_key TEXT PRIMARY KEY,
+			state_id TEXT NOT NULL DEFAULT '',
+			updated_at_ms INTEGER NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id TEXT PRIMARY KEY,
 			session_key TEXT NOT NULL,
@@ -96,10 +101,26 @@ func (s *SQLiteStore) init() error {
 			error TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE INDEX IF NOT EXISTS compaction_session_idx ON session_compactions(session_key, started_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS session_snapshots (
+			session_key TEXT NOT NULL,
+			revision INTEGER NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			facts_json TEXT NOT NULL DEFAULT '[]',
+			preferences_json TEXT NOT NULL DEFAULT '[]',
+			tasks_json TEXT NOT NULL DEFAULT '[]',
+			open_loops_json TEXT NOT NULL DEFAULT '[]',
+			constraints_json TEXT NOT NULL DEFAULT '[]',
+			summary TEXT NOT NULL DEFAULT '',
+			compaction_id TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(session_key, revision)
+		);`,
+		`CREATE INDEX IF NOT EXISTS session_snapshots_latest_idx ON session_snapshots(session_key, revision DESC, created_at_ms DESC);`,
 		`CREATE TABLE IF NOT EXISTS memory_items (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
 			agent_id TEXT NOT NULL DEFAULT '',
+			scope_type TEXT NOT NULL DEFAULT 'session',
+			scope_id TEXT NOT NULL DEFAULT '',
 			session_key TEXT NOT NULL DEFAULT '',
 			kind TEXT NOT NULL,
 			item_key TEXT NOT NULL,
@@ -113,8 +134,21 @@ func (s *SQLiteStore) init() error {
 			deleted_at_ms INTEGER NOT NULL DEFAULT 0,
 			metadata_json TEXT NOT NULL DEFAULT '{}'
 		);`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS memory_items_unique_active ON memory_items(user_id, agent_id, kind, item_key);`,
-		`CREATE INDEX IF NOT EXISTS memory_items_scope_idx ON memory_items(user_id, agent_id, session_key, deleted_at_ms, expires_at_ms, last_seen_at_ms DESC);`,
+		`CREATE INDEX IF NOT EXISTS memory_items_legacy_scope_idx ON memory_items(user_id, agent_id, session_key, deleted_at_ms, expires_at_ms, last_seen_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS memory_observations (
+			id TEXT PRIMARY KEY,
+			item_id TEXT NOT NULL,
+			session_key TEXT NOT NULL DEFAULT '',
+			event_id TEXT NOT NULL DEFAULT '',
+			observed_at_ms INTEGER NOT NULL,
+			confidence REAL NOT NULL DEFAULT 0,
+			content TEXT NOT NULL DEFAULT '',
+			extractor TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL DEFAULT 'upsert',
+			metadata_json TEXT NOT NULL DEFAULT '{}'
+		);`,
+		`CREATE INDEX IF NOT EXISTS memory_obs_item_idx ON memory_observations(item_id, observed_at_ms DESC);`,
+		`CREATE INDEX IF NOT EXISTS memory_obs_event_idx ON memory_observations(event_id, observed_at_ms DESC);`,
 		`CREATE TABLE IF NOT EXISTS memory_links (
 			id TEXT PRIMARY KEY,
 			from_item_id TEXT NOT NULL,
@@ -162,6 +196,19 @@ func (s *SQLiteStore) init() error {
 			created_at_ms INTEGER NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS memory_metrics_metric_idx ON memory_metrics(metric, created_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS memory_audit_log (
+			id TEXT PRIMARY KEY,
+			action TEXT NOT NULL,
+			entity TEXT NOT NULL,
+			entity_id TEXT NOT NULL DEFAULT '',
+			session_key TEXT NOT NULL DEFAULT '',
+			user_id TEXT NOT NULL DEFAULT '',
+			agent_id TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			payload_json TEXT NOT NULL DEFAULT '{}',
+			created_at_ms INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS memory_audit_created_idx ON memory_audit_log(created_at_ms DESC);`,
 		`CREATE TABLE IF NOT EXISTS persona_profiles (
 			user_id TEXT NOT NULL,
 			agent_id TEXT NOT NULL,
@@ -221,15 +268,18 @@ func (s *SQLiteStore) init() error {
 			PRIMARY KEY(user_id, agent_id, field_path, value_hash)
 		);`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(item_id UNINDEXED, content, tokenize='unicode61 remove_diacritics 2');`,
+		`DROP TRIGGER IF EXISTS memory_items_ai;`,
+		`DROP TRIGGER IF EXISTS memory_items_au;`,
+		`DROP TRIGGER IF EXISTS memory_items_ad;`,
 		`CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
 			INSERT INTO memory_items_fts(item_id, content) VALUES (new.id, new.content);
 		END;`,
 		`CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE OF content ON memory_items BEGIN
-			INSERT INTO memory_items_fts(memory_items_fts, rowid, item_id, content) VALUES('delete', old.rowid, old.id, old.content);
+			DELETE FROM memory_items_fts WHERE item_id = old.id;
 			INSERT INTO memory_items_fts(item_id, content) VALUES(new.id, new.content);
 		END;`,
 		`CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
-			INSERT INTO memory_items_fts(memory_items_fts, rowid, item_id, content) VALUES('delete', old.rowid, old.id, old.content);
+			DELETE FROM memory_items_fts WHERE item_id = old.id;
 		END;`,
 	}
 
@@ -237,6 +287,49 @@ func (s *SQLiteStore) init() error {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("init sqlite schema failed on %q: %w", trimSQL(stmt), err)
 		}
+	}
+
+	// Backward-compatible migrations for older databases.
+	if err := ensureColumnExists(s.db, "memory_items", "scope_type", "TEXT NOT NULL DEFAULT 'session'"); err != nil {
+		return err
+	}
+	if err := ensureColumnExists(s.db, "memory_items", "scope_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+UPDATE memory_items
+SET scope_type = CASE
+	WHEN TRIM(scope_type) = '' AND TRIM(session_key) = '' THEN 'global'
+	WHEN TRIM(scope_type) = '' THEN 'session'
+	ELSE scope_type
+END,
+scope_id = CASE
+	WHEN TRIM(scope_id) = '' AND TRIM(scope_type) = 'session' THEN session_key
+	WHEN TRIM(scope_id) = '' AND TRIM(scope_type) = 'user' THEN user_id
+	ELSE scope_id
+END`); err != nil {
+		return fmt.Errorf("migrate memory scope columns: %w", err)
+	}
+	if _, err := s.db.Exec(`
+UPDATE memory_items
+SET scope_type = 'global'
+WHERE TRIM(scope_type) = 'session' AND TRIM(scope_id) = '' AND TRIM(session_key) = ''`); err != nil {
+		return fmt.Errorf("normalize global memory scope: %w", err)
+	}
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS memory_items_unique_active`); err != nil {
+		return fmt.Errorf("drop legacy memory unique index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS memory_items_unique_active ON memory_items(user_id, agent_id, scope_type, scope_id, kind, item_key)`); err != nil {
+		return fmt.Errorf("create memory unique index: %w", err)
+	}
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS memory_items_scope_idx`); err != nil {
+		return fmt.Errorf("drop legacy memory scope index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS memory_items_scope_idx ON memory_items(user_id, agent_id, scope_type, scope_id, deleted_at_ms, expires_at_ms, last_seen_at_ms DESC)`); err != nil {
+		return fmt.Errorf("create memory scope index: %w", err)
+	}
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS memory_items_legacy_scope_idx`); err != nil {
+		return fmt.Errorf("drop legacy memory scope compatibility index: %w", err)
 	}
 
 	if _, err := s.db.Exec(`DELETE FROM retrieval_cache WHERE expires_at_ms <= ?`, time.Now().UnixMilli()); err != nil {
@@ -254,7 +347,55 @@ func trimSQL(sql string) string {
 	return line
 }
 
+func ensureColumnExists(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+
+	var (
+		cid       int
+		name      string
+		colType   string
+		notNull   int
+		dfltValue sql.NullString
+		pk        int
+	)
+	for rows.Next() {
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("scan table info(%s): %w", table, err)
+		}
+		if strings.EqualFold(name, column) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table info(%s): %w", table, err)
+	}
+
+	stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition)
+	if _, err := db.Exec(stmt); err != nil {
+		return fmt.Errorf("alter table add column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
 func nowMS() int64 { return time.Now().UnixMilli() }
+
+func invalidateRetrievalCacheTx(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM retrieval_cache`); err != nil {
+		return fmt.Errorf("invalidate retrieval cache: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) invalidateRetrievalCache(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM retrieval_cache`); err != nil {
+		return fmt.Errorf("invalidate retrieval cache: %w", err)
+	}
+	return nil
+}
 
 func encodeMap(m map[string]string) string {
 	if len(m) == 0 {
@@ -265,6 +406,87 @@ func encodeMap(m map[string]string) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+func encodeStringSlice(values []string) string {
+	if len(values) == 0 {
+		return "[]"
+	}
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		key := strings.ToLower(v)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, v)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func decodeStringSlice(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	out := []string{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func insertAuditLogTx(ctx context.Context, tx *sql.Tx, action, entity, entityID, sessionKey, userID, agentID, reason string, payload map[string]string) error {
+	if tx == nil {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO memory_audit_log(id, action, entity, entity_id, session_key, user_id, agent_id, reason, payload_json, created_at_ms)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"audit-"+uuid.NewString(),
+		action,
+		entity,
+		entityID,
+		sessionKey,
+		userID,
+		agentID,
+		reason,
+		encodeMap(payload),
+		nowMS(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert audit log: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) insertAuditLog(ctx context.Context, action, entity, entityID, sessionKey, userID, agentID, reason string, payload map[string]string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO memory_audit_log(id, action, entity, entity_id, session_key, user_id, agent_id, reason, payload_json, created_at_ms)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"audit-"+uuid.NewString(),
+		action,
+		entity,
+		entityID,
+		sessionKey,
+		userID,
+		agentID,
+		reason,
+		encodeMap(payload),
+		nowMS(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert audit log: %w", err)
+	}
+	return nil
 }
 
 func decodeMap(raw string) map[string]string {
@@ -365,6 +587,100 @@ func (s *SQLiteStore) SetSessionSummary(ctx context.Context, sessionKey, summary
 	return nil
 }
 
+func (s *SQLiteStore) GetSessionProviderState(ctx context.Context, sessionKey string) (string, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT state_id FROM session_provider_state WHERE session_key = ?`, sessionKey)
+	var stateID string
+	if err := row.Scan(&stateID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get session provider state: %w", err)
+	}
+	return stateID, nil
+}
+
+func (s *SQLiteStore) SetSessionProviderState(ctx context.Context, sessionKey, stateID string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO session_provider_state(session_key, state_id, updated_at_ms)
+VALUES(?, ?, ?)
+ON CONFLICT(session_key) DO UPDATE SET
+	state_id = excluded.state_id,
+	updated_at_ms = excluded.updated_at_ms`,
+		sessionKey, strings.TrimSpace(stateID), nowMS(),
+	)
+	if err != nil {
+		return fmt.Errorf("set session provider state: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetLatestSessionSnapshot(ctx context.Context, sessionKey string) (SessionSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT session_key, revision, created_at_ms, facts_json, preferences_json, tasks_json, open_loops_json, constraints_json, summary, compaction_id
+FROM session_snapshots
+WHERE session_key = ?
+ORDER BY revision DESC, created_at_ms DESC
+LIMIT 1`, sessionKey)
+	var snap SessionSnapshot
+	var factsRaw, prefRaw, tasksRaw, loopsRaw, constraintsRaw string
+	if err := row.Scan(&snap.SessionKey, &snap.Revision, &snap.CreatedAtMS, &factsRaw, &prefRaw, &tasksRaw, &loopsRaw, &constraintsRaw, &snap.Summary, &snap.CompactionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionSnapshot{}, nil
+		}
+		return SessionSnapshot{}, fmt.Errorf("get latest session snapshot: %w", err)
+	}
+	snap.Facts = decodeStringSlice(factsRaw)
+	snap.Preferences = decodeStringSlice(prefRaw)
+	snap.Tasks = decodeStringSlice(tasksRaw)
+	snap.OpenLoops = decodeStringSlice(loopsRaw)
+	snap.Constraints = decodeStringSlice(constraintsRaw)
+	return snap, nil
+}
+
+func (s *SQLiteStore) UpsertSessionSnapshot(ctx context.Context, snap SessionSnapshot) error {
+	if strings.TrimSpace(snap.SessionKey) == "" {
+		return fmt.Errorf("upsert session snapshot: empty session key")
+	}
+	if snap.CreatedAtMS == 0 {
+		snap.CreatedAtMS = nowMS()
+	}
+	if snap.Revision <= 0 {
+		var next int
+		row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision), 0) + 1 FROM session_snapshots WHERE session_key = ?`, snap.SessionKey)
+		if err := row.Scan(&next); err != nil {
+			return fmt.Errorf("upsert session snapshot: resolve revision: %w", err)
+		}
+		snap.Revision = next
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO session_snapshots(session_key, revision, created_at_ms, facts_json, preferences_json, tasks_json, open_loops_json, constraints_json, summary, compaction_id)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(session_key, revision) DO UPDATE SET
+	created_at_ms = excluded.created_at_ms,
+	facts_json = excluded.facts_json,
+	preferences_json = excluded.preferences_json,
+	tasks_json = excluded.tasks_json,
+	open_loops_json = excluded.open_loops_json,
+	constraints_json = excluded.constraints_json,
+	summary = excluded.summary,
+	compaction_id = excluded.compaction_id`,
+		snap.SessionKey,
+		snap.Revision,
+		snap.CreatedAtMS,
+		encodeStringSlice(snap.Facts),
+		encodeStringSlice(snap.Preferences),
+		encodeStringSlice(snap.Tasks),
+		encodeStringSlice(snap.OpenLoops),
+		encodeStringSlice(snap.Constraints),
+		snap.Summary,
+		snap.CompactionID,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert session snapshot: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) AppendEvent(ctx context.Context, ev Event) error {
 	if strings.TrimSpace(ev.SessionKey) == "" {
 		return fmt.Errorf("append event: empty session_key")
@@ -420,6 +736,111 @@ WHERE session_key = ?`, created, ev.SessionKey); err != nil {
 		return fmt.Errorf("append event commit: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) AppendUserEventAndMemories(ctx context.Context, ev Event, userID, agentID string, ops []ConsolidationOp) (int, error) {
+	if strings.TrimSpace(ev.SessionKey) == "" {
+		return 0, fmt.Errorf("append user event and memories: empty session_key")
+	}
+	if strings.TrimSpace(ev.Role) == "" {
+		ev.Role = "user"
+	}
+	if ev.ID == "" {
+		ev.ID = "evt-" + uuid.NewString()
+	}
+	if ev.TurnID == "" {
+		ev.TurnID = "turn-" + uuid.NewString()
+	}
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = time.Now()
+	}
+	if strings.TrimSpace(agentID) == "" {
+		agentID = "dotagent"
+	}
+
+	meta := encodeMap(ev.Metadata)
+	created := ev.CreatedAt.UnixMilli()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("append user event and memories begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := nowMS()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO sessions(session_key, channel, chat_id, user_id, created_at_ms, updated_at_ms, message_count, summary, last_consolidated_ms)
+VALUES(?, '', '', '', ?, ?, 0, '', 0)
+ON CONFLICT(session_key) DO UPDATE SET updated_at_ms = excluded.updated_at_ms`, ev.SessionKey, now, now); err != nil {
+		return 0, fmt.Errorf("append user event and memories ensure session: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO events(id, session_key, turn_id, seq, role, content, tool_call_id, tool_name, metadata_json, created_at_ms, archived)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`, ev.ID, ev.SessionKey, ev.TurnID, ev.Seq, ev.Role, ev.Content, ev.ToolCallID, ev.ToolName, meta, created); err != nil {
+		return 0, fmt.Errorf("append user event and memories insert event: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE sessions
+SET updated_at_ms = ?, message_count = message_count + 1
+WHERE session_key = ?`, created, ev.SessionKey); err != nil {
+		return 0, fmt.Errorf("append user event and memories update session: %w", err)
+	}
+
+	inserted := 0
+	for _, op := range ops {
+		if strings.TrimSpace(op.Key) == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(op.Action)) {
+		case "delete":
+			scopeType, scopeID := deriveScopeForOp(op.Kind, ev.SessionKey, userID, op.Metadata)
+			args := []interface{}{nowMS(), userID, agentID, string(op.Kind), op.Key}
+			query := `
+UPDATE memory_items
+SET deleted_at_ms = ?
+WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`
+			if scopeType != "" {
+				query += ` AND scope_type = ?`
+				args = append(args, string(scopeType))
+			}
+			if strings.TrimSpace(scopeID) != "" {
+				query += ` AND scope_id = ?`
+				args = append(args, scopeID)
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				return inserted, fmt.Errorf("append user event and memories delete memory: %w", err)
+			}
+			_ = insertAuditLogTx(ctx, tx, "memory_delete", "memory_item", op.Key, ev.SessionKey, userID, agentID, "user_forget_request", map[string]string{
+				"kind":      string(op.Kind),
+				"scope":     string(scopeType),
+				"scope_id":  scopeID,
+				"source_ev": ev.ID,
+			})
+		default:
+			scopeType, scopeID := deriveScopeForOp(op.Kind, ev.SessionKey, userID, op.Metadata)
+			item, mapErr := buildMemoryItemFromOp(op, ev, userID, agentID, scopeType, scopeID)
+			if mapErr != nil {
+				return inserted, mapErr
+			}
+			itemID, upsertErr := upsertMemoryItemTx(ctx, tx, item)
+			if upsertErr != nil {
+				return inserted, fmt.Errorf("append user event and memories upsert memory: %w", upsertErr)
+			}
+			if embErr := upsertEmbeddingTx(ctx, tx, itemID, currentEmbeddingModel(), embedText(item.Content)); embErr != nil {
+				return inserted, embErr
+			}
+			inserted++
+		}
+	}
+
+	if err := invalidateRetrievalCacheTx(ctx, tx); err != nil {
+		return inserted, err
+	}
+	if err := tx.Commit(); err != nil {
+		return inserted, fmt.Errorf("append user event and memories commit: %w", err)
+	}
+	return inserted, nil
 }
 
 func (s *SQLiteStore) ListRecentEvents(ctx context.Context, sessionKey string, limit int, includeArchived bool) ([]Event, error) {
@@ -488,6 +909,44 @@ AND id NOT IN (
 	return int(n), nil
 }
 
+func (s *SQLiteStore) ArchiveEventsExceptTurns(ctx context.Context, sessionKey string, keepTurnIDs []string) (int, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return 0, fmt.Errorf("archive events except turns: empty session_key")
+	}
+	keep := uniqueStrings(keepTurnIDs)
+	if len(keep) == 0 {
+		res, err := s.db.ExecContext(ctx, `
+UPDATE events
+SET archived = 1
+WHERE session_key = ?
+AND archived = 0`, sessionKey)
+		if err != nil {
+			return 0, fmt.Errorf("archive events except turns: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		return int(n), nil
+	}
+
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(keep)), ",")
+	args := make([]interface{}, 0, 1+len(keep))
+	args = append(args, sessionKey)
+	for _, turnID := range keep {
+		args = append(args, turnID)
+	}
+	query := fmt.Sprintf(`
+UPDATE events
+SET archived = 1
+WHERE session_key = ?
+AND archived = 0
+AND turn_id NOT IN (%s)`, placeholders)
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("archive events except turns: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *SQLiteStore) StartCompaction(ctx context.Context, sessionKey string, sourceCount, retainedCount int, checkpoint map[string]string) (string, error) {
 	id := "cmp-" + uuid.NewString()
 	_, err := s.db.ExecContext(ctx, `
@@ -545,17 +1004,20 @@ func (s *SQLiteStore) UpsertMemoryItem(ctx context.Context, item MemoryItem) (Me
 	}
 
 	row := tx.QueryRowContext(ctx, `
-SELECT id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
+SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
 FROM memory_items
 WHERE id = ?`, id)
 
 	var out MemoryItem
 	var kind string
+	var scopeType string
 	var metadataRaw string
 	if err := row.Scan(
 		&out.ID,
 		&out.UserID,
 		&out.AgentID,
+		&scopeType,
+		&out.ScopeID,
 		&out.SessionKey,
 		&kind,
 		&out.Key,
@@ -571,8 +1033,13 @@ WHERE id = ?`, id)
 	); err != nil {
 		return MemoryItem{}, fmt.Errorf("read upserted memory item: %w", err)
 	}
+	out.ScopeType = MemoryScopeType(scopeType)
 	out.Kind = MemoryItemKind(kind)
 	out.Metadata = decodeMap(metadataRaw)
+	normalizeMemoryScope(&out)
+	if err := invalidateRetrievalCacheTx(ctx, tx); err != nil {
+		return MemoryItem{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return MemoryItem{}, fmt.Errorf("upsert memory item commit: %w", err)
 	}
@@ -587,23 +1054,29 @@ WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`, nowMS(), user
 	if err != nil {
 		return fmt.Errorf("delete memory by key: %w", err)
 	}
+	_ = s.insertAuditLog(ctx, "memory_delete", "memory_item", key, "", userID, agentID, "delete_by_key", map[string]string{
+		"kind": string(kind),
+	})
+	if err := s.invalidateRetrievalCache(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *SQLiteStore) ListMemoryCandidates(ctx context.Context, userID, agentID, sessionKey string, limit int) ([]MemoryItem, error) {
+	_ = sessionKey
 	if limit <= 0 {
 		limit = 20
 	}
 	now := nowMS()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
+SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
 FROM memory_items
 WHERE user_id = ? AND agent_id = ?
 AND deleted_at_ms = 0
 AND (expires_at_ms = 0 OR expires_at_ms > ?)
-AND (session_key = '' OR session_key = ?)
 ORDER BY last_seen_at_ms DESC
-LIMIT ?`, userID, agentID, now, sessionKey, limit)
+LIMIT ?`, userID, agentID, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list memory candidates: %w", err)
 	}
@@ -613,6 +1086,7 @@ LIMIT ?`, userID, agentID, now, sessionKey, limit)
 }
 
 func (s *SQLiteStore) SearchMemoryFTS(ctx context.Context, userID, agentID, sessionKey, query string, limit int) ([]MemoryItem, error) {
+	_ = sessionKey
 	if limit <= 0 {
 		limit = 20
 	}
@@ -622,7 +1096,7 @@ func (s *SQLiteStore) SearchMemoryFTS(ctx context.Context, userID, agentID, sess
 	}
 	now := nowMS()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT m.id, m.user_id, m.agent_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.metadata_json
+SELECT m.id, m.user_id, m.agent_id, m.scope_type, m.scope_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.metadata_json
 FROM memory_items_fts f
 JOIN memory_items m ON m.id = f.item_id
 WHERE f.content MATCH ?
@@ -630,9 +1104,8 @@ AND m.user_id = ?
 AND m.agent_id = ?
 AND m.deleted_at_ms = 0
 AND (m.expires_at_ms = 0 OR m.expires_at_ms > ?)
-AND (m.session_key = '' OR m.session_key = ?)
 ORDER BY bm25(memory_items_fts), m.last_seen_at_ms DESC
-LIMIT ?`, query, userID, agentID, now, sessionKey, limit)
+LIMIT ?`, query, userID, agentID, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("search memory fts: %w", err)
 	}
@@ -646,12 +1119,15 @@ func scanMemoryItems(rows *sql.Rows) ([]MemoryItem, error) {
 	for rows.Next() {
 		var it MemoryItem
 		var kind string
+		var scopeType string
 		var metaRaw string
-		if err := rows.Scan(&it.ID, &it.UserID, &it.AgentID, &it.SessionKey, &kind, &it.Key, &it.Content, &it.Confidence, &it.Weight, &it.SourceEventID, &it.FirstSeenAtMS, &it.LastSeenAtMS, &it.ExpiresAtMS, &it.DeletedAtMS, &metaRaw); err != nil {
+		if err := rows.Scan(&it.ID, &it.UserID, &it.AgentID, &scopeType, &it.ScopeID, &it.SessionKey, &kind, &it.Key, &it.Content, &it.Confidence, &it.Weight, &it.SourceEventID, &it.FirstSeenAtMS, &it.LastSeenAtMS, &it.ExpiresAtMS, &it.DeletedAtMS, &metaRaw); err != nil {
 			return nil, fmt.Errorf("scan memory item: %w", err)
 		}
+		it.ScopeType = MemoryScopeType(scopeType)
 		it.Kind = MemoryItemKind(kind)
 		it.Metadata = decodeMap(metaRaw)
+		normalizeMemoryScope(&it)
 		out = append(out, it)
 	}
 	if err := rows.Err(); err != nil {
@@ -711,6 +1187,37 @@ LIMIT ?`, itemID, limit)
 	return out, nil
 }
 
+func (s *SQLiteStore) ListMemoryObservations(ctx context.Context, itemID string, limit int) ([]MemoryObservation, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, item_id, session_key, event_id, observed_at_ms, confidence, content, extractor, action, metadata_json
+FROM memory_observations
+WHERE item_id = ?
+ORDER BY observed_at_ms DESC
+LIMIT ?`, itemID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list memory observations: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]MemoryObservation, 0, limit)
+	for rows.Next() {
+		var obs MemoryObservation
+		var rawMeta string
+		if err := rows.Scan(&obs.ID, &obs.ItemID, &obs.SessionKey, &obs.EventID, &obs.ObservedAt, &obs.Confidence, &obs.Content, &obs.Extractor, &obs.Action, &rawMeta); err != nil {
+			return nil, fmt.Errorf("scan memory observation: %w", err)
+		}
+		obs.Metadata = decodeMap(rawMeta)
+		out = append(out, obs)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate memory observations: %w", err)
+	}
+	return out, nil
+}
+
 func (s *SQLiteStore) UpsertEmbedding(ctx context.Context, itemID, model string, vector []float32) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO memory_embeddings(item_id, model, vector_json, norm, updated_at_ms)
@@ -722,6 +1229,24 @@ ON CONFLICT(item_id) DO UPDATE SET
 	updated_at_ms = excluded.updated_at_ms`, itemID, model, encodeVector(vector), vectorNorm(vector), nowMS())
 	if err != nil {
 		return fmt.Errorf("upsert embedding: %w", err)
+	}
+	return nil
+}
+
+func upsertEmbeddingTx(ctx context.Context, tx *sql.Tx, itemID, model string, vector []float32) error {
+	if strings.TrimSpace(itemID) == "" {
+		return fmt.Errorf("upsert embedding tx: empty item_id")
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO memory_embeddings(item_id, model, vector_json, norm, updated_at_ms)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(item_id) DO UPDATE SET
+	model = excluded.model,
+	vector_json = excluded.vector_json,
+	norm = excluded.norm,
+	updated_at_ms = excluded.updated_at_ms`, itemID, model, encodeVector(vector), vectorNorm(vector), nowMS())
+	if err != nil {
+		return fmt.Errorf("upsert embedding tx: %w", err)
 	}
 	return nil
 }
@@ -770,6 +1295,89 @@ func uniqueStrings(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func buildMemoryItemFromOp(op ConsolidationOp, ev Event, userID, agentID string, scopeType MemoryScopeType, scopeID string) (MemoryItem, error) {
+	if strings.TrimSpace(op.Content) == "" {
+		return MemoryItem{}, fmt.Errorf("memory op has empty content for key %q", op.Key)
+	}
+	conf := clampConfidence(op.Confidence)
+	if conf == 0 {
+		conf = 0.55
+	}
+	item := MemoryItem{
+		ID:            "mem-" + uuid.NewString(),
+		UserID:        userID,
+		AgentID:       agentID,
+		ScopeType:     scopeType,
+		ScopeID:       scopeID,
+		SessionKey:    ev.SessionKey,
+		Kind:          op.Kind,
+		Key:           strings.TrimSpace(op.Key),
+		Content:       strings.TrimSpace(op.Content),
+		Confidence:    conf,
+		Weight:        1.1,
+		SourceEventID: ev.ID,
+		FirstSeenAtMS: ev.CreatedAt.UnixMilli(),
+		LastSeenAtMS:  ev.CreatedAt.UnixMilli(),
+		ExpiresAtMS:   0,
+		Metadata:      op.Metadata,
+	}
+	if item.FirstSeenAtMS == 0 {
+		item.FirstSeenAtMS = nowMS()
+		item.LastSeenAtMS = item.FirstSeenAtMS
+	}
+	if op.TTL > 0 {
+		item.ExpiresAtMS = time.Now().Add(op.TTL).UnixMilli()
+	}
+	normalizeMemoryScope(&item)
+	return item, nil
+}
+
+func deriveScopeForOp(kind MemoryItemKind, sessionKey, userID string, meta map[string]string) (MemoryScopeType, string) {
+	scopeType := MemoryScopeSession
+	scopeID := sessionKey
+	if scopeRaw := strings.ToLower(strings.TrimSpace(meta["scope_type"])); scopeRaw != "" {
+		switch MemoryScopeType(scopeRaw) {
+		case MemoryScopeSession, MemoryScopeUser, MemoryScopeGlobal:
+			scopeType = MemoryScopeType(scopeRaw)
+		}
+	}
+	if scopeRaw := strings.TrimSpace(meta["scope_id"]); scopeRaw != "" {
+		scopeID = scopeRaw
+	}
+
+	switch scopeType {
+	case MemoryScopeSession:
+		if strings.TrimSpace(scopeID) == "" {
+			scopeID = sessionKey
+		}
+	case MemoryScopeUser:
+		if strings.TrimSpace(scopeID) == "" {
+			scopeID = userID
+		}
+	case MemoryScopeGlobal:
+		scopeID = ""
+	default:
+		scopeType = MemoryScopeSession
+		scopeID = sessionKey
+	}
+
+	if strings.TrimSpace(meta["scope_type"]) == "" {
+		switch kind {
+		case MemorySemanticFact, MemoryUserPreference, MemoryProcedural:
+			scopeType = MemoryScopeUser
+			scopeID = userID
+		case MemoryTaskState, MemoryEpisodic:
+			scopeType = MemoryScopeSession
+			scopeID = sessionKey
+		}
+	}
+	if scopeType == MemoryScopeUser && strings.TrimSpace(scopeID) == "" {
+		scopeType = MemoryScopeSession
+		scopeID = sessionKey
+	}
+	return scopeType, scopeID
 }
 
 func (s *SQLiteStore) GetRetrievalCache(ctx context.Context, key string, nowMS int64) (string, bool, error) {
@@ -939,6 +1547,48 @@ SET status = ?, updated_at_ms = ?, error = ''
 WHERE status = ? AND lease_until_ms > 0 AND lease_until_ms <= ?`, JobPending, nowMS, JobRunning, nowMS)
 	if err != nil {
 		return fmt.Errorf("requeue expired jobs: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) SweepRetention(ctx context.Context, nowMS, eventRetentionMS, auditRetentionMS int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sweep retention begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if eventRetentionMS > 0 {
+		cutoff := nowMS - eventRetentionMS
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM events
+WHERE archived = 1 AND created_at_ms <= ?`, cutoff); err != nil {
+			return fmt.Errorf("sweep retention events: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM memory_items
+WHERE deleted_at_ms > 0 AND deleted_at_ms <= ?`, nowMS); err != nil {
+		return fmt.Errorf("sweep retention deleted memory: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM memory_items
+WHERE expires_at_ms > 0 AND expires_at_ms <= ?`, nowMS); err != nil {
+		return fmt.Errorf("sweep retention expired memory: %w", err)
+	}
+	if auditRetentionMS > 0 {
+		cutoff := nowMS - auditRetentionMS
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM memory_audit_log
+WHERE created_at_ms <= ?`, cutoff); err != nil {
+			return fmt.Errorf("sweep retention audit log: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM retrieval_cache WHERE expires_at_ms <= ?`, nowMS); err != nil {
+		return fmt.Errorf("sweep retention retrieval cache: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sweep retention commit: %w", err)
 	}
 	return nil
 }
@@ -1350,6 +2000,8 @@ WHERE id = ?`, personaCandidateApplied, revision.ID, appliedAt, candidate.ID); e
 			ID:            "mem-" + uuid.NewString(),
 			UserID:        profile.UserID,
 			AgentID:       profile.AgentID,
+			ScopeType:     MemoryScopeUser,
+			ScopeID:       profile.UserID,
 			SessionKey:    candidate.SessionKey,
 			Kind:          MemoryProcedural,
 			Key:           rootKey,
@@ -1382,6 +2034,8 @@ AND (item_key = ? OR item_key LIKE ?)`,
 				ID:            "mem-" + uuid.NewString(),
 				UserID:        profile.UserID,
 				AgentID:       profile.AgentID,
+				ScopeType:     MemoryScopeUser,
+				ScopeID:       profile.UserID,
 				SessionKey:    candidate.SessionKey,
 				Kind:          op.Kind,
 				Key:           op.Key,
@@ -1411,6 +2065,9 @@ ON CONFLICT(from_item_id, to_item_id, relation) DO UPDATE SET
 			}
 		}
 	}
+	if err := invalidateRetrievalCacheTx(ctx, tx); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("apply persona mutation commit: %w", err)
@@ -1434,25 +2091,36 @@ func upsertMemoryItemTx(ctx context.Context, tx *sql.Tx, item MemoryItem) (strin
 	if item.LastSeenAtMS == 0 {
 		item.LastSeenAtMS = nowMS()
 	}
+	normalizeMemoryScope(&item)
+	if item.ScopeType == MemoryScopeSession && strings.TrimSpace(item.SessionKey) == "" {
+		item.SessionKey = item.ScopeID
+	}
+	item.Confidence = clampConfidence(item.Confidence)
+	if item.Weight <= 0 {
+		item.Weight = 1
+	}
 
 	var existingID string
+	var existingContent string
 	var existingConfidence float64
 	var existingWeight float64
 	var existingSource string
 	var existingSession string
+	var existingMetaMap map[string]string
 	var existingMeta string
 	row := tx.QueryRowContext(ctx, `
-SELECT id, confidence, weight, source_event_id, session_key, metadata_json
+SELECT id, content, confidence, weight, source_event_id, session_key, metadata_json
 FROM memory_items
-WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`,
-		item.UserID, item.AgentID, string(item.Kind), item.Key,
+WHERE user_id = ? AND agent_id = ? AND scope_type = ? AND scope_id = ? AND kind = ? AND item_key = ?`,
+		item.UserID, item.AgentID, string(item.ScopeType), item.ScopeID, string(item.Kind), item.Key,
 	)
-	switch err := row.Scan(&existingID, &existingConfidence, &existingWeight, &existingSource, &existingSession, &existingMeta); {
+	switch err := row.Scan(&existingID, &existingContent, &existingConfidence, &existingWeight, &existingSource, &existingSession, &existingMeta); {
 	case err == nil:
 		confidence := existingConfidence
 		if item.Confidence > confidence {
 			confidence = item.Confidence
 		}
+		existingMetaMap = decodeMap(existingMeta)
 		weight := existingWeight
 		if weight == 0 {
 			weight = item.Weight
@@ -1467,14 +2135,25 @@ WHERE user_id = ? AND agent_id = ? AND kind = ? AND item_key = ?`,
 		if strings.TrimSpace(item.SessionKey) != "" {
 			session = item.SessionKey
 		}
-		meta := existingMeta
-		if len(item.Metadata) > 0 {
-			meta = encodeMap(item.Metadata)
+		metaMap := existingMetaMap
+		if metaMap == nil {
+			metaMap = map[string]string{}
 		}
+		if len(item.Metadata) > 0 {
+			for k, v := range item.Metadata {
+				metaMap[k] = v
+			}
+		}
+		content, changed := chooseMemoryContent(existingContent, item.Content, existingConfidence, item.Confidence, item.Kind, item.Key)
+		if changed {
+			metaMap["content_changed_at_ms"] = fmt.Sprintf("%d", nowMS())
+		}
+		meta := encodeMap(metaMap)
 		if _, err := tx.ExecContext(ctx, `
 UPDATE memory_items
-SET session_key = ?, confidence = ?, weight = ?, source_event_id = ?, last_seen_at_ms = ?, expires_at_ms = ?, deleted_at_ms = 0, metadata_json = ?
+SET content = ?, session_key = ?, confidence = ?, weight = ?, source_event_id = ?, last_seen_at_ms = ?, expires_at_ms = ?, deleted_at_ms = 0, metadata_json = ?
 WHERE id = ?`,
+			content,
 			session,
 			confidence,
 			weight,
@@ -1484,16 +2163,29 @@ WHERE id = ?`,
 			meta,
 			existingID,
 		); err != nil {
-			return "", err
+			return "", fmt.Errorf("update memory_items existing id=%s key=%s scope=%s/%s: %w", existingID, item.Key, item.ScopeType, item.ScopeID, err)
 		}
+		if obsErr := insertMemoryObservationTx(ctx, tx, existingID, item, "upsert"); obsErr != nil {
+			return "", obsErr
+		}
+		_ = insertAuditLogTx(ctx, tx, "memory_upsert", "memory_item", existingID, item.SessionKey, item.UserID, item.AgentID, "update", map[string]string{
+			"kind":      string(item.Kind),
+			"item_key":  item.Key,
+			"scope":     string(item.ScopeType),
+			"scope_id":  item.ScopeID,
+			"event_id":  item.SourceEventID,
+			"extractor": item.Metadata["extractor"],
+		})
 		return existingID, nil
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO memory_items(id, user_id, agent_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+INSERT INTO memory_items(id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
 			item.ID,
 			item.UserID,
 			item.AgentID,
+			string(item.ScopeType),
+			item.ScopeID,
 			item.SessionKey,
 			string(item.Kind),
 			item.Key,
@@ -1506,12 +2198,177 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
 			item.ExpiresAtMS,
 			encodeMap(item.Metadata),
 		); err != nil {
-			return "", err
+			return "", fmt.Errorf("insert memory_items id=%s key=%s scope=%s/%s: %w", item.ID, item.Key, item.ScopeType, item.ScopeID, err)
 		}
+		if obsErr := insertMemoryObservationTx(ctx, tx, item.ID, item, "insert"); obsErr != nil {
+			return "", obsErr
+		}
+		_ = insertAuditLogTx(ctx, tx, "memory_upsert", "memory_item", item.ID, item.SessionKey, item.UserID, item.AgentID, "insert", map[string]string{
+			"kind":      string(item.Kind),
+			"item_key":  item.Key,
+			"scope":     string(item.ScopeType),
+			"scope_id":  item.ScopeID,
+			"event_id":  item.SourceEventID,
+			"extractor": item.Metadata["extractor"],
+		})
 		return item.ID, nil
 	default:
 		return "", err
 	}
+}
+
+func clampConfidence(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func normalizeMemoryScope(item *MemoryItem) {
+	if item == nil {
+		return
+	}
+	if item.ScopeType == "" {
+		if strings.TrimSpace(item.SessionKey) == "" {
+			item.ScopeType = MemoryScopeGlobal
+		} else {
+			item.ScopeType = MemoryScopeSession
+		}
+	}
+	switch item.ScopeType {
+	case MemoryScopeSession:
+		if strings.TrimSpace(item.ScopeID) == "" {
+			item.ScopeID = item.SessionKey
+		}
+		if strings.TrimSpace(item.SessionKey) == "" {
+			item.SessionKey = item.ScopeID
+		}
+	case MemoryScopeUser:
+		if strings.TrimSpace(item.ScopeID) == "" {
+			item.ScopeID = item.UserID
+		}
+		if strings.TrimSpace(item.ScopeID) == "" && strings.TrimSpace(item.SessionKey) != "" {
+			item.ScopeID = item.SessionKey
+		}
+	case MemoryScopeGlobal:
+		item.ScopeID = ""
+	}
+}
+
+func chooseMemoryContent(existing, incoming string, existingConfidence, incomingConfidence float64, kind MemoryItemKind, key string) (string, bool) {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	if existing == "" {
+		return incoming, incoming != ""
+	}
+	if incoming == "" {
+		return existing, false
+	}
+	if strings.EqualFold(existing, incoming) {
+		return incoming, !strings.EqualFold(existing, incoming)
+	}
+
+	singletonKey := strings.HasPrefix(key, "identity/") || strings.HasPrefix(key, "profile/")
+	if singletonKey || kind == MemoryTaskState {
+		if incomingConfidence+0.05 >= existingConfidence {
+			return incoming, true
+		}
+		return existing, false
+	}
+
+	overlap := textTokenJaccard(existing, incoming)
+	if overlap < 0.2 && existingConfidence > incomingConfidence+0.15 {
+		return existing, false
+	}
+	if incomingConfidence > existingConfidence+0.05 {
+		return incoming, true
+	}
+	if len(incoming) > len(existing)+8 {
+		return incoming, true
+	}
+	return existing, false
+}
+
+func textTokenJaccard(a, b string) float64 {
+	aSet := tokenSet(a)
+	bSet := tokenSet(b)
+	if len(aSet) == 0 || len(bSet) == 0 {
+		return 0
+	}
+	inter := 0
+	union := len(aSet)
+	for tok := range bSet {
+		if _, ok := aSet[tok]; ok {
+			inter++
+		} else {
+			union++
+		}
+	}
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
+func tokenSet(in string) map[string]struct{} {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(in)))
+	out := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		f = strings.Trim(f, ".,!?;:\"'()[]{}")
+		if len(f) < 2 {
+			continue
+		}
+		out[f] = struct{}{}
+	}
+	return out
+}
+
+func insertMemoryObservationTx(ctx context.Context, tx *sql.Tx, itemID string, item MemoryItem, action string) error {
+	content := strings.TrimSpace(item.Content)
+	if strings.TrimSpace(item.SourceEventID) == "" && content == "" {
+		return nil
+	}
+	meta := map[string]string{}
+	for k, v := range item.Metadata {
+		meta[k] = v
+	}
+	extractor := strings.TrimSpace(meta["extractor"])
+	if extractor == "" {
+		extractor = "unknown"
+	}
+	obs := MemoryObservation{
+		ID:         "obs-" + uuid.NewString(),
+		ItemID:     itemID,
+		SessionKey: item.SessionKey,
+		EventID:    item.SourceEventID,
+		ObservedAt: item.LastSeenAtMS,
+		Confidence: clampConfidence(item.Confidence),
+		Content:    truncateForMetadata(content, 400),
+		Metadata:   meta,
+		Extractor:  extractor,
+		Action:     nonEmptyString(action, "upsert"),
+	}
+	if obs.ObservedAt == 0 {
+		obs.ObservedAt = nowMS()
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_observations(id, item_id, session_key, event_id, observed_at_ms, confidence, content, extractor, action, metadata_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		obs.ID, obs.ItemID, obs.SessionKey, obs.EventID, obs.ObservedAt, obs.Confidence, obs.Content, obs.Extractor, obs.Action, encodeMap(obs.Metadata),
+	); err != nil {
+		return fmt.Errorf("insert memory observation: %w", err)
+	}
+	return nil
+}
+
+func nonEmptyString(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 func (s *SQLiteStore) RollbackPersonaToRevision(ctx context.Context, userID, agentID, revisionID string) (PersonaProfile, error) {

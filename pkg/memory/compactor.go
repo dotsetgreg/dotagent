@@ -53,11 +53,35 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 	}
 
 	sourceCount := len(events)
-	toArchive := events[:len(events)-keepLatest]
+	keepTurns, retainedCount := selectTurnsToKeep(events, keepLatest)
+	archiveStrategy := "turns"
+	toArchive := make([]Event, 0, len(events))
+	for _, ev := range events {
+		turnID := strings.TrimSpace(ev.TurnID)
+		if turnID == "" {
+			turnID = ev.ID
+		}
+		if _, ok := keepTurns[turnID]; ok {
+			continue
+		}
+		toArchive = append(toArchive, ev)
+	}
+	// Fallback for large single-turn sessions: retain an event cap even when turn-aware
+	// retention would otherwise keep everything.
+	if len(toArchive) == 0 && len(events) > keepLatest {
+		archiveStrategy = "events_fallback"
+		retainedCount = keepLatest
+		toArchive = append(toArchive, events[:len(events)-keepLatest]...)
+	}
+	if len(toArchive) == 0 {
+		return nil
+	}
 
-	compactionID, err := c.store.StartCompaction(ctx, sessionKey, sourceCount, keepLatest, map[string]string{
-		"phase":        "started",
-		"source_count": fmt.Sprintf("%d", sourceCount),
+	compactionID, err := c.store.StartCompaction(ctx, sessionKey, sourceCount, retainedCount, map[string]string{
+		"phase":            "started",
+		"source_count":     fmt.Sprintf("%d", sourceCount),
+		"retain_count":     fmt.Sprintf("%d", retainedCount),
+		"archive_strategy": archiveStrategy,
 	})
 	if err != nil {
 		return err
@@ -90,16 +114,30 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
 		return err
 	}
+	if err := c.store.UpsertSessionSnapshot(ctx, buildSessionSnapshot(sessionKey, compactionID, summary, toArchive)); err != nil {
+		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
+		return err
+	}
 
-	archivedCount, err := c.store.ArchiveEventsBefore(ctx, sessionKey, keepLatest)
+	var archivedCount int
+	if archiveStrategy == "turns" {
+		keepTurnIDs := make([]string, 0, len(keepTurns))
+		for turnID := range keepTurns {
+			keepTurnIDs = append(keepTurnIDs, turnID)
+		}
+		archivedCount, err = c.store.ArchiveEventsExceptTurns(ctx, sessionKey, keepTurnIDs)
+	} else {
+		archivedCount, err = c.store.ArchiveEventsBefore(ctx, sessionKey, keepLatest)
+	}
 	if err != nil {
 		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
 		return err
 	}
 
 	if err := c.store.CheckpointCompaction(ctx, compactionID, map[string]string{
-		"phase":          "archived",
-		"archived_count": fmt.Sprintf("%d", archivedCount),
+		"phase":            "archived",
+		"archived_count":   fmt.Sprintf("%d", archivedCount),
+		"archive_strategy": archiveStrategy,
 	}); err != nil {
 		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
 		return err
@@ -175,4 +213,100 @@ func fallbackSummary(existing string, events []Event) string {
 	}
 
 	return strings.Join(parts, "\n")
+}
+
+func selectTurnsToKeep(events []Event, keepLatest int) (map[string]struct{}, int) {
+	keep := map[string]struct{}{}
+	if keepLatest <= 0 || len(events) == 0 {
+		return keep, 0
+	}
+	keptEvents := 0
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		turnID := strings.TrimSpace(ev.TurnID)
+		if turnID == "" {
+			turnID = ev.ID
+		}
+		if turnID == "" {
+			continue
+		}
+		if _, ok := keep[turnID]; ok {
+			keptEvents++
+			continue
+		}
+		if keptEvents >= keepLatest && len(keep) > 0 {
+			break
+		}
+		keep[turnID] = struct{}{}
+		keptEvents++
+	}
+	return keep, keptEvents
+}
+
+func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Event) SessionSnapshot {
+	facts := []string{}
+	prefs := []string{}
+	tasks := []string{}
+	openLoops := []string{}
+	constraints := []string{}
+
+	add := func(dst *[]string, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := strings.ToLower(value)
+		for _, existing := range *dst {
+			if strings.ToLower(existing) == key {
+				return
+			}
+		}
+		*dst = append(*dst, value)
+	}
+
+	for _, ev := range events {
+		if ev.Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(ev.Content)
+		if content == "" {
+			continue
+		}
+		for _, fact := range ExtractFactSignals(content) {
+			if isPreferencePhrase(fact) {
+				add(&prefs, fact)
+			} else {
+				add(&facts, fact)
+			}
+		}
+		lower := strings.ToLower(content)
+		if strings.Contains(lower, "need to") ||
+			strings.Contains(lower, "todo") ||
+			strings.Contains(lower, "deadline") ||
+			strings.Contains(lower, "remind me") {
+			add(&tasks, content)
+		}
+		if strings.Contains(lower, "can't") ||
+			strings.Contains(lower, "cannot") ||
+			strings.Contains(lower, "must") ||
+			strings.Contains(lower, "requirement") ||
+			strings.Contains(lower, "constraint") {
+			add(&constraints, content)
+		}
+		if strings.Contains(content, "?") && len(openLoops) < 8 {
+			add(&openLoops, content)
+		}
+	}
+
+	return SessionSnapshot{
+		SessionKey:   sessionKey,
+		CreatedAtMS:  nowMS(),
+		Facts:        facts,
+		Preferences:  prefs,
+		Tasks:        tasks,
+		OpenLoops:    openLoops,
+		Constraints:  constraints,
+		Summary:      strings.TrimSpace(summary),
+		CompactionID: compactionID,
+	}
 }

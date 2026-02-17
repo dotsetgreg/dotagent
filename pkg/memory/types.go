@@ -41,11 +41,22 @@ const (
 	MemoryProcedural     MemoryItemKind = "procedural"
 )
 
+// MemoryScopeType defines where a memory applies.
+type MemoryScopeType string
+
+const (
+	MemoryScopeSession MemoryScopeType = "session"
+	MemoryScopeUser    MemoryScopeType = "user"
+	MemoryScopeGlobal  MemoryScopeType = "global"
+)
+
 // MemoryItem is a consolidated memory entry in the canonical store.
 type MemoryItem struct {
 	ID            string
 	UserID        string
 	AgentID       string
+	ScopeType     MemoryScopeType
+	ScopeID       string
 	SessionKey    string
 	Kind          MemoryItemKind
 	Key           string
@@ -58,6 +69,20 @@ type MemoryItem struct {
 	ExpiresAtMS   int64
 	DeletedAtMS   int64
 	Metadata      map[string]string
+}
+
+// MemoryObservation records immutable provenance for memory updates.
+type MemoryObservation struct {
+	ID         string
+	ItemID     string
+	SessionKey string
+	EventID    string
+	ObservedAt int64
+	Confidence float64
+	Content    string
+	Metadata   map[string]string
+	Extractor  string
+	Action     string
 }
 
 // MemoryLink relates memory items (entity graph edges).
@@ -92,6 +117,7 @@ type RetrievalOptions struct {
 	CacheTTL        time.Duration
 	NowMS           int64
 	IncludeSession  bool
+	IncludeUser     bool
 	IncludeGlobal   bool
 	RecencyHalfLife time.Duration
 }
@@ -116,6 +142,31 @@ type PromptContext struct {
 	RecallCards   []MemoryCard
 	RecallPrompt  string
 	Budget        ContextBudget
+	Continuity    PromptContinuity
+}
+
+// PromptContinuity captures context availability guarantees for a turn.
+type PromptContinuity struct {
+	HasPriorTurns bool
+	HasHistory    bool
+	HasSummary    bool
+	HasRecall     bool
+	Degraded      bool
+	DegradedBy    []string
+}
+
+// SessionSnapshot is a structured compaction artifact used for long-horizon continuity.
+type SessionSnapshot struct {
+	SessionKey   string
+	Revision     int
+	CreatedAtMS  int64
+	Facts        []string
+	Preferences  []string
+	Tasks        []string
+	OpenLoops    []string
+	Constraints  []string
+	Summary      string
+	CompactionID string
 }
 
 // Message is provider-agnostic prompt message representation.
