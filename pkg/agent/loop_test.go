@@ -10,6 +10,7 @@ import (
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
 	"github.com/dotsetgreg/dotagent/pkg/config"
+	"github.com/dotsetgreg/dotagent/pkg/memory"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
@@ -26,6 +27,15 @@ func (m *mockProvider) Chat(ctx context.Context, messages []providers.Message, t
 
 func (m *mockProvider) GetDefaultModel() string {
 	return "mock-model"
+}
+
+func mustNewAgentLoop(tb testing.TB, cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
+	tb.Helper()
+	al, err := NewAgentLoop(cfg, msgBus, provider)
+	if err != nil {
+		tb.Fatalf("NewAgentLoop failed: %v", err)
+	}
+	return al
 }
 
 func TestRecordLastChannel(t *testing.T) {
@@ -51,7 +61,7 @@ func TestRecordLastChannel(t *testing.T) {
 	// Create agent loop
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Test RecordLastChannel
 	testChannel := "test-channel"
@@ -67,7 +77,7 @@ func TestRecordLastChannel(t *testing.T) {
 	}
 
 	// Verify persistence by creating a new agent loop
-	al2 := NewAgentLoop(cfg, msgBus, provider)
+	al2 := mustNewAgentLoop(t, cfg, msgBus, provider)
 	if al2.state.GetLastChannel() != testChannel {
 		t.Errorf("Expected persistent channel '%s', got '%s'", testChannel, al2.state.GetLastChannel())
 	}
@@ -96,7 +106,7 @@ func TestRecordLastChatID(t *testing.T) {
 	// Create agent loop
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Test RecordLastChatID
 	testChatID := "test-chat-id-123"
@@ -112,7 +122,7 @@ func TestRecordLastChatID(t *testing.T) {
 	}
 
 	// Verify persistence by creating a new agent loop
-	al2 := NewAgentLoop(cfg, msgBus, provider)
+	al2 := mustNewAgentLoop(t, cfg, msgBus, provider)
 	if al2.state.GetLastChatID() != testChatID {
 		t.Errorf("Expected persistent chat ID '%s', got '%s'", testChatID, al2.state.GetLastChatID())
 	}
@@ -141,7 +151,7 @@ func TestNewAgentLoop_StateInitialized(t *testing.T) {
 	// Create agent loop
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Verify state manager is initialized
 	if al.state == nil {
@@ -176,7 +186,7 @@ func TestToolRegistry_ToolRegistration(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Register a custom tool
 	customTool := &mockCustomTool{}
@@ -222,7 +232,7 @@ func TestToolContext_Updates(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &simpleMockProvider{response: "OK"}
-	_ = NewAgentLoop(cfg, msgBus, provider)
+	_ = mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Verify that ContextualTool interface is defined and can be implemented
 	// This test validates the interface contract exists
@@ -253,7 +263,7 @@ func TestToolRegistry_GetDefinitions(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Register a test tool and verify it shows up in startup info
 	testTool := &mockCustomTool{}
@@ -297,7 +307,7 @@ func TestAgentLoop_GetStartupInfo(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	info := al.GetStartupInfo()
 
@@ -344,7 +354,7 @@ func TestAgentLoop_Stop(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &mockProvider{}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Note: running is only set to true when Run() is called
 	// We can't test that without starting the event loop
@@ -466,7 +476,7 @@ func TestToolResult_SilentToolDoesNotSendUserMessage(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &simpleMockProvider{response: "File operation complete"}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 	helper := testHelper{al: al}
 
 	// ReadFileTool returns SilentResult, which should not send user message
@@ -508,7 +518,7 @@ func TestToolResult_UserFacingToolDoesSendMessage(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &simpleMockProvider{response: "Command output: hello world"}
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 	helper := testHelper{al: al}
 
 	// ExecTool returns UserResult, which should send user message
@@ -552,6 +562,27 @@ func (m *failFirstMockProvider) GetDefaultModel() string {
 	return "mock-fail-model"
 }
 
+type captureRetryProvider struct {
+	currentCall        int
+	secondCallMessages []providers.Message
+}
+
+func (m *captureRetryProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	m.currentCall++
+	if m.currentCall == 1 {
+		return nil, fmt.Errorf("context window exceeded: too many tokens")
+	}
+	m.secondCallMessages = append([]providers.Message(nil), messages...)
+	return &providers.LLMResponse{
+		Content:   "retry-success",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *captureRetryProvider) GetDefaultModel() string {
+	return "mock-capture-retry"
+}
+
 // TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -581,7 +612,7 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 		successResp: "Recovered from context error",
 	}
 
-	al := NewAgentLoop(cfg, msgBus, provider)
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
 	// Inject some history to simulate a full context
 	sessionKey := "test-session-context"
@@ -594,7 +625,20 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 		{Role: "assistant", Content: "Old response 2"},
 		{Role: "user", Content: "Trigger message"},
 	}
-	al.sessions.SetHistory(sessionKey, history)
+	if err := al.memory.EnsureSession(context.Background(), sessionKey, "test", "test-chat", "local-user"); err != nil {
+		t.Fatalf("ensure memory session: %v", err)
+	}
+	for i, msg := range history {
+		if err := al.memory.AppendEvent(context.Background(), memory.Event{
+			SessionKey: sessionKey,
+			TurnID:     "seed-turn",
+			Seq:        i + 1,
+			Role:       msg.Role,
+			Content:    msg.Content,
+		}); err != nil {
+			t.Fatalf("append seed history: %v", err)
+		}
+	}
 
 	// Call ProcessDirectWithChannel
 	// Note: ProcessDirectWithChannel calls processMessage which will execute runLLMIteration
@@ -614,7 +658,11 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	}
 
 	// Check final history length
-	finalHistory := al.sessions.GetHistory(sessionKey)
+	promptCtx, err := al.memory.BuildPromptContext(context.Background(), sessionKey, "local-user", "Trigger message", 4096)
+	if err != nil {
+		t.Fatalf("build prompt context after retry: %v", err)
+	}
+	finalHistory := promptCtx.History
 	// We verify that the history has been modified (compressed)
 	// Original length: 6
 	// Expected behavior: compression drops ~50% of history (mid slice)
@@ -622,5 +670,47 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
 	if len(finalHistory) >= 8 {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	}
+}
+
+func TestAgentLoop_ContextRetryPreservesCurrentUserMessage(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &captureRetryProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	msg := "Please answer this exact query after retry"
+	response, err := al.ProcessDirectWithChannel(context.Background(), msg, "retry-session", "cli", "direct")
+	if err != nil {
+		t.Fatalf("ProcessDirectWithChannel failed: %v", err)
+	}
+	if response != "retry-success" {
+		t.Fatalf("unexpected response: %q", response)
+	}
+	if provider.currentCall != 2 {
+		t.Fatalf("expected 2 provider calls, got %d", provider.currentCall)
+	}
+
+	found := false
+	for _, m := range provider.secondCallMessages {
+		if m.Role == "user" && m.Content == msg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("retry request did not include original user message")
 	}
 }

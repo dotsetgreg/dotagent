@@ -1,0 +1,64 @@
+package memory
+
+import "context"
+
+// Store provides durable persistence for all memory state.
+type Store interface {
+	Close() error
+	EnsureSession(ctx context.Context, sessionKey, channel, chatID, userID string) error
+	GetSession(ctx context.Context, sessionKey string) (Session, error)
+	MarkSessionConsolidated(ctx context.Context, sessionKey string, atMS int64) error
+	GetSessionSummary(ctx context.Context, sessionKey string) (string, error)
+	SetSessionSummary(ctx context.Context, sessionKey, summary string) error
+	AppendEvent(ctx context.Context, ev Event) error
+	ListRecentEvents(ctx context.Context, sessionKey string, limit int, includeArchived bool) ([]Event, error)
+	ArchiveEventsBefore(ctx context.Context, sessionKey string, keepLatest int) (archivedCount int, err error)
+	StartCompaction(ctx context.Context, sessionKey string, sourceCount, retainedCount int, checkpoint map[string]string) (string, error)
+	CheckpointCompaction(ctx context.Context, compactionID string, checkpoint map[string]string) error
+	CompleteCompaction(ctx context.Context, compactionID, summary string) error
+	FailCompaction(ctx context.Context, compactionID, errMsg string) error
+
+	UpsertMemoryItem(ctx context.Context, item MemoryItem) (MemoryItem, error)
+	DeleteMemoryByKey(ctx context.Context, userID, agentID string, kind MemoryItemKind, key string) error
+	ListMemoryCandidates(ctx context.Context, userID, agentID, sessionKey string, limit int) ([]MemoryItem, error)
+	SearchMemoryFTS(ctx context.Context, userID, agentID, sessionKey, query string, limit int) ([]MemoryItem, error)
+	UpsertMemoryLink(ctx context.Context, link MemoryLink) error
+	ListMemoryLinks(ctx context.Context, itemID string, limit int) ([]MemoryLink, error)
+
+	UpsertEmbedding(ctx context.Context, itemID, model string, vector []float32) error
+	GetEmbeddings(ctx context.Context, itemIDs []string) (map[string][]float32, error)
+
+	GetRetrievalCache(ctx context.Context, key string, nowMS int64) (string, bool, error)
+	PutRetrievalCache(ctx context.Context, key, value string, expiresAtMS int64) error
+
+	EnqueueJob(ctx context.Context, job Job) error
+	ClaimNextJob(ctx context.Context, nowMS, leaseForMS int64) (Job, bool, error)
+	CompleteJob(ctx context.Context, id string) error
+	FailJob(ctx context.Context, id, errMsg string) error
+	RequeueExpiredJobs(ctx context.Context, nowMS int64) error
+
+	AddMetric(ctx context.Context, metric string, value float64, labels map[string]string) error
+}
+
+// Retriever recalls memories for prompt construction.
+type Retriever interface {
+	Recall(ctx context.Context, query string, opts RetrievalOptions) ([]MemoryCard, error)
+}
+
+// Consolidator extracts structured long-term memories from turns.
+type Consolidator interface {
+	ConsolidateTurn(ctx context.Context, sessionKey, turnID, userID, agentID string) error
+}
+
+// Compactor generates compaction artifacts and archives old thread events.
+type Compactor interface {
+	CompactSession(ctx context.Context, sessionKey, userID, agentID string, budget ContextBudget) error
+}
+
+// Policy controls capture/retention/selection behavior.
+type Policy interface {
+	ShouldCapture(ev Event) bool
+	TTLFor(kind MemoryItemKind) int64
+	MinConfidence(kind MemoryItemKind) float64
+	ShouldRecall(card MemoryCard) bool
+}

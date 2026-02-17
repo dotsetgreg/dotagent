@@ -32,7 +32,7 @@ services:
     volumes:
       # Configuration file
       - ./config/config.json:/root/.dotagent/config.json:ro
-      # Persistent workspace (sessions, memory, logs)
+      # Persistent workspace (state DB, skills, logs)
       - dotagent-workspace:/root/.dotagent/workspace
     command: ["gateway"]
 

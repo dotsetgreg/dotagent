@@ -17,7 +17,6 @@ import (
 type ContextBuilder struct {
 	workspace    string
 	skillsLoader *skills.SkillsLoader
-	memory       *MemoryStore
 	tools        *tools.ToolRegistry // Direct reference to tool registry
 }
 
@@ -39,7 +38,6 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 	return &ContextBuilder{
 		workspace:    workspace,
 		skillsLoader: skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
-		memory:       NewMemoryStore(workspace),
 	}
 }
 
@@ -68,8 +66,7 @@ You are dotagent, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: %s
-- Memory: %s/memory/MEMORY.md
-- Daily Notes: %s/memory/YYYYMM/YYYYMMDD.md
+- Memory DB: %s/state/memory.db
 - Skills: %s/skills/{skill-name}/SKILL.md
 
 %s
@@ -80,8 +77,8 @@ Your workspace is at: %s
 
 2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
-3. **Memory** - When remembering something, write to %s/memory/MEMORY.md`,
-		now, runtime, workspacePath, workspacePath, workspacePath, workspacePath, toolsSection, workspacePath)
+3. **Memory** - Memory capture and retrieval are automatic; use recalled memory context and current conversation state.`,
+		now, runtime, workspacePath, workspacePath, workspacePath, toolsSection)
 }
 
 func (cb *ContextBuilder) buildToolsSection() string {
@@ -128,12 +125,6 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 %s`, skillsSummary))
 	}
 
-	// Memory context
-	memoryContext := cb.memory.GetMemoryContext()
-	if memoryContext != "" {
-		parts = append(parts, "# Memory\n\n"+memoryContext)
-	}
-
 	// Join with "---" separator
 	return strings.Join(parts, "\n\n---\n\n")
 }
@@ -157,7 +148,7 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 	return result
 }
 
-func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary string, currentMessage string, media []string, channel, chatID string) []providers.Message {
+func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary string, recalledMemory string, currentMessage string, media []string, channel, chatID string) []providers.Message {
 	messages := []providers.Message{}
 
 	systemPrompt := cb.BuildSystemPrompt()
@@ -188,17 +179,17 @@ func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary str
 	if summary != "" {
 		systemPrompt += "\n\n## Summary of Previous Conversation\n\n" + summary
 	}
+	if strings.TrimSpace(recalledMemory) != "" {
+		systemPrompt += "\n\n" + strings.TrimSpace(recalledMemory)
+	}
 
-	//This fix prevents the session memory from LLM failure due to elimination of toolu_IDs required from LLM
-	// --- INICIO DEL FIX ---
-	//Diegox-17
+	// Drop leading orphaned tool messages because providers require a matching
+	// assistant tool call before any tool role message.
 	for len(history) > 0 && (history[0].Role == "tool") {
 		logger.DebugCF("agent", "Removing orphaned tool message from history to prevent LLM error",
 			map[string]interface{}{"role": history[0].Role})
 		history = history[1:]
 	}
-	//Diegox-17
-	// --- FIN DEL FIX ---
 
 	messages = append(messages, providers.Message{
 		Role:    "system",
@@ -207,10 +198,12 @@ func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary str
 
 	messages = append(messages, history...)
 
-	messages = append(messages, providers.Message{
-		Role:    "user",
-		Content: currentMessage,
-	})
+	if strings.TrimSpace(currentMessage) != "" {
+		messages = append(messages, providers.Message{
+			Role:    "user",
+			Content: currentMessage,
+		})
+	}
 
 	return messages
 }

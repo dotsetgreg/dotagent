@@ -57,23 +57,11 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {
 	}
 
 	for _, allowed := range c.allowList {
-		// Strip leading "@" from allowed value for username matching
-		trimmed := strings.TrimPrefix(allowed, "@")
-		allowedID := trimmed
-		allowedUser := ""
-		if idx := strings.Index(trimmed, "|"); idx > 0 {
-			allowedID = trimmed[:idx]
-			allowedUser = trimmed[idx+1:]
+		candidate := strings.TrimSpace(strings.TrimPrefix(allowed, "@"))
+		if candidate == "" {
+			continue
 		}
-
-		// Support either side using "id|username" compound form for backward compatibility.
-		if senderID == allowed ||
-			idPart == allowed ||
-			senderID == trimmed ||
-			idPart == trimmed ||
-			idPart == allowedID ||
-			(allowedUser != "" && senderID == allowedUser) ||
-			(userPart != "" && (userPart == allowed || userPart == trimmed || userPart == allowedUser)) {
+		if candidate == senderID || candidate == idPart || (userPart != "" && candidate == userPart) {
 			return true
 		}
 	}

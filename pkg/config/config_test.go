@@ -88,13 +88,12 @@ func TestDefaultConfig_Providers(t *testing.T) {
 	}
 }
 
-// TestDefaultConfig_Channels verifies channels are disabled by default
+// TestDefaultConfig_Channels verifies Discord config defaults
 func TestDefaultConfig_Channels(t *testing.T) {
 	cfg := DefaultConfig()
 
-	// Verify Discord channel is disabled by default
-	if cfg.Channels.Discord.Enabled {
-		t.Error("Discord should be disabled by default")
+	if cfg.Channels.Discord.Token != "" {
+		t.Error("Discord token should be empty by default")
 	}
 }
 

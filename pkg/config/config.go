@@ -49,6 +49,7 @@ type Config struct {
 	Providers ProvidersConfig `json:"providers"`
 	Gateway   GatewayConfig   `json:"gateway"`
 	Tools     ToolsConfig     `json:"tools"`
+	Memory    MemoryConfig    `json:"memory"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
 	Devices   DevicesConfig   `json:"devices"`
 	mu        sync.RWMutex
@@ -73,7 +74,6 @@ type ChannelsConfig struct {
 }
 
 type DiscordConfig struct {
-	Enabled   bool                `json:"enabled" env:"DOTAGENT_CHANNELS_DISCORD_ENABLED"`
 	Token     string              `json:"token" env:"DOTAGENT_CHANNELS_DISCORD_TOKEN"`
 	AllowFrom FlexibleStringSlice `json:"allow_from" env:"DOTAGENT_CHANNELS_DISCORD_ALLOW_FROM"`
 }
@@ -123,6 +123,14 @@ type ToolsConfig struct {
 	Web WebToolsConfig `json:"web"`
 }
 
+type MemoryConfig struct {
+	MaxRecallItems        int `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
+	CandidateLimit        int `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
+	RetrievalCacheSeconds int `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
+	WorkerPollMS          int `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
+	WorkerLeaseSeconds    int `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Agents: AgentsConfig{
@@ -138,7 +146,6 @@ func DefaultConfig() *Config {
 		},
 		Channels: ChannelsConfig{
 			Discord: DiscordConfig{
-				Enabled:   false,
 				Token:     "",
 				AllowFrom: FlexibleStringSlice{},
 			},
@@ -162,6 +169,13 @@ func DefaultConfig() *Config {
 					MaxResults: 5,
 				},
 			},
+		},
+		Memory: MemoryConfig{
+			MaxRecallItems:        8,
+			CandidateLimit:        80,
+			RetrievalCacheSeconds: 20,
+			WorkerPollMS:          700,
+			WorkerLeaseSeconds:    60,
 		},
 		Heartbeat: HeartbeatConfig{
 			Enabled:  true,

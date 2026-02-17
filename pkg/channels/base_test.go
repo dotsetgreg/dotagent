@@ -28,9 +28,9 @@ func TestBaseChannelIsAllowed(t *testing.T) {
 			want:      true,
 		},
 		{
-			name:      "numeric sender matches legacy compound allowlist",
+			name:      "exact compound sender matches compound allowlist",
 			allowList: []string{"123456|alice"},
-			senderID:  "123456",
+			senderID:  "123456|alice",
 			want:      true,
 		},
 		{

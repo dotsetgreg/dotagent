@@ -1,85 +1,63 @@
 # DotAgent
 
-DotAgent is a lightweight AI agent runtime written in Go.
-
-Supported runtime integrations:
-- Messaging: Discord only
-- LLM provider: OpenRouter only
+DotAgent is a Go-based personal agent runtime with:
+- Messaging: Discord
+- LLM provider: OpenRouter
+- Memory: unified SQLite store (`workspace/state/memory.db`)
 
 ## Requirements
 
 - Go 1.25+
 - OpenRouter API key
-- Discord bot token (gateway mode only)
+- Discord bot token (for `gateway` mode)
 
 ## Install
 
 ```bash
 git clone https://github.com/dotsetgreg/dotagent.git
 cd dotagent
-make deps
-make build
+go build -o dotagent ./cmd/dotagent
 ```
 
-## Quick Start
-
-### 1. Initialize config and workspace
+## Onboard
 
 ```bash
-dotagent onboard
+./dotagent onboard
 ```
 
-### 2. Configure OpenRouter and Discord
+This creates `~/.dotagent/config.json` and a default workspace.
 
-Edit `~/.dotagent/config.json`:
+Update at least:
+- `providers.openrouter.api_key`
+- `channels.discord.token` (for gateway mode)
 
-```json
-{
-  "agents": {
-    "defaults": {
-      "workspace": "~/.dotagent/workspace",
-      "restrict_to_workspace": true,
-      "provider": "openrouter",
-      "model": "openai/gpt-5.2",
-      "max_tokens": 8192,
-      "temperature": 0.7,
-      "max_tool_iterations": 20
-    }
-  },
-  "providers": {
-    "openrouter": {
-      "api_key": "sk-or-v1-...",
-      "api_base": "https://openrouter.ai/api/v1"
-    }
-  },
-  "channels": {
-    "discord": {
-      "enabled": true,
-      "token": "YOUR_DISCORD_BOT_TOKEN",
-      "allow_from": []
-    }
-  }
-}
-```
-
-### 3. Run gateway mode
+Validate setup:
 
 ```bash
-dotagent gateway
+./dotagent status
 ```
 
-### 4. Or run local CLI mode
+## Run
+
+Local CLI interaction:
 
 ```bash
-dotagent agent -m "Summarize this repo"
+./dotagent agent
+./dotagent agent -m "Summarize this repo"
 ```
 
-## Discord Setup
+Discord gateway:
 
-1. Create a Discord application and bot: <https://discord.com/developers/applications>
-2. Copy bot token into `channels.discord.token`
-3. Enable **MESSAGE CONTENT INTENT** for the bot
-4. Invite bot with scope `bot` and permissions like `Send Messages` and `Read Message History`
+```bash
+./dotagent gateway
+```
+
+## Config Notes
+
+- Provider is OpenRouter (`agents.defaults.provider=openrouter`)
+- Discord is the only messaging channel (`channels.discord`)
+- Default model is `openai/gpt-5.2`
+- Canonical memory DB: `~/.dotagent/workspace/state/memory.db`
 
 ## Environment Variables
 
@@ -89,8 +67,14 @@ DOTAGENT_PROVIDERS_OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 DOTAGENT_AGENTS_DEFAULTS_PROVIDER=openrouter
 DOTAGENT_AGENTS_DEFAULTS_MODEL=openai/gpt-5.2
 
-DOTAGENT_CHANNELS_DISCORD_ENABLED=true
 DOTAGENT_CHANNELS_DISCORD_TOKEN=YOUR_DISCORD_BOT_TOKEN
+DOTAGENT_CHANNELS_DISCORD_ALLOW_FROM=123456789012345678
+
+DOTAGENT_MEMORY_MAX_RECALL_ITEMS=8
+DOTAGENT_MEMORY_CANDIDATE_LIMIT=80
+DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS=20
+DOTAGENT_MEMORY_WORKER_POLL_MS=700
+DOTAGENT_MEMORY_WORKER_LEASE_SECONDS=60
 ```
 
 ## Commands
@@ -98,10 +82,8 @@ DOTAGENT_CHANNELS_DISCORD_TOKEN=YOUR_DISCORD_BOT_TOKEN
 ```bash
 dotagent onboard
 dotagent agent
-dotagent agent -m "your prompt"
 dotagent gateway
 dotagent status
-dotagent migrate
 dotagent cron
 dotagent skills
 dotagent version
@@ -110,9 +92,5 @@ dotagent version
 ## Test
 
 ```bash
-go test ./pkg/...
+GOCACHE=/tmp/go-build go test ./...
 ```
-
-## License
-
-MIT

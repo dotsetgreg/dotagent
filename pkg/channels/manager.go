@@ -9,6 +9,7 @@ package channels
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
@@ -46,18 +47,17 @@ func NewManager(cfg *config.Config, messageBus *bus.MessageBus) (*Manager, error
 func (m *Manager) initChannels() error {
 	logger.InfoC("channels", "Initializing channel manager")
 
-	if m.config.Channels.Discord.Enabled && m.config.Channels.Discord.Token != "" {
-		logger.DebugC("channels", "Attempting to initialize Discord channel")
-		discord, err := NewDiscordChannel(m.config.Channels.Discord, m.bus)
-		if err != nil {
-			logger.ErrorCF("channels", "Failed to initialize Discord channel", map[string]interface{}{
-				"error": err.Error(),
-			})
-		} else {
-			m.channels["discord"] = discord
-			logger.InfoC("channels", "Discord channel enabled successfully")
-		}
+	if strings.TrimSpace(m.config.Channels.Discord.Token) == "" {
+		return fmt.Errorf("channels.discord.token is required")
 	}
+
+	logger.DebugC("channels", "Attempting to initialize Discord channel")
+	discord, err := NewDiscordChannel(m.config.Channels.Discord, m.bus)
+	if err != nil {
+		return fmt.Errorf("initialize Discord channel: %w", err)
+	}
+	m.channels["discord"] = discord
+	logger.InfoC("channels", "Discord channel initialized successfully")
 
 	logger.InfoCF("channels", "Channel initialization completed", map[string]interface{}{
 		"enabled_channels": len(m.channels),

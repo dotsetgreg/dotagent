@@ -12,7 +12,6 @@
   },
   "channels": {
     "discord": {
-      "enabled": false,
       "token": "YOUR_DISCORD_BOT_TOKEN",
       "allow_from": []
     }
@@ -36,6 +35,13 @@
         "max_results": 5
       }
     }
+  },
+  "memory": {
+    "max_recall_items": 8,
+    "candidate_limit": 80,
+    "retrieval_cache_seconds": 20,
+    "worker_poll_ms": 700,
+    "worker_lease_seconds": 60
   },
   "heartbeat": {
     "enabled": true,

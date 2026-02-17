@@ -31,7 +31,6 @@ import (
 	"github.com/dotsetgreg/dotagent/pkg/health"
 	"github.com/dotsetgreg/dotagent/pkg/heartbeat"
 	"github.com/dotsetgreg/dotagent/pkg/logger"
-	"github.com/dotsetgreg/dotagent/pkg/migrate"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 	"github.com/dotsetgreg/dotagent/pkg/skills"
 	"github.com/dotsetgreg/dotagent/pkg/state"
@@ -134,8 +133,6 @@ func main() {
 		gatewayCmd()
 	case "status":
 		statusCmd()
-	case "migrate":
-		migrateCmd()
 	case "cron":
 		cronCmd()
 	case "skills":
@@ -206,7 +203,6 @@ func printHelp() {
 	fmt.Println("  gateway     Start dotagent gateway")
 	fmt.Println("  status      Show dotagent status")
 	fmt.Println("  cron        Manage scheduled tasks")
-	fmt.Println("  migrate     Migrate from OpenClaw to DotAgent")
 	fmt.Println("  skills      Manage skills (install, list, remove)")
 	fmt.Println("  version     Show version information")
 }
@@ -217,9 +213,15 @@ func onboard() {
 	if _, err := os.Stat(configPath); err == nil {
 		fmt.Printf("Config already exists at %s\n", configPath)
 		fmt.Print("Overwrite? (y/n): ")
-		var response string
-		fmt.Scanln(&response)
-		if response != "y" {
+		reader := bufio.NewReader(os.Stdin)
+		response, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			fmt.Printf("Error reading input: %v\n", readErr)
+			fmt.Println("Aborted.")
+			return
+		}
+		response = strings.ToLower(strings.TrimSpace(response))
+		if response != "y" && response != "yes" {
 			fmt.Println("Aborted.")
 			return
 		}
@@ -232,13 +234,19 @@ func onboard() {
 	}
 
 	workspace := cfg.WorkspacePath()
-	createWorkspaceTemplates(workspace)
+	if err := createWorkspaceTemplates(workspace); err != nil {
+		fmt.Printf("Error creating workspace templates: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("%s dotagent is ready!\n", logo)
 	fmt.Println("\nNext steps:")
 	fmt.Println("  1. Add your API key to", configPath)
 	fmt.Println("     Get one at: https://openrouter.ai/keys")
-	fmt.Println("  2. Chat: dotagent agent -m \"Hello!\"")
+	fmt.Println("  2. (Gateway mode) Add your Discord bot token to channels.discord.token")
+	fmt.Println("  3. Chat locally: dotagent agent -m \"Hello!\"")
+	fmt.Println("  4. Run gateway: dotagent gateway")
+	fmt.Println("  5. Check readiness: dotagent status")
 }
 
 func copyEmbeddedToTarget(targetDir string) error {
@@ -288,81 +296,19 @@ func copyEmbeddedToTarget(targetDir string) error {
 	return err
 }
 
-func createWorkspaceTemplates(workspace string) {
-	err := copyEmbeddedToTarget(workspace)
-	if err != nil {
-		fmt.Printf("Error copying workspace templates: %v\n", err)
-	}
+func createWorkspaceTemplates(workspace string) error {
+	return copyEmbeddedToTarget(workspace)
 }
 
-func migrateCmd() {
-	if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") {
-		migrateHelp()
-		return
+func validateRuntimeConfig(cfg *config.Config, requireDiscord bool) error {
+	configPath := getConfigPath()
+	if strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) == "" {
+		return fmt.Errorf("providers.openrouter.api_key is required in %s or DOTAGENT_PROVIDERS_OPENROUTER_API_KEY", configPath)
 	}
-
-	opts := migrate.Options{}
-
-	args := os.Args[2:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--dry-run":
-			opts.DryRun = true
-		case "--config-only":
-			opts.ConfigOnly = true
-		case "--workspace-only":
-			opts.WorkspaceOnly = true
-		case "--force":
-			opts.Force = true
-		case "--refresh":
-			opts.Refresh = true
-		case "--openclaw-home":
-			if i+1 < len(args) {
-				opts.OpenClawHome = args[i+1]
-				i++
-			}
-		case "--dotagent-home":
-			if i+1 < len(args) {
-				opts.DotAgentHome = args[i+1]
-				i++
-			}
-		default:
-			fmt.Printf("Unknown flag: %s\n", args[i])
-			migrateHelp()
-			os.Exit(1)
-		}
+	if requireDiscord && strings.TrimSpace(cfg.Channels.Discord.Token) == "" {
+		return fmt.Errorf("channels.discord.token is required in %s or DOTAGENT_CHANNELS_DISCORD_TOKEN", configPath)
 	}
-
-	result, err := migrate.Run(opts)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !opts.DryRun {
-		migrate.PrintSummary(result)
-	}
-}
-
-func migrateHelp() {
-	fmt.Println("\nMigrate from OpenClaw to DotAgent")
-	fmt.Println()
-	fmt.Println("Usage: dotagent migrate [options]")
-	fmt.Println()
-	fmt.Println("Options:")
-	fmt.Println("  --dry-run          Show what would be migrated without making changes")
-	fmt.Println("  --refresh          Re-sync workspace files from OpenClaw (repeatable)")
-	fmt.Println("  --config-only      Only migrate config, skip workspace files")
-	fmt.Println("  --workspace-only   Only migrate workspace files, skip config")
-	fmt.Println("  --force            Skip confirmation prompts")
-	fmt.Println("  --openclaw-home    Override OpenClaw home directory (default: ~/.openclaw)")
-	fmt.Println("  --dotagent-home    Override DotAgent home directory (default: ~/.dotagent)")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  dotagent migrate              Detect and migrate from OpenClaw")
-	fmt.Println("  dotagent migrate --dry-run    Show what would be migrated")
-	fmt.Println("  dotagent migrate --refresh    Re-sync workspace files")
-	fmt.Println("  dotagent migrate --force      Migrate without confirmation")
+	return nil
 }
 
 func agentCmd() {
@@ -393,6 +339,10 @@ func agentCmd() {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
+	if err := validateRuntimeConfig(cfg, false); err != nil {
+		fmt.Printf("Configuration error: %v\n", err)
+		os.Exit(1)
+	}
 
 	provider, err := providers.CreateProvider(cfg)
 	if err != nil {
@@ -401,7 +351,11 @@ func agentCmd() {
 	}
 
 	msgBus := bus.NewMessageBus()
-	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	agentLoop, err := agent.NewAgentLoop(cfg, msgBus, provider)
+	if err != nil {
+		fmt.Printf("Error initializing memory subsystem: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Print agent startup info (only for interactive mode)
 	startupInfo := agentLoop.GetStartupInfo()
@@ -528,6 +482,10 @@ func gatewayCmd() {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
+	if err := validateRuntimeConfig(cfg, true); err != nil {
+		fmt.Printf("Configuration error: %v\n", err)
+		os.Exit(1)
+	}
 
 	provider, err := providers.CreateProvider(cfg)
 	if err != nil {
@@ -536,7 +494,11 @@ func gatewayCmd() {
 	}
 
 	msgBus := bus.NewMessageBus()
-	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	agentLoop, err := agent.NewAgentLoop(cfg, msgBus, provider)
+	if err != nil {
+		fmt.Printf("Error initializing memory subsystem: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Print agent startup info
 	fmt.Println("\n📦 Agent Status:")
@@ -593,11 +555,7 @@ func gatewayCmd() {
 	agentLoop.SetChannelManager(channelManager)
 
 	enabledChannels := channelManager.GetEnabledChannels()
-	if len(enabledChannels) > 0 {
-		fmt.Printf("✓ Channels enabled: %s\n", enabledChannels)
-	} else {
-		fmt.Println("⚠ Warning: No channels enabled")
-	}
+	fmt.Printf("✓ Channels enabled: %s\n", strings.Join(enabledChannels, ", "))
 
 	fmt.Printf("✓ Gateway started on %s:%d\n", cfg.Gateway.Host, cfg.Gateway.Port)
 	fmt.Println("Press Ctrl+C to stop")
@@ -685,6 +643,12 @@ func statusCmd() {
 	} else {
 		fmt.Println("Workspace:", workspace, "✗")
 	}
+	memoryDB := filepath.Join(workspace, "state", "memory.db")
+	if _, err := os.Stat(memoryDB); err == nil {
+		fmt.Println("Memory DB:", memoryDB, "✓")
+	} else {
+		fmt.Println("Memory DB:", memoryDB, "not initialized")
+	}
 
 	if _, err := os.Stat(configPath); err == nil {
 		fmt.Printf("Model: %s\n", cfg.Agents.Defaults.Model)
@@ -695,7 +659,13 @@ func statusCmd() {
 			}
 			return "not set"
 		}
-		fmt.Println("OpenRouter API:", status(cfg.Providers.OpenRouter.APIKey != ""))
+		apiReady := strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) != ""
+		discordReady := strings.TrimSpace(cfg.Channels.Discord.Token) != ""
+
+		fmt.Println("OpenRouter API:", status(apiReady))
+		fmt.Println("Discord token:", status(discordReady))
+		fmt.Println("Agent ready:", status(apiReady))
+		fmt.Println("Gateway ready:", status(apiReady && discordReady))
 	}
 }
 

@@ -11,23 +11,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
 	"github.com/dotsetgreg/dotagent/pkg/channels"
 	"github.com/dotsetgreg/dotagent/pkg/config"
 	"github.com/dotsetgreg/dotagent/pkg/constants"
 	"github.com/dotsetgreg/dotagent/pkg/logger"
+	"github.com/dotsetgreg/dotagent/pkg/memory"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
-	"github.com/dotsetgreg/dotagent/pkg/session"
 	"github.com/dotsetgreg/dotagent/pkg/state"
 	"github.com/dotsetgreg/dotagent/pkg/tools"
 	"github.com/dotsetgreg/dotagent/pkg/utils"
+	"github.com/google/uuid"
 )
 
 type AgentLoop struct {
@@ -37,12 +35,11 @@ type AgentLoop struct {
 	model          string
 	contextWindow  int // Maximum context window size in tokens
 	maxIterations  int
-	sessions       *session.SessionManager
+	memory         *memory.Service
 	state          *state.Manager
 	contextBuilder *ContextBuilder
 	tools          *tools.ToolRegistry
 	running        atomic.Bool
-	summarizing    sync.Map // Tracks which sessions are currently being summarized
 	channelManager *channels.Manager
 }
 
@@ -51,6 +48,7 @@ type processOptions struct {
 	SessionKey      string // Session identifier for history/context
 	Channel         string // Target channel for tool execution
 	ChatID          string // Target chat ID for tool execution
+	UserID          string // User identifier for memory namespace
 	UserMessage     string // User message content (may include prefix)
 	DefaultResponse string // Response when LLM returns empty
 	EnableSummary   bool   // Whether to trigger summarization
@@ -104,7 +102,7 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 	return registry
 }
 
-func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
+func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) (*AgentLoop, error) {
 	workspace := cfg.WorkspacePath()
 	os.MkdirAll(workspace, 0755)
 
@@ -127,14 +125,43 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	subagentTool := tools.NewSubagentTool(subagentManager)
 	toolsRegistry.Register(subagentTool)
 
-	sessionsManager := session.NewSessionManager(filepath.Join(workspace, "sessions"))
-
 	// Create state manager for atomic state persistence
 	stateManager := state.NewManager(workspace)
 
 	// Create context builder and set tools registry
 	contextBuilder := NewContextBuilder(workspace)
 	contextBuilder.SetToolsRegistry(toolsRegistry)
+
+	summarizeFn := func(ctx context.Context, existingSummary, transcript string) (string, error) {
+		prompt := "Update the durable conversation summary.\n" +
+			"Preserve user preferences, constraints, commitments, unresolved tasks, and key technical context.\n" +
+			"Keep it compact and factual.\n\n" +
+			"EXISTING SUMMARY:\n" + existingSummary + "\n\n" +
+			"NEW TRANSCRIPT SEGMENT:\n" + transcript + "\n\n" +
+			"Return only the updated summary."
+		resp, err := provider.Chat(ctx, []providers.Message{{Role: "user", Content: prompt}}, nil, cfg.Agents.Defaults.Model, map[string]interface{}{
+			"max_tokens":  900,
+			"temperature": 0.2,
+		})
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(resp.Content), nil
+	}
+
+	memSvc, err := memory.NewService(memory.Config{
+		Workspace:        workspace,
+		AgentID:          "dotagent",
+		MaxContextTokens: cfg.Agents.Defaults.MaxTokens,
+		MaxRecallItems:   cfg.Memory.MaxRecallItems,
+		CandidateLimit:   cfg.Memory.CandidateLimit,
+		RetrievalCache:   time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
+		WorkerLease:      time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
+		WorkerPoll:       time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+	}, summarizeFn)
+	if err != nil {
+		return nil, fmt.Errorf("initialize memory service: %w", err)
+	}
 
 	return &AgentLoop{
 		bus:            msgBus,
@@ -143,12 +170,11 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		model:          cfg.Agents.Defaults.Model,
 		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
-		sessions:       sessionsManager,
+		memory:         memSvc,
 		state:          stateManager,
 		contextBuilder: contextBuilder,
 		tools:          toolsRegistry,
-		summarizing:    sync.Map{},
-	}
+	}, nil
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
@@ -195,6 +221,9 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 func (al *AgentLoop) Stop() {
 	al.running.Store(false)
+	if al.memory != nil {
+		_ = al.memory.Close()
+	}
 }
 
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {
@@ -224,7 +253,7 @@ func (al *AgentLoop) ProcessDirect(ctx context.Context, content, sessionKey stri
 func (al *AgentLoop) ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID string) (string, error) {
 	msg := bus.InboundMessage{
 		Channel:    channel,
-		SenderID:   "cron",
+		SenderID:   "local-user",
 		ChatID:     chatID,
 		Content:    content,
 		SessionKey: sessionKey,
@@ -240,6 +269,7 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 		SessionKey:      "heartbeat",
 		Channel:         channel,
 		ChatID:          chatID,
+		UserID:          "heartbeat",
 		UserMessage:     content,
 		DefaultResponse: "I've completed processing but have no response to give.",
 		EnableSummary:   false,
@@ -279,6 +309,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		SessionKey:      msg.SessionKey,
 		Channel:         msg.Channel,
 		ChatID:          msg.ChatID,
+		UserID:          msg.SenderID,
 		UserMessage:     msg.Content,
 		DefaultResponse: "I've completed processing but have no response to give.",
 		EnableSummary:   true,
@@ -355,27 +386,58 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	// 1. Update tool contexts
 	al.updateToolContexts(opts.Channel, opts.ChatID)
 
+	// 1.5 Ensure memory session exists
+	if !opts.NoHistory {
+		if err := al.memory.EnsureSession(ctx, opts.SessionKey, opts.Channel, opts.ChatID, opts.UserID); err != nil {
+			logger.WarnCF("agent", "Failed to ensure memory session", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
+		}
+	}
+
 	// 2. Build messages (skip history for heartbeat)
 	var history []providers.Message
 	var summary string
+	var recall string
 	if !opts.NoHistory {
-		history = al.sessions.GetHistory(opts.SessionKey)
-		summary = al.sessions.GetSummary(opts.SessionKey)
+		promptCtx, err := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
+		if err != nil {
+			logger.WarnCF("agent", "Failed to build memory prompt context", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
+		} else {
+			history = toProviderMessages(promptCtx.History)
+			summary = promptCtx.Summary
+			recall = promptCtx.RecallPrompt
+		}
 	}
 	messages := al.contextBuilder.BuildMessages(
 		history,
 		summary,
+		recall,
 		opts.UserMessage,
 		nil,
 		opts.Channel,
 		opts.ChatID,
 	)
 
-	// 3. Save user message to session
-	al.sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
+	// 3. Persist user event immediately
+	turnID := "turn-" + uuid.NewString()
+	seq := 1
+	if !opts.NoHistory {
+		_ = al.memory.AppendEvent(ctx, memory.Event{
+			SessionKey: opts.SessionKey,
+			TurnID:     turnID,
+			Seq:        seq,
+			Role:       "user",
+			Content:    opts.UserMessage,
+			Metadata: map[string]string{
+				"channel": opts.Channel,
+				"chat_id": opts.ChatID,
+				"user_id": opts.UserID,
+			},
+		})
+		seq++
+	}
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts)
+	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq)
 	if err != nil {
 		return "", err
 	}
@@ -388,16 +450,27 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		finalContent = opts.DefaultResponse
 	}
 
-	// 6. Save final assistant message to session
-	al.sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
-	al.sessions.Save(opts.SessionKey)
-
-	// 7. Optional: summarization
-	if opts.EnableSummary {
-		al.maybeSummarize(opts.SessionKey, opts.Channel, opts.ChatID)
+	// 6. Save final assistant event and schedule memory maintenance
+	if !opts.NoHistory {
+		_ = al.memory.AppendEvent(ctx, memory.Event{
+			SessionKey: opts.SessionKey,
+			TurnID:     turnID,
+			Seq:        seq,
+			Role:       "assistant",
+			Content:    finalContent,
+			Metadata: map[string]string{
+				"channel": opts.Channel,
+				"chat_id": opts.ChatID,
+				"user_id": opts.UserID,
+			},
+		})
+		seq++
+		if opts.EnableSummary {
+			al.memory.ScheduleTurnMaintenance(ctx, opts.SessionKey, turnID, opts.UserID)
+		}
 	}
 
-	// 8. Optional: send response via bus
+	// 7. Optional: send response via bus
 	if opts.SendResponse {
 		al.bus.PublishOutbound(bus.OutboundMessage{
 			Channel: opts.Channel,
@@ -406,7 +479,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		})
 	}
 
-	// 9. Log response
+	// 8. Log response
 	responsePreview := utils.Truncate(finalContent, 120)
 	logger.InfoCF("agent", fmt.Sprintf("Response: %s", responsePreview),
 		map[string]interface{}{
@@ -420,7 +493,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 // runLLMIteration executes the LLM call loop with tool handling.
 // Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions) (string, int, error) {
+func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int) (string, int, error) {
 	iteration := 0
 	var finalContent string
 
@@ -489,91 +562,27 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					al.bus.PublishOutbound(bus.OutboundMessage{
 						Channel: opts.Channel,
 						ChatID:  opts.ChatID,
-						Content: "⚠️ Context window exceeded. Compressing history and retrying...",
+						Content: "⚠️ Context window exceeded. Compacting memory and retrying...",
 					})
 				}
 
-				// Force compression
-				al.forceCompression(opts.SessionKey)
-
-				// Rebuild messages with compressed history
-				// Note: We need to reload history from session manager because forceCompression changed it
-				newHistory := al.sessions.GetHistory(opts.SessionKey)
-				newSummary := al.sessions.GetSummary(opts.SessionKey)
-
-				// Re-create messages for the next attempt
-				// We keep the current user message (opts.UserMessage) effectively
-				messages = al.contextBuilder.BuildMessages(
-					newHistory,
-					newSummary,
-					opts.UserMessage,
-					nil,
-					opts.Channel,
-					opts.ChatID,
-				)
-
-				// Important: If we are in the middle of a tool loop (iteration > 1),
-				// rebuilding messages from session history might duplicate the flow or miss context
-				// if intermediate steps weren't saved correctly.
-				// However, al.sessions.AddFullMessage is called after every tool execution,
-				// so GetHistory should reflect the current state including partial tool execution.
-				// But we need to ensure we don't duplicate the user message which is appended in BuildMessages.
-				// BuildMessages(history...) takes the stored history and appends the *current* user message.
-				// If iteration > 1, the "current user message" was already added to history in step 3 of runAgentLoop.
-				// So if we pass opts.UserMessage again, we might duplicate it?
-				// Actually, step 3 is: al.sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
-				// So GetHistory ALREADY contains the user message!
-
-				// CORRECTION:
-				// BuildMessages combines: [System] + [History] + [CurrentMessage]
-				// But Step 3 added CurrentMessage to History.
-				// So if we use GetHistory now, it has the user message.
-				// If we pass opts.UserMessage to BuildMessages, it adds it AGAIN.
-
-				// For retry in the middle of a loop, we should rely on what's in the session.
-				// BUT checking BuildMessages implementation:
-				// It appends history... then appends currentMessage.
-
-				// Logic fix for retry:
-				// If iteration == 1, opts.UserMessage corresponds to the user input.
-				// If iteration > 1, we are processing tool results. The "messages" passed to Chat
-				// already accumulated tool outputs.
-				// Rebuilding from session history is safest because it persists state.
-				// Start fresh with rebuilt history.
-
-				// Special case: standard BuildMessages appends "currentMessage".
-				// If we are strictly retrying the *LLM call*, we want the exact same state as before but compressed.
-				// However, the "messages" argument passed to runLLMIteration is constructed by the caller.
-				// If we rebuild from Session, we need to know if "currentMessage" should be appended or is already in history.
-
-				// In runAgentLoop:
-				// 3. sessions.AddMessage(userMsg)
-				// 4. runLLMIteration(..., UserMessage)
-
-				// So History contains the user message.
-				// BuildMessages typically appends the user message as a *new* pending message.
-				// Wait, standard BuildMessages usage in runAgentLoop:
-				// messages := BuildMessages(history (has old), UserMessage)
-				// THEN AddMessage(UserMessage).
-				// So "history" passed to BuildMessages does NOT contain the current UserMessage yet.
-
-				// But here, inside the loop, we have already saved it.
-				// So GetHistory() includes the current user message.
-				// If we call BuildMessages(GetHistory(), UserMessage), we get duplicates.
-
-				// Hack/Fix:
-				// If we are retrying, we rebuild from Session History ONLY.
-				// We pass empty string as "currentMessage" to BuildMessages
-				// because the "current message" is already saved in history (step 3).
-
-				messages = al.contextBuilder.BuildMessages(
-					newHistory,
-					newSummary,
-					"", // Empty because history already contains the relevant messages
-					nil,
-					opts.Channel,
-					opts.ChatID,
-				)
+				if err := al.memory.ForceCompact(ctx, opts.SessionKey, opts.UserID, al.contextWindow); err != nil {
+					logger.WarnCF("agent", "Memory force compaction failed", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
+				}
+				rebuilt, bErr := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
+				if bErr != nil {
+					logger.WarnCF("agent", "Failed rebuilding prompt context after compaction", map[string]interface{}{"error": bErr.Error()})
+				} else {
+					messages = al.contextBuilder.BuildMessages(
+						toProviderMessages(rebuilt.History),
+						rebuilt.Summary,
+						rebuilt.RecallPrompt,
+						opts.UserMessage,
+						nil,
+						opts.Channel,
+						opts.ChatID,
+					)
+				}
 
 				continue
 			}
@@ -632,8 +641,22 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		}
 		messages = append(messages, assistantMsg)
 
-		// Save assistant message with tool calls to session
-		al.sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+		if !opts.NoHistory {
+			_ = al.memory.AppendEvent(ctx, memory.Event{
+				SessionKey: opts.SessionKey,
+				TurnID:     turnID,
+				Seq:        *seq,
+				Role:       "assistant",
+				Content:    response.Content,
+				Metadata: map[string]string{
+					"channel":         opts.Channel,
+					"chat_id":         opts.ChatID,
+					"user_id":         opts.UserID,
+					"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
+				},
+			})
+			*seq = *seq + 1
+		}
 
 		// Execute tool calls
 		for _, tc := range response.ToolCalls {
@@ -646,10 +669,9 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					"iteration": iteration,
 				})
 
-			// Create async callback for tools that implement AsyncTool
-			// NOTE: Following openclaw's design, async tools do NOT send results directly to users.
-			// Instead, they notify the agent via PublishInbound, and the agent decides
-			// whether to forward the result to the user (in processSystemMessage).
+			// Create async callback for tools that implement AsyncTool.
+			// Async tools do not send directly to users. They notify the agent via
+			// PublishInbound, and processSystemMessage decides whether to forward output.
 			asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
 				// Log the async completion but don't send directly to user
 				// The agent will handle user notification via processSystemMessage
@@ -691,8 +713,23 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			}
 			messages = append(messages, toolResultMsg)
 
-			// Save tool result message to session
-			al.sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+			if !opts.NoHistory {
+				_ = al.memory.AppendEvent(ctx, memory.Event{
+					SessionKey: opts.SessionKey,
+					TurnID:     turnID,
+					Seq:        *seq,
+					Role:       "tool",
+					Content:    contentForLLM,
+					ToolCallID: tc.ID,
+					ToolName:   tc.Name,
+					Metadata: map[string]string{
+						"channel": opts.Channel,
+						"chat_id": opts.ChatID,
+						"user_id": opts.UserID,
+					},
+				})
+				*seq = *seq + 1
+			}
 		}
 	}
 
@@ -717,90 +754,6 @@ func (al *AgentLoop) updateToolContexts(channel, chatID string) {
 			st.SetContext(channel, chatID)
 		}
 	}
-}
-
-// maybeSummarize triggers summarization if the session history exceeds thresholds.
-func (al *AgentLoop) maybeSummarize(sessionKey, channel, chatID string) {
-	newHistory := al.sessions.GetHistory(sessionKey)
-	tokenEstimate := al.estimateTokens(newHistory)
-	threshold := al.contextWindow * 75 / 100
-
-	if len(newHistory) > 20 || tokenEstimate > threshold {
-		if _, loading := al.summarizing.LoadOrStore(sessionKey, true); !loading {
-			go func() {
-				defer al.summarizing.Delete(sessionKey)
-				// Notify user about optimization if not an internal channel
-				if !constants.IsInternalChannel(channel) {
-					al.bus.PublishOutbound(bus.OutboundMessage{
-						Channel: channel,
-						ChatID:  chatID,
-						Content: "⚠️ Memory threshold reached. Optimizing conversation history...",
-					})
-				}
-				al.summarizeSession(sessionKey)
-			}()
-		}
-	}
-}
-
-// forceCompression aggressively reduces context when the limit is hit.
-// It drops the oldest 50% of messages (keeping system prompt and last user message).
-func (al *AgentLoop) forceCompression(sessionKey string) {
-	history := al.sessions.GetHistory(sessionKey)
-	if len(history) <= 4 {
-		return
-	}
-
-	// Keep system prompt (usually [0]) and the very last message (user's trigger)
-	// We want to drop the oldest half of the *conversation*
-	// Assuming [0] is system, [1:] is conversation
-	conversation := history[1 : len(history)-1]
-	if len(conversation) == 0 {
-		return
-	}
-
-	// Helper to find the mid-point of the conversation
-	mid := len(conversation) / 2
-
-	// New history structure:
-	// 1. System Prompt
-	// 2. [Summary of dropped part] - synthesized
-	// 3. Second half of conversation
-	// 4. Last message
-
-	// Simplified approach for emergency: Drop first half of conversation
-	// and rely on existing summary if present, or create a placeholder.
-
-	droppedCount := mid
-	keptConversation := conversation[mid:]
-
-	newHistory := make([]providers.Message, 0)
-	newHistory = append(newHistory, history[0]) // System prompt
-
-	// Add a note about compression
-	compressionNote := fmt.Sprintf("[System: Emergency compression dropped %d oldest messages due to context limit]", droppedCount)
-	// If there was an existing summary, we might lose it if it was in the dropped part (which is just messages).
-	// The summary is stored separately in session.Summary, so it persists!
-	// We just need to ensure the user knows there's a gap.
-
-	// We only modify the messages list here
-	newHistory = append(newHistory, providers.Message{
-		Role:    "system",
-		Content: compressionNote,
-	})
-
-	newHistory = append(newHistory, keptConversation...)
-	newHistory = append(newHistory, history[len(history)-1]) // Last message
-
-	// Update session
-	al.sessions.SetHistory(sessionKey, newHistory)
-	al.sessions.Save(sessionKey)
-
-	logger.WarnCF("agent", "Forced compression executed", map[string]interface{}{
-		"session_key":  sessionKey,
-		"dropped_msgs": droppedCount,
-		"new_count":    len(newHistory),
-	})
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.
@@ -871,112 +824,19 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	return result
 }
 
-// summarizeSession summarizes the conversation history for a session.
-func (al *AgentLoop) summarizeSession(sessionKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	history := al.sessions.GetHistory(sessionKey)
-	summary := al.sessions.GetSummary(sessionKey)
-
-	// Keep last 4 messages for continuity
-	if len(history) <= 4 {
-		return
+func toProviderMessages(messages []memory.Message) []providers.Message {
+	if len(messages) == 0 {
+		return nil
 	}
-
-	toSummarize := history[:len(history)-4]
-
-	// Oversized Message Guard
-	// Skip messages larger than 50% of context window to prevent summarizer overflow
-	maxMessageTokens := al.contextWindow / 2
-	validMessages := make([]providers.Message, 0)
-	omitted := false
-
-	for _, m := range toSummarize {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		// Estimate tokens for this message
-		msgTokens := len(m.Content) / 2 // Use safer estimate here too (2.5 -> 2 for integer division safety)
-		if msgTokens > maxMessageTokens {
-			omitted = true
-			continue
-		}
-		validMessages = append(validMessages, m)
-	}
-
-	if len(validMessages) == 0 {
-		return
-	}
-
-	// Multi-Part Summarization
-	// Split into two parts if history is significant
-	var finalSummary string
-	if len(validMessages) > 10 {
-		mid := len(validMessages) / 2
-		part1 := validMessages[:mid]
-		part2 := validMessages[mid:]
-
-		s1, _ := al.summarizeBatch(ctx, part1, "")
-		s2, _ := al.summarizeBatch(ctx, part2, "")
-
-		// Merge them
-		mergePrompt := fmt.Sprintf("Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s", s1, s2)
-		resp, err := al.provider.Chat(ctx, []providers.Message{{Role: "user", Content: mergePrompt}}, nil, al.model, map[string]interface{}{
-			"max_tokens":  1024,
-			"temperature": 0.3,
-		})
-		if err == nil {
-			finalSummary = resp.Content
-		} else {
-			finalSummary = s1 + " " + s2
-		}
-	} else {
-		finalSummary, _ = al.summarizeBatch(ctx, validMessages, summary)
-	}
-
-	if omitted && finalSummary != "" {
-		finalSummary += "\n[Note: Some oversized messages were omitted from this summary for efficiency.]"
-	}
-
-	if finalSummary != "" {
-		al.sessions.SetSummary(sessionKey, finalSummary)
-		al.sessions.TruncateHistory(sessionKey, 4)
-		al.sessions.Save(sessionKey)
-	}
-}
-
-// summarizeBatch summarizes a batch of messages.
-func (al *AgentLoop) summarizeBatch(ctx context.Context, batch []providers.Message, existingSummary string) (string, error) {
-	prompt := "Provide a concise summary of this conversation segment, preserving core context and key points.\n"
-	if existingSummary != "" {
-		prompt += "Existing context: " + existingSummary + "\n"
-	}
-	prompt += "\nCONVERSATION:\n"
-	for _, m := range batch {
-		prompt += fmt.Sprintf("%s: %s\n", m.Role, m.Content)
-	}
-
-	response, err := al.provider.Chat(ctx, []providers.Message{{Role: "user", Content: prompt}}, nil, al.model, map[string]interface{}{
-		"max_tokens":  1024,
-		"temperature": 0.3,
-	})
-	if err != nil {
-		return "", err
-	}
-	return response.Content, nil
-}
-
-// estimateTokens estimates the number of tokens in a message list.
-// Uses a safe heuristic of 2.5 characters per token to account for CJK and other
-// overheads better than the previous 3 chars/token.
-func (al *AgentLoop) estimateTokens(messages []providers.Message) int {
-	totalChars := 0
+	out := make([]providers.Message, 0, len(messages))
 	for _, m := range messages {
-		totalChars += utf8.RuneCountInString(m.Content)
+		out = append(out, providers.Message{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+		})
 	}
-	// 2.5 chars per token = totalChars * 2 / 5
-	return totalChars * 2 / 5
+	return out
 }
 
 func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) (string, bool) {
@@ -1013,7 +873,6 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		}
 		switch args[0] {
 		case "models":
-			// TODO: Fetch available models dynamically from OpenRouter.
 			return "OpenRouter model is configured via config/env. Current default: openai/gpt-5.2", true
 		case "channels":
 			if al.channelManager == nil {
