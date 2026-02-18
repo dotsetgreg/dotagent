@@ -34,7 +34,7 @@
     "openai_codex": {
       "oauth_access_token": "",
       "oauth_token_file": "~/.codex/auth.json",
-      "api_base": "https://api.openai.com/v1",
+      "api_base": "https://chatgpt.com/backend-api",
       "proxy": ""
     }
   },

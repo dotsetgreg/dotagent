@@ -25,6 +25,14 @@ func augmentProviderError(providerName, message string) string {
 			strings.Contains(lower, "insufficient permissions for this operation") {
 			return msg + " Hint: your OAuth token does not currently have model.request scope for this account/project."
 		}
+		if strings.Contains(lower, "just a moment") ||
+			strings.Contains(lower, "enable javascript and cookies to continue") {
+			return msg + " Hint: ChatGPT backend rejected this request at the edge. Use providers.openai_codex.api_base=https://chatgpt.com/backend-api and avoid VPN/datacenter/proxy egress that triggers Cloudflare challenges."
+		}
+		if strings.Contains(lower, "missing \"https://api.openai.com/auth\" claim") ||
+			strings.Contains(lower, "missing chatgpt_account_id") {
+			return msg + " Hint: providers.openai_codex requires a ChatGPT/Codex OAuth access token that contains chatgpt_account_id (Codex CLI auth.json tokens do)."
+		}
 	}
 
 	return msg

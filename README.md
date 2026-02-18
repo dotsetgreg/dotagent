@@ -92,6 +92,7 @@ docker compose start dotagent-gateway
 - OpenAI Codex (`openai-codex`) auth modes: direct bearer token or bearer token file
   - Set exactly one auth source: `providers.openai_codex.oauth_access_token` or `providers.openai_codex.oauth_token_file`.
   - `providers.openai_codex.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
+  - Default `providers.openai_codex.api_base` is `https://chatgpt.com/backend-api` (DotAgent resolves the request endpoint to `/codex/responses`).
   - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2` (OpenRouter default)
@@ -156,7 +157,7 @@ DOTAGENT_PROVIDERS_OPENAI_PROJECT=proj_xxx
 
 DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_ACCESS_TOKEN=
 DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE=~/.codex/auth.json
-DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE=https://api.openai.com/v1
+DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE=https://chatgpt.com/backend-api
 DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY=
 
 DOTAGENT_AGENTS_DEFAULTS_PROVIDER=openrouter
@@ -191,7 +192,8 @@ OpenAI Codex OAuth in Docker:
   "agents": { "defaults": { "provider": "openai-codex", "model": "gpt-5" } },
   "providers": {
     "openai_codex": {
-      "oauth_token_file": "/root/.codex/auth.json"
+      "oauth_token_file": "/root/.codex/auth.json",
+      "api_base": "https://chatgpt.com/backend-api"
     }
   }
 }

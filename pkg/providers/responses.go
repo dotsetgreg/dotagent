@@ -18,9 +18,31 @@ type responsesProvider struct {
 	auth         AuthStrategy
 	httpClient   *http.Client
 	extraHeaders map[string]string
+	options      responsesProviderOptions
 }
 
 func newResponsesProvider(providerName, apiBase, defaultModel, proxy string, auth AuthStrategy, extraHeaders map[string]string) (*responsesProvider, error) {
+	return newResponsesProviderWithOptions(providerName, apiBase, defaultModel, proxy, auth, extraHeaders, nil)
+}
+
+type responsesProviderOptions struct {
+	// buildEndpoint resolves the final request URL from configured apiBase.
+	buildEndpoint func(apiBase string) string
+	// beforeMarshal can inject provider-specific request-body fields.
+	beforeMarshal func(body map[string]interface{})
+	// beforeSend can inject provider-specific headers after auth is applied.
+	beforeSend func(req *http.Request) error
+}
+
+func newResponsesProviderWithOptions(
+	providerName,
+	apiBase,
+	defaultModel,
+	proxy string,
+	auth AuthStrategy,
+	extraHeaders map[string]string,
+	options *responsesProviderOptions,
+) (*responsesProvider, error) {
 	providerName = strings.TrimSpace(strings.ToLower(providerName))
 	if providerName == "" {
 		return nil, fmt.Errorf("provider name is required")
@@ -53,6 +75,17 @@ func newResponsesProvider(providerName, apiBase, defaultModel, proxy string, aut
 		cleanHeaders[name] = value
 	}
 
+	effectiveOptions := responsesProviderOptions{
+		buildEndpoint: defaultResponsesEndpoint,
+	}
+	if options != nil {
+		if options.buildEndpoint != nil {
+			effectiveOptions.buildEndpoint = options.buildEndpoint
+		}
+		effectiveOptions.beforeMarshal = options.beforeMarshal
+		effectiveOptions.beforeSend = options.beforeSend
+	}
+
 	return &responsesProvider{
 		providerName: providerName,
 		apiBase:      apiBase,
@@ -60,6 +93,7 @@ func newResponsesProvider(providerName, apiBase, defaultModel, proxy string, aut
 		auth:         auth,
 		httpClient:   client,
 		extraHeaders: cleanHeaders,
+		options:      effectiveOptions,
 	}, nil
 }
 
@@ -94,13 +128,19 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 	if temperature, ok := optionAsFloat(options, "temperature"); ok {
 		requestBody["temperature"] = temperature
 	}
+	if p.options.beforeMarshal != nil {
+		p.options.beforeMarshal(requestBody)
+	}
 
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, "", fmt.Errorf("marshal %s request: %w", p.providerName, err)
 	}
 
-	endpoint := p.apiBase + "/responses"
+	endpoint := strings.TrimSpace(p.options.buildEndpoint(p.apiBase))
+	if endpoint == "" {
+		return nil, "", fmt.Errorf("%s endpoint is empty", p.providerName)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, "", fmt.Errorf("create %s request: %w", p.providerName, err)
@@ -112,6 +152,11 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 	}
 	for name, value := range p.extraHeaders {
 		req.Header.Set(name, value)
+	}
+	if p.options.beforeSend != nil {
+		if err := p.options.beforeSend(req); err != nil {
+			return nil, "", fmt.Errorf("prepare %s request: %w", p.providerName, err)
+		}
 	}
 
 	resp, err := p.httpClient.Do(req)
@@ -142,6 +187,14 @@ func (p *responsesProvider) GetDefaultModel() string {
 		return ""
 	}
 	return p.defaultModel
+}
+
+func defaultResponsesEndpoint(apiBase string) string {
+	base := strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if base == "" {
+		return ""
+	}
+	return base + "/responses"
 }
 
 type parsedResponsesResult struct {

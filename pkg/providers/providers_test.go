@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,21 @@ import (
 
 	"github.com/dotsetgreg/dotagent/pkg/config"
 )
+
+func makeOpenAICodexToken(t *testing.T, accountID string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadRaw, err := json.Marshal(map[string]any{
+		openAICodexJWTClaimPath: map[string]any{
+			"chatgpt_account_id": accountID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal codex payload: %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadRaw)
+	return header + "." + payload + ".sig"
+}
 
 func TestCreateProvider_OpenRouter_DefaultSelection(t *testing.T) {
 	var seenAuth string
@@ -276,10 +292,16 @@ func TestValidateProviderConfig_MissingCredentials_OpenAICodex(t *testing.T) {
 func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 	var seenAuth string
 	var seenPath string
+	var seenAccountID string
+	var seenBeta string
+	var seenOriginator string
 	var seenTools []interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAuth = r.Header.Get("Authorization")
 		seenPath = r.URL.Path
+		seenAccountID = r.Header.Get("chatgpt-account-id")
+		seenBeta = r.Header.Get("OpenAI-Beta")
+		seenOriginator = r.Header.Get("originator")
 
 		var req map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -290,6 +312,9 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		}
 		if tools, ok := req["tools"].([]interface{}); ok {
 			seenTools = tools
+		}
+		if got, ok := req["store"].(bool); !ok || got {
+			t.Fatalf("expected store=false in codex payload, got %v", req["store"])
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -310,7 +335,8 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 	defer server.Close()
 
 	tokenFile := filepath.Join(t.TempDir(), "codex-token.txt")
-	if err := os.WriteFile(tokenFile, []byte("codex-oauth-token"), 0o600); err != nil {
+	token := makeOpenAICodexToken(t, "acct_test_123")
+	if err := os.WriteFile(tokenFile, []byte(token), 0o600); err != nil {
 		t.Fatalf("write token file: %v", err)
 	}
 
@@ -335,11 +361,20 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		t.Fatalf("chat: %v", err)
 	}
 
-	if seenAuth != "Bearer codex-oauth-token" {
+	if seenAuth != "Bearer "+token {
 		t.Fatalf("expected bearer token from file, got %q", seenAuth)
 	}
-	if seenPath != "/responses" {
-		t.Fatalf("expected /responses path, got %q", seenPath)
+	if seenPath != "/codex/responses" {
+		t.Fatalf("expected /codex/responses path, got %q", seenPath)
+	}
+	if seenAccountID != "acct_test_123" {
+		t.Fatalf("expected chatgpt-account-id header, got %q", seenAccountID)
+	}
+	if seenBeta != "responses=experimental" {
+		t.Fatalf("expected OpenAI-Beta header, got %q", seenBeta)
+	}
+	if seenOriginator != "dotagent" {
+		t.Fatalf("expected originator header, got %q", seenOriginator)
 	}
 	if len(seenTools) != 1 {
 		t.Fatalf("expected one tool definition in responses payload, got %d", len(seenTools))
@@ -377,7 +412,8 @@ func TestCreateProvider_OpenAICodex_StatefulResponseID(t *testing.T) {
 	defer server.Close()
 
 	tokenFile := filepath.Join(t.TempDir(), "codex-token.txt")
-	if err := os.WriteFile(tokenFile, []byte("codex-oauth-token"), 0o600); err != nil {
+	token := makeOpenAICodexToken(t, "acct_test_123")
+	if err := os.WriteFile(tokenFile, []byte(token), 0o600); err != nil {
 		t.Fatalf("write token file: %v", err)
 	}
 
@@ -414,6 +450,38 @@ func TestCreateProvider_OpenAICodex_StatefulResponseID(t *testing.T) {
 	}
 	if resp.Content != "done" {
 		t.Fatalf("expected content done, got %q", resp.Content)
+	}
+}
+
+func TestResolveOpenAICodexResponsesEndpoint(t *testing.T) {
+	cases := []struct {
+		base string
+		want string
+	}{
+		{base: "https://chatgpt.com/backend-api", want: "https://chatgpt.com/backend-api/codex/responses"},
+		{base: "https://chatgpt.com/backend-api/", want: "https://chatgpt.com/backend-api/codex/responses"},
+		{base: "https://chatgpt.com/backend-api/codex", want: "https://chatgpt.com/backend-api/codex/responses"},
+		{base: "https://chatgpt.com/backend-api/codex/responses", want: "https://chatgpt.com/backend-api/codex/responses"},
+	}
+	for _, tc := range cases {
+		got := resolveOpenAICodexResponsesEndpoint(tc.base)
+		if got != tc.want {
+			t.Fatalf("endpoint for %q = %q, want %q", tc.base, got, tc.want)
+		}
+	}
+}
+
+func TestExtractOpenAICodexAccountID(t *testing.T) {
+	token := makeOpenAICodexToken(t, "acct_test_42")
+	got, err := extractOpenAICodexAccountID(token)
+	if err != nil {
+		t.Fatalf("extract account id: %v", err)
+	}
+	if got != "acct_test_42" {
+		t.Fatalf("account id = %q, want acct_test_42", got)
+	}
+	if _, err := extractOpenAICodexAccountID("not-a-jwt"); err == nil {
+		t.Fatalf("expected invalid token format error")
 	}
 }
 

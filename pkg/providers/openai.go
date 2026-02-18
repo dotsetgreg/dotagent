@@ -2,8 +2,6 @@ package providers
 
 import (
 	"fmt"
-	"os"
-	"slices"
 	"strings"
 
 	"github.com/dotsetgreg/dotagent/pkg/config"
@@ -26,11 +24,8 @@ func validateOpenAIConfig(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	if mode == "oauth_token_file" {
-		resolved := expandHome(source)
-		if _, statErr := os.Stat(resolved); statErr != nil {
-			return fmt.Errorf("OpenAI OAuth token file not accessible at %s: %w", resolved, statErr)
-		}
+	if err := validateOAuthTokenFileSource(mode, source, "OpenAI"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -106,49 +101,32 @@ func resolveOpenAIAuthConfig(cfg *config.Config) (mode string, source string, er
 		return "", "", fmt.Errorf("config is required")
 	}
 
-	type candidate struct {
-		mode   string
-		source string
-		field  string
-	}
-	candidates := make([]candidate, 0, 3)
+	candidates := make([]credentialCandidate, 0, 3)
 	if apiKey := strings.TrimSpace(cfg.Providers.OpenAI.APIKey); apiKey != "" {
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, credentialCandidate{
 			mode:   "api_key",
 			source: apiKey,
 			field:  "providers.openai.api_key",
 		})
 	}
 	if token := strings.TrimSpace(cfg.Providers.OpenAI.OAuthAccessToken); token != "" {
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, credentialCandidate{
 			mode:   "oauth_access_token",
 			source: token,
 			field:  "providers.openai.oauth_access_token",
 		})
 	}
 	if tokenFile := strings.TrimSpace(cfg.Providers.OpenAI.OAuthTokenFile); tokenFile != "" {
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, credentialCandidate{
 			mode:   "oauth_token_file",
 			source: tokenFile,
 			field:  "providers.openai.oauth_token_file",
 		})
 	}
 
-	switch len(candidates) {
-	case 0:
-		return "", "", fmt.Errorf("OpenAI credentials are required (set providers.openai.api_key, providers.openai.oauth_access_token, or providers.openai.oauth_token_file)")
-	case 1:
-		chosen := candidates[0]
-		return chosen.mode, chosen.source, nil
-	default:
-		fields := make([]string, 0, len(candidates))
-		for _, item := range candidates {
-			fields = append(fields, item.field)
-		}
-		slices.Sort(fields)
-		return "", "", fmt.Errorf(
-			"multiple OpenAI credential sources configured (%s); set exactly one",
-			strings.Join(fields, ", "),
-		)
-	}
+	return selectSingleCredential(
+		candidates,
+		"OpenAI credentials are required (set providers.openai.api_key, providers.openai.oauth_access_token, or providers.openai.oauth_token_file)",
+		"multiple OpenAI credential sources configured",
+	)
 }

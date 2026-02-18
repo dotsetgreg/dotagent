@@ -1,17 +1,20 @@
 package providers
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"os"
-	"slices"
+	"net/http"
+	"runtime"
 	"strings"
 
 	"github.com/dotsetgreg/dotagent/pkg/config"
 )
 
 const (
-	defaultOpenAICodexAPIBase = "https://api.openai.com/v1"
+	defaultOpenAICodexAPIBase = "https://chatgpt.com/backend-api"
 	defaultOpenAICodexModel   = "gpt-5"
+	openAICodexJWTClaimPath   = "https://api.openai.com/auth"
 )
 
 func init() {
@@ -26,11 +29,8 @@ func validateOpenAICodexConfig(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	if mode == "oauth_token_file" {
-		resolved := expandHome(source)
-		if _, statErr := os.Stat(resolved); statErr != nil {
-			return fmt.Errorf("OpenAI Codex OAuth token file not accessible at %s: %w", resolved, statErr)
-		}
+	if err := validateOAuthTokenFileSource(mode, source, "OpenAI Codex"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -60,13 +60,23 @@ func newOpenAICodexProviderFromConfig(cfg *config.Config) (LLMProvider, error) {
 		apiBase = defaultOpenAICodexAPIBase
 	}
 
-	return newResponsesProvider(
+	return newResponsesProviderWithOptions(
 		ProviderOpenAICodex,
 		apiBase,
 		defaultOpenAICodexModel,
 		strings.TrimSpace(cfg.Providers.OpenAICodex.Proxy),
 		auth,
 		nil,
+		&responsesProviderOptions{
+			buildEndpoint: resolveOpenAICodexResponsesEndpoint,
+			beforeMarshal: func(body map[string]interface{}) {
+				body["store"] = false
+				if _, hasStream := body["stream"]; !hasStream {
+					body["stream"] = false
+				}
+			},
+			beforeSend: decorateOpenAICodexRequest,
+		},
 	)
 }
 
@@ -90,42 +100,125 @@ func resolveOpenAICodexAuthConfig(cfg *config.Config) (mode string, source strin
 		return "", "", fmt.Errorf("config is required")
 	}
 
-	type candidate struct {
-		mode   string
-		source string
-		field  string
-	}
-	candidates := make([]candidate, 0, 2)
+	candidates := make([]credentialCandidate, 0, 2)
 	if token := strings.TrimSpace(cfg.Providers.OpenAICodex.OAuthAccessToken); token != "" {
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, credentialCandidate{
 			mode:   "oauth_access_token",
 			source: token,
 			field:  "providers.openai_codex.oauth_access_token",
 		})
 	}
 	if tokenFile := strings.TrimSpace(cfg.Providers.OpenAICodex.OAuthTokenFile); tokenFile != "" {
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, credentialCandidate{
 			mode:   "oauth_token_file",
 			source: tokenFile,
 			field:  "providers.openai_codex.oauth_token_file",
 		})
 	}
 
-	switch len(candidates) {
-	case 0:
-		return "", "", fmt.Errorf("OpenAI Codex credentials are required (set providers.openai_codex.oauth_access_token or providers.openai_codex.oauth_token_file)")
-	case 1:
-		chosen := candidates[0]
-		return chosen.mode, chosen.source, nil
-	default:
-		fields := make([]string, 0, len(candidates))
-		for _, item := range candidates {
-			fields = append(fields, item.field)
-		}
-		slices.Sort(fields)
-		return "", "", fmt.Errorf(
-			"multiple OpenAI Codex credential sources configured (%s); set exactly one",
-			strings.Join(fields, ", "),
-		)
+	return selectSingleCredential(
+		candidates,
+		"OpenAI Codex credentials are required (set providers.openai_codex.oauth_access_token or providers.openai_codex.oauth_token_file)",
+		"multiple OpenAI Codex credential sources configured",
+	)
+}
+
+func resolveOpenAICodexResponsesEndpoint(apiBase string) string {
+	base := strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if base == "" {
+		return ""
 	}
+	if strings.HasSuffix(base, "/codex/responses") {
+		return base
+	}
+	if strings.HasSuffix(base, "/codex") {
+		return base + "/responses"
+	}
+	return base + "/codex/responses"
+}
+
+func decorateOpenAICodexRequest(req *http.Request) error {
+	if req == nil {
+		return fmt.Errorf("request is nil")
+	}
+	token, err := extractBearerToken(req.Header.Get("Authorization"))
+	if err != nil {
+		return err
+	}
+	accountID, err := extractOpenAICodexAccountID(token)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("chatgpt-account-id", accountID)
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("originator", "dotagent")
+	req.Header.Set("User-Agent", openAICodexUserAgent())
+	req.Header.Set("Accept", "application/json")
+	return nil
+}
+
+func extractBearerToken(authHeader string) (string, error) {
+	header := strings.TrimSpace(authHeader)
+	if header == "" {
+		return "", fmt.Errorf("missing Authorization header")
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(strings.ToLower(header), strings.ToLower(prefix)) {
+		return "", fmt.Errorf("unsupported Authorization header format")
+	}
+	token := strings.TrimSpace(header[len(prefix):])
+	if token == "" {
+		return "", fmt.Errorf("bearer token is empty")
+	}
+	return token, nil
+}
+
+func extractOpenAICodexAccountID(token string) (string, error) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid OpenAI Codex token format")
+	}
+	payloadRaw, err := decodeBase64URL(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("decode OpenAI Codex token payload: %w", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		return "", fmt.Errorf("parse OpenAI Codex token payload: %w", err)
+	}
+	rawClaim, ok := payload[openAICodexJWTClaimPath]
+	if !ok {
+		return "", fmt.Errorf("missing %q claim in OpenAI Codex token", openAICodexJWTClaimPath)
+	}
+	authClaim, ok := rawClaim.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("invalid %q claim in OpenAI Codex token", openAICodexJWTClaimPath)
+	}
+	accountID, _ := authClaim["chatgpt_account_id"].(string)
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return "", fmt.Errorf("missing chatgpt_account_id in OpenAI Codex token")
+	}
+	return accountID, nil
+}
+
+func decodeBase64URL(raw string) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty base64url segment")
+	}
+	if decoded, err := base64.RawURLEncoding.DecodeString(trimmed); err == nil {
+		return decoded, nil
+	}
+	decoded, err := base64.URLEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+func openAICodexUserAgent() string {
+	return fmt.Sprintf("dotagent (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
 }
