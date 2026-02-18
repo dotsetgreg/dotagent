@@ -319,6 +319,9 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		if got, ok := req["stream"].(bool); !ok || !got {
 			t.Fatalf("expected stream=true in codex payload, got %v", req["stream"])
 		}
+		if _, found := req["max_output_tokens"]; found {
+			t.Fatalf("expected max_output_tokens removed for codex payload")
+		}
 		instructions, ok := req["instructions"].(string)
 		if !ok || strings.TrimSpace(instructions) == "" {
 			t.Fatalf("expected non-empty instructions, got %v", req["instructions"])

@@ -32,3 +32,10 @@ func TestAugmentProviderError_OpenAICodexClaimHint(t *testing.T) {
 		t.Fatalf("expected account-id hint, got %q", msg)
 	}
 }
+
+func TestAugmentProviderError_OpenAICodexMaxOutputTokensHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOpenAICodex, "Unsupported parameter: max_output_tokens")
+	if !strings.Contains(strings.ToLower(msg), "max_output_tokens") {
+		t.Fatalf("expected max_output_tokens hint, got %q", msg)
+	}
+}

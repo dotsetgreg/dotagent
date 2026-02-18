@@ -71,6 +71,7 @@ func newOpenAICodexProviderFromConfig(cfg *config.Config) (LLMProvider, error) {
 		&responsesProviderOptions{
 			buildEndpoint: resolveOpenAICodexResponsesEndpoint,
 			beforeMarshal: func(body map[string]interface{}) {
+				delete(body, "max_output_tokens")
 				body["store"] = false
 				body["stream"] = true
 				ensureOpenAICodexInstructions(body)
