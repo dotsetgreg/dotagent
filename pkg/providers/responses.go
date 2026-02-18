@@ -436,6 +436,7 @@ func responsesAsString(value interface{}) string {
 
 func buildResponsesInput(messages []Message) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(messages))
+	seenFunctionCalls := make(map[string]struct{})
 	for _, msg := range messages {
 		role := strings.TrimSpace(strings.ToLower(msg.Role))
 		switch role {
@@ -447,6 +448,11 @@ func buildResponsesInput(messages []Message) []map[string]interface{} {
 		case "tool":
 			callID := strings.TrimSpace(msg.ToolCallID)
 			if callID == "" {
+				continue
+			}
+			if _, ok := seenFunctionCalls[callID]; !ok {
+				// Providers like OpenAI Responses reject orphan tool outputs
+				// that reference unknown call IDs.
 				continue
 			}
 			out = append(out, map[string]interface{}{
@@ -505,6 +511,7 @@ func buildResponsesInput(messages []Message) []map[string]interface{} {
 				"name":      name,
 				"arguments": rawArgs,
 			})
+			seenFunctionCalls[callID] = struct{}{}
 		}
 	}
 	return out

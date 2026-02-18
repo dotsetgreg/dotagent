@@ -71,6 +71,18 @@ func TestBuildResponsesInput_AssistantUsesOutputText(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesInput_SkipsOrphanToolOutput(t *testing.T) {
+	input := buildResponsesInput([]Message{
+		{Role: "user", Content: "hello"},
+		{Role: "tool", ToolCallID: "call_missing", Content: `{"ok":true}`},
+	})
+	for _, item := range input {
+		if itemType, _ := item["type"].(string); itemType == "function_call_output" {
+			t.Fatalf("expected orphan function_call_output to be skipped")
+		}
+	}
+}
+
 func TestParseResponsesResponse_ParsesToolCallsAndText(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_1",
