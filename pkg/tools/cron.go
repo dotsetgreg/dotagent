@@ -107,7 +107,7 @@ func (t *CronTool) Execute(ctx context.Context, args map[string]interface{}) *To
 
 	switch action {
 	case "add":
-		return t.addJob(args)
+		return t.addJob(ctx, args)
 	case "list":
 		return t.listJobs()
 	case "remove":
@@ -121,11 +121,8 @@ func (t *CronTool) Execute(ctx context.Context, args map[string]interface{}) *To
 	}
 }
 
-func (t *CronTool) addJob(args map[string]interface{}) *ToolResult {
-	t.mu.RLock()
-	channel := t.channel
-	chatID := t.chatID
-	t.mu.RUnlock()
+func (t *CronTool) addJob(ctx context.Context, args map[string]interface{}) *ToolResult {
+	channel, chatID := t.currentContext(ctx)
 
 	if channel == "" || chatID == "" {
 		return ErrorResult("no session context (channel/chat_id not set). Use this tool in an active conversation.")
@@ -257,6 +254,23 @@ func (t *CronTool) enableJob(args map[string]interface{}, enable bool) *ToolResu
 		status = "disabled"
 	}
 	return SilentResult(fmt.Sprintf("Cron job '%s' %s", job.Name, status))
+}
+
+func (t *CronTool) currentContext(ctx context.Context) (string, string) {
+	ctxChannel, ctxChatID := channelChatFromContext(ctx)
+
+	t.mu.RLock()
+	channel, chatID := t.channel, t.chatID
+	t.mu.RUnlock()
+
+	if ctxChannel != "" {
+		channel = ctxChannel
+	}
+	if ctxChatID != "" {
+		chatID = ctxChatID
+	}
+
+	return channel, chatID
 }
 
 // ExecuteJob executes a cron job through the agent

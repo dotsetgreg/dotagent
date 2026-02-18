@@ -67,34 +67,61 @@ func (m *Manager) initChannels() error {
 }
 
 func (m *Manager) StartAll(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	m.mu.RLock()
 	if len(m.channels) == 0 {
+		m.mu.RUnlock()
 		logger.WarnC("channels", "No channels enabled")
 		return nil
 	}
+	channelsCopy := make(map[string]Channel, len(m.channels))
+	for name, channel := range m.channels {
+		channelsCopy[name] = channel
+	}
+	m.mu.RUnlock()
 
 	logger.InfoC("channels", "Starting all channels")
 
-	dispatchCtx, cancel := context.WithCancel(ctx)
-	m.dispatchTask = &asyncTask{cancel: cancel}
-
-	go m.dispatchOutbound(dispatchCtx)
-
-	for name, channel := range m.channels {
-		logger.InfoCF("channels", "Starting channel", map[string]interface{}{
-			"channel": name,
-		})
+	var started []string
+	var startErrors []string
+	for name, channel := range channelsCopy {
+		logger.InfoCF("channels", "Starting channel", map[string]interface{}{"channel": name})
 		if err := channel.Start(ctx); err != nil {
 			logger.ErrorCF("channels", "Failed to start channel", map[string]interface{}{
 				"channel": name,
 				"error":   err.Error(),
 			})
+			startErrors = append(startErrors, fmt.Sprintf("%s: %v", name, err))
+			continue
 		}
+		started = append(started, name)
 	}
 
-	logger.InfoC("channels", "All channels started")
+	if len(startErrors) > 0 {
+		for _, name := range started {
+			channel := channelsCopy[name]
+			if err := channel.Stop(ctx); err != nil {
+				logger.WarnCF("channels", "Failed to stop partially-started channel", map[string]interface{}{
+					"channel": name,
+					"error":   err.Error(),
+				})
+			}
+		}
+		return fmt.Errorf("failed to start channels: %s", strings.Join(startErrors, "; "))
+	}
+
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.dispatchTask != nil {
+		m.dispatchTask.cancel()
+	}
+	m.dispatchTask = &asyncTask{cancel: cancel}
+	m.mu.Unlock()
+
+	go m.dispatchOutbound(dispatchCtx)
+
+	logger.InfoCF("channels", "All channels started", map[string]interface{}{
+		"count": len(started),
+	})
 	return nil
 }
 

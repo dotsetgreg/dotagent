@@ -94,3 +94,17 @@ func TestProcessTool_CloseStopsAndClears(t *testing.T) {
 		t.Fatalf("expected close to clear managed process records, got %q", list.ForLLM)
 	}
 }
+
+func TestProcessTool_StartRestrictedBlocksShellOperators(t *testing.T) {
+	tool := NewProcessTool(t.TempDir(), true)
+	start := tool.Execute(context.Background(), map[string]interface{}{
+		"action":  "start",
+		"command": "echo test && ls",
+	})
+	if !start.IsError {
+		t.Fatalf("expected restricted mode process start to be blocked")
+	}
+	if !strings.Contains(strings.ToLower(start.ForLLM), "restricted mode") {
+		t.Fatalf("expected restricted mode guard message, got %q", start.ForLLM)
+	}
+}

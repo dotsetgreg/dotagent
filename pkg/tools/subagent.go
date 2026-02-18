@@ -212,6 +212,7 @@ type SubagentTool struct {
 	manager       *SubagentManager
 	originChannel string
 	originChatID  string
+	mu            sync.RWMutex
 }
 
 func NewSubagentTool(manager *SubagentManager) *SubagentTool {
@@ -248,6 +249,8 @@ func (t *SubagentTool) Parameters() map[string]interface{} {
 }
 
 func (t *SubagentTool) SetContext(channel, chatID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.originChannel = channel
 	t.originChatID = chatID
 }
@@ -263,6 +266,16 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]interface{})
 	if t.manager == nil {
 		return ErrorResult("Subagent manager not configured").WithError(fmt.Errorf("manager is nil"))
 	}
+
+	originChannel, originChatID := channelChatFromContext(ctx)
+	t.mu.RLock()
+	if originChannel == "" {
+		originChannel = t.originChannel
+	}
+	if originChatID == "" {
+		originChatID = t.originChatID
+	}
+	t.mu.RUnlock()
 
 	// Build messages for subagent
 	messages := []providers.Message{
@@ -292,7 +305,7 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]interface{})
 			"max_tokens":  4096,
 			"temperature": 0.7,
 		},
-	}, messages, t.originChannel, t.originChatID)
+	}, messages, originChannel, originChatID)
 
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("Subagent execution failed: %v", err)).WithError(err)

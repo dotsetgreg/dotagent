@@ -58,6 +58,41 @@ func TestMessageTool_Execute_Success(t *testing.T) {
 	}
 }
 
+func TestMessageTool_Execute_UsesExecutionContextDefaults(t *testing.T) {
+	tool := NewMessageTool()
+
+	var sentChannel, sentChatID string
+	tool.SetSendCallback(func(channel, chatID, content string) error {
+		sentChannel = channel
+		sentChatID = chatID
+		return nil
+	})
+
+	ctx := withToolExecutionContext(context.Background(), "discord", "chat-ctx", nil)
+	result := tool.Execute(ctx, map[string]interface{}{"content": "Hello"})
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if sentChannel != "discord" || sentChatID != "chat-ctx" {
+		t.Fatalf("expected execution context defaults to be used, got %s:%s", sentChannel, sentChatID)
+	}
+}
+
+func TestMessageTool_Execute_MarksRoundState(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetSendCallback(func(channel, chatID, content string) error { return nil })
+
+	round := NewExecutionRoundState()
+	ctx := WithExecutionRoundState(withToolExecutionContext(context.Background(), "discord", "chat-ctx", nil), round)
+	result := tool.Execute(ctx, map[string]interface{}{"content": "Hello"})
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if !round.MessageSent() {
+		t.Fatalf("expected round state to be marked as sent")
+	}
+}
+
 func TestMessageTool_Execute_WithCustomChannel(t *testing.T) {
 	tool := NewMessageTool()
 	tool.SetContext("default-channel", "default-chat-id")

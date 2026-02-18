@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+var restrictedShellMetaPattern = regexp.MustCompile("(\\|\\||&&|[;&|]|`|\\$\\(|[<>]{1,2}|\\r|\\n)")
+
 type ExecTool struct {
 	workingDir          string
 	timeout             time.Duration
@@ -172,6 +174,10 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 	}
 
 	if t.restrictToWorkspace {
+		if restrictedShellMetaPattern.MatchString(cmd) {
+			return "Command blocked by safety guard (restricted mode disallows shell control operators)"
+		}
+
 		if strings.Contains(cmd, "..\\") || strings.Contains(cmd, "../") {
 			return "Command blocked by safety guard (path traversal detected)"
 		}

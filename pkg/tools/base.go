@@ -1,6 +1,9 @@
 package tools
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 // Tool is the interface that all tools must implement.
 type Tool interface {
@@ -74,6 +77,112 @@ type AsyncTool interface {
 type ClosableTool interface {
 	Tool
 	Close() error
+}
+
+type toolExecutionContext struct {
+	channel       string
+	chatID        string
+	asyncCallback AsyncCallback
+}
+
+type toolExecutionContextKey struct{}
+
+// withToolExecutionContext annotates a call context with per-execution metadata.
+func withToolExecutionContext(ctx context.Context, channel, chatID string, asyncCallback AsyncCallback) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing, ok := toolExecutionContextFromContext(ctx); ok {
+		if channel == "" {
+			channel = existing.channel
+		}
+		if chatID == "" {
+			chatID = existing.chatID
+		}
+		if asyncCallback == nil {
+			asyncCallback = existing.asyncCallback
+		}
+	}
+	execCtx := toolExecutionContext{
+		channel:       channel,
+		chatID:        chatID,
+		asyncCallback: asyncCallback,
+	}
+	return context.WithValue(ctx, toolExecutionContextKey{}, execCtx)
+}
+
+func toolExecutionContextFromContext(ctx context.Context) (toolExecutionContext, bool) {
+	if ctx == nil {
+		return toolExecutionContext{}, false
+	}
+	execCtx, ok := ctx.Value(toolExecutionContextKey{}).(toolExecutionContext)
+	return execCtx, ok
+}
+
+func channelChatFromContext(ctx context.Context) (string, string) {
+	execCtx, ok := toolExecutionContextFromContext(ctx)
+	if !ok {
+		return "", ""
+	}
+	return execCtx.channel, execCtx.chatID
+}
+
+func asyncCallbackFromContext(ctx context.Context) AsyncCallback {
+	execCtx, ok := toolExecutionContextFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return execCtx.asyncCallback
+}
+
+// ExecutionRoundState tracks per-agent-run round state in a request-scoped way.
+type ExecutionRoundState struct {
+	messageSent atomic.Bool
+}
+
+func NewExecutionRoundState() *ExecutionRoundState {
+	return &ExecutionRoundState{}
+}
+
+func (s *ExecutionRoundState) MarkMessageSent() {
+	if s == nil {
+		return
+	}
+	s.messageSent.Store(true)
+}
+
+func (s *ExecutionRoundState) MessageSent() bool {
+	if s == nil {
+		return false
+	}
+	return s.messageSent.Load()
+}
+
+type executionRoundStateKey struct{}
+
+// WithExecutionRoundState adds per-round state to context.
+func WithExecutionRoundState(ctx context.Context, state *ExecutionRoundState) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if state == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, executionRoundStateKey{}, state)
+}
+
+func executionRoundStateFromContext(ctx context.Context) *ExecutionRoundState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(executionRoundStateKey{}).(*ExecutionRoundState)
+	return state
+}
+
+func markMessageSentInContext(ctx context.Context) {
+	if state := executionRoundStateFromContext(ctx); state != nil {
+		state.MarkMessageSent()
+	}
 }
 
 func ToolToSchema(tool Tool) map[string]interface{} {

@@ -3,6 +3,8 @@ package bus
 import (
 	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type MessageBus struct {
@@ -10,8 +12,16 @@ type MessageBus struct {
 	outbound chan OutboundMessage
 	handlers map[string]MessageHandler
 	closed   bool
+	dropped  droppedCounters
 	mu       sync.RWMutex
 }
+
+type droppedCounters struct {
+	inbound  atomic.Uint64
+	outbound atomic.Uint64
+}
+
+const publishTimeout = 100 * time.Millisecond
 
 func NewMessageBus() *MessageBus {
 	return &MessageBus{
@@ -27,12 +37,26 @@ func (mb *MessageBus) PublishInbound(msg InboundMessage) {
 	if mb.closed {
 		return
 	}
-	mb.inbound <- msg
+
+	select {
+	case mb.inbound <- msg:
+	default:
+		timer := time.NewTimer(publishTimeout)
+		defer timer.Stop()
+		select {
+		case mb.inbound <- msg:
+		case <-timer.C:
+			mb.dropped.inbound.Add(1)
+		}
+	}
 }
 
 func (mb *MessageBus) ConsumeInbound(ctx context.Context) (InboundMessage, bool) {
 	select {
-	case msg := <-mb.inbound:
+	case msg, ok := <-mb.inbound:
+		if !ok {
+			return InboundMessage{}, false
+		}
 		return msg, true
 	case <-ctx.Done():
 		return InboundMessage{}, false
@@ -45,12 +69,26 @@ func (mb *MessageBus) PublishOutbound(msg OutboundMessage) {
 	if mb.closed {
 		return
 	}
-	mb.outbound <- msg
+
+	select {
+	case mb.outbound <- msg:
+	default:
+		timer := time.NewTimer(publishTimeout)
+		defer timer.Stop()
+		select {
+		case mb.outbound <- msg:
+		case <-timer.C:
+			mb.dropped.outbound.Add(1)
+		}
+	}
 }
 
 func (mb *MessageBus) SubscribeOutbound(ctx context.Context) (OutboundMessage, bool) {
 	select {
-	case msg := <-mb.outbound:
+	case msg, ok := <-mb.outbound:
+		if !ok {
+			return OutboundMessage{}, false
+		}
 		return msg, true
 	case <-ctx.Done():
 		return OutboundMessage{}, false
@@ -79,4 +117,12 @@ func (mb *MessageBus) Close() {
 	mb.closed = true
 	close(mb.inbound)
 	close(mb.outbound)
+}
+
+func (mb *MessageBus) DroppedInbound() uint64 {
+	return mb.dropped.inbound.Load()
+}
+
+func (mb *MessageBus) DroppedOutbound() uint64 {
+	return mb.dropped.outbound.Load()
 }

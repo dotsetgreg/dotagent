@@ -67,10 +67,11 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, args map[string
 // If the tool implements AsyncTool and a non-nil callback is provided,
 // the callback will be set on the tool before execution.
 func (r *ToolRegistry) ExecuteWithContext(ctx context.Context, name string, args map[string]interface{}, channel, chatID string, asyncCallback AsyncCallback) *ToolResult {
+	sanitizedArgs := sanitizeToolArgs(args)
 	logger.InfoCF("tool", "Tool execution started",
 		map[string]interface{}{
 			"tool": name,
-			"args": args,
+			"args": sanitizedArgs,
 		})
 
 	tool, ok := r.Get(name)
@@ -82,23 +83,19 @@ func (r *ToolRegistry) ExecuteWithContext(ctx context.Context, name string, args
 		return ErrorResult(fmt.Sprintf("tool %q not found", name)).WithError(fmt.Errorf("tool not found"))
 	}
 
-	// If tool implements ContextualTool, set context
-	if contextualTool, ok := tool.(ContextualTool); ok && channel != "" && chatID != "" {
-		contextualTool.SetContext(channel, chatID)
-	}
+	execCtx := withToolExecutionContext(ctx, channel, chatID, asyncCallback)
 
-	// If tool implements AsyncTool and callback is provided, set callback
-	if asyncTool, ok := tool.(AsyncTool); ok && asyncCallback != nil {
-		asyncTool.SetCallback(asyncCallback)
-		logger.DebugCF("tool", "Async callback injected",
+	start := time.Now()
+	result := tool.Execute(execCtx, args)
+	duration := time.Since(start)
+	if result == nil {
+		err := fmt.Errorf("tool %q returned nil result", name)
+		logger.ErrorCF("tool", "Tool returned nil result",
 			map[string]interface{}{
 				"tool": name,
 			})
+		return ErrorResult(err.Error()).WithError(err)
 	}
-
-	start := time.Now()
-	result := tool.Execute(ctx, args)
-	duration := time.Since(start)
 
 	// Log based on result type
 	if result.IsError {
@@ -199,4 +196,82 @@ func (r *ToolRegistry) GetSummaries() []string {
 		summaries = append(summaries, fmt.Sprintf("- `%s` - %s", tool.Name(), tool.Description()))
 	}
 	return summaries
+}
+
+var sensitiveArgKeyFragments = []string{
+	"api_key",
+	"apikey",
+	"authorization",
+	"auth",
+	"bearer",
+	"client_secret",
+	"cookie",
+	"password",
+	"private",
+	"secret",
+	"session",
+	"token",
+}
+
+func sanitizeToolArgs(args map[string]interface{}) map[string]interface{} {
+	if args == nil {
+		return nil
+	}
+	sanitized := make(map[string]interface{}, len(args))
+	for key, value := range args {
+		sanitized[key] = sanitizeToolArgValue(key, value, 0)
+	}
+	return sanitized
+}
+
+func sanitizeToolArgValue(key string, value interface{}, depth int) interface{} {
+	if depth > 6 {
+		return "<omitted>"
+	}
+	if isSensitiveArgKey(key) {
+		return "<redacted>"
+	}
+
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for k, v := range typed {
+			out[k] = sanitizeToolArgValue(k, v, depth+1)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, sanitizeToolArgValue(key, item, depth+1))
+		}
+		return out
+	case []string:
+		out := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, truncateLogString(item))
+		}
+		return out
+	case string:
+		return truncateLogString(typed)
+	default:
+		return value
+	}
+}
+
+func isSensitiveArgKey(key string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+	for _, fragment := range sensitiveArgKeyFragments {
+		if strings.Contains(normalized, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateLogString(value string) string {
+	const maxLen = 256
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "...(truncated)"
 }

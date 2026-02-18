@@ -540,6 +540,11 @@ func gatewayCmd() {
 
 	if err := channelManager.StartAll(ctx); err != nil {
 		fmt.Printf("Error starting channels: %v\n", err)
+		cancel()
+		heartbeatService.Stop()
+		cronService.Stop()
+		agentLoop.Stop()
+		os.Exit(1)
 	}
 
 	healthServer := health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)

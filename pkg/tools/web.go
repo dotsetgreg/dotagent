@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -266,7 +268,9 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 }
 
 type WebFetchTool struct {
-	maxChars int
+	maxChars          int
+	allowPrivateHosts bool
+	resolver          *net.Resolver
 }
 
 func NewWebFetchTool(maxChars int) *WebFetchTool {
@@ -275,7 +279,12 @@ func NewWebFetchTool(maxChars int) *WebFetchTool {
 	}
 	return &WebFetchTool{
 		maxChars: maxChars,
+		resolver: net.DefaultResolver,
 	}
+}
+
+func (t *WebFetchTool) setAllowPrivateHostsForTesting(allow bool) {
+	t.allowPrivateHosts = allow
 }
 
 func (t *WebFetchTool) Name() string {
@@ -323,6 +332,10 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]interface{})
 		return ErrorResult("missing domain in URL")
 	}
 
+	if err := t.validateTargetURL(ctx, parsedURL); err != nil {
+		return ErrorResult(fmt.Sprintf("blocked URL target: %v", err))
+	}
+
 	maxChars := t.maxChars
 	if mc, ok := args["maxChars"].(float64); ok {
 		if int(mc) > 100 {
@@ -348,6 +361,9 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]interface{})
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("stopped after 5 redirects")
+			}
+			if err := t.validateTargetURL(ctx, req.URL); err != nil {
+				return err
 			}
 			return nil
 		},
@@ -402,9 +418,26 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]interface{})
 	}
 
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	llmText := text
+	llmTruncated := false
+	const maxLLMChars = 4000
+	if len(llmText) > maxLLMChars {
+		llmText = llmText[:maxLLMChars]
+		llmTruncated = true
+	}
+	forLLM := fmt.Sprintf(
+		"Fetched URL: %s\nStatus: %d\nExtractor: %s\nContent length: %d\nContent truncated: %v\nLLM snippet truncated: %v\nContent:\n%s",
+		urlStr,
+		resp.StatusCode,
+		extractor,
+		len(text),
+		truncated,
+		llmTruncated,
+		llmText,
+	)
 
 	return &ToolResult{
-		ForLLM:  fmt.Sprintf("Fetched %d bytes from %s (extractor: %s, truncated: %v)", len(text), urlStr, extractor, truncated),
+		ForLLM:  forLLM,
 		ForUser: string(resultJSON),
 	}
 }
@@ -432,4 +465,117 @@ func (t *WebFetchTool) extractText(htmlContent string) string {
 	}
 
 	return strings.Join(cleanLines, "\n")
+}
+
+func (t *WebFetchTool) validateTargetURL(ctx context.Context, parsedURL *url.URL) error {
+	if parsedURL == nil {
+		return fmt.Errorf("invalid URL")
+	}
+	if t.allowPrivateHosts {
+		return nil
+	}
+
+	host := strings.TrimSpace(parsedURL.Hostname())
+	if host == "" {
+		return fmt.Errorf("missing host")
+	}
+	return t.validateTargetHost(ctx, host)
+}
+
+func (t *WebFetchTool) validateTargetHost(ctx context.Context, host string) error {
+	normalizedHost := strings.TrimSuffix(strings.ToLower(host), ".")
+	if normalizedHost == "" {
+		return fmt.Errorf("missing host")
+	}
+	if normalizedHost == "localhost" ||
+		strings.HasSuffix(normalizedHost, ".localhost") ||
+		strings.HasSuffix(normalizedHost, ".local") ||
+		strings.HasSuffix(normalizedHost, ".internal") {
+		return fmt.Errorf("host %q resolves to local/private network", host)
+	}
+
+	if ip := net.ParseIP(normalizedHost); ip != nil {
+		if isBlockedFetchIP(ip) {
+			return fmt.Errorf("IP %s is not allowed", ip.String())
+		}
+		return nil
+	}
+
+	lookupCtx := ctx
+	cancel := func() {}
+	if lookupCtx == nil {
+		lookupCtx = context.Background()
+	}
+	if _, hasDeadline := lookupCtx.Deadline(); !hasDeadline {
+		lookupCtx, cancel = context.WithTimeout(lookupCtx, 5*time.Second)
+	}
+	defer cancel()
+
+	resolver := t.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	addrs, err := resolver.LookupIPAddr(lookupCtx, normalizedHost)
+	if err != nil {
+		return fmt.Errorf("resolve host %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("resolve host %q: no addresses found", host)
+	}
+	for _, addr := range addrs {
+		if isBlockedFetchIP(addr.IP) {
+			return fmt.Errorf("resolved address %s is not allowed", addr.IP.String())
+		}
+	}
+
+	return nil
+}
+
+var blockedFetchPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func isBlockedFetchIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	for _, prefix := range blockedFetchPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

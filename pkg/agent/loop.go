@@ -266,22 +266,16 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 
-			response, err := al.processMessage(ctx, msg)
+			roundState := tools.NewExecutionRoundState()
+			roundCtx := tools.WithExecutionRoundState(ctx, roundState)
+
+			response, err := al.processMessage(roundCtx, msg)
 			if err != nil {
 				response = fmt.Sprintf("Error processing message: %v", err)
 			}
 
 			if response != "" {
-				// Check if the message tool already sent a response during this round.
-				// If so, skip publishing to avoid duplicate messages to the user.
-				alreadySent := false
-				if tool, ok := al.tools.Get("message"); ok {
-					if mt, ok := tool.(*tools.MessageTool); ok {
-						alreadySent = mt.HasSentInRound()
-					}
-				}
-
-				if !alreadySent {
+				if !roundState.MessageSent() {
 					al.bus.PublishOutbound(bus.OutboundMessage{
 						Channel: msg.Channel,
 						ChatID:  msg.ChatID,
@@ -464,9 +458,6 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		}
 	}
 
-	// 1. Update tool contexts
-	al.updateToolContexts(opts.Channel, opts.ChatID)
-
 	if !opts.NoHistory {
 		normalizedSessionKey, skErr := resolveSessionKey(opts.SessionKey, al.workspaceID, opts.Channel, opts.ChatID, opts.UserID)
 		if skErr != nil {
@@ -482,7 +473,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		opts.SessionKey = "ephemeral:no_history"
 	}
 
-	// 1.5 Ensure memory session exists
+	// 1. Ensure memory session exists
 	if !opts.NoHistory {
 		if err := al.memory.EnsureSession(ctx, opts.SessionKey, opts.Channel, opts.ChatID, opts.UserID); err != nil {
 			logger.WarnCF("agent", "Failed to ensure memory session", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
@@ -974,21 +965,6 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 	}
 
 	return finalContent, iteration, nil
-}
-
-// updateToolContexts updates the context for tools that need channel/chatID info.
-func (al *AgentLoop) updateToolContexts(channel, chatID string) {
-	for _, toolName := range []string{"message", "spawn", "subagent", "session"} {
-		tool, ok := al.tools.Get(toolName)
-		if !ok {
-			continue
-		}
-		contextual, ok := tool.(tools.ContextualTool)
-		if !ok {
-			continue
-		}
-		contextual.SetContext(channel, chatID)
-	}
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.

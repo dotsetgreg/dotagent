@@ -5,9 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+func newLocalWebFetchTool(maxChars int) *WebFetchTool {
+	tool := NewWebFetchTool(maxChars)
+	tool.setAllowPrivateHostsForTesting(true)
+	return tool
+}
 
 // TestWebTool_WebFetch_Success verifies successful URL fetching
 func TestWebTool_WebFetch_Success(t *testing.T) {
@@ -18,7 +25,7 @@ func TestWebTool_WebFetch_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := NewWebFetchTool(50000)
+	tool := newLocalWebFetchTool(50000)
 	ctx := context.Background()
 	args := map[string]interface{}{
 		"url": server.URL,
@@ -36,9 +43,9 @@ func TestWebTool_WebFetch_Success(t *testing.T) {
 		t.Errorf("Expected ForUser to contain 'Test Page', got: %s", result.ForUser)
 	}
 
-	// ForLLM should contain summary
-	if !strings.Contains(result.ForLLM, "bytes") && !strings.Contains(result.ForLLM, "extractor") {
-		t.Errorf("Expected ForLLM to contain summary, got: %s", result.ForLLM)
+	// ForLLM should contain extracted content snippet
+	if !strings.Contains(result.ForLLM, "Content:") || !strings.Contains(result.ForLLM, "Test Page") {
+		t.Errorf("Expected ForLLM to contain extracted snippet, got: %s", result.ForLLM)
 	}
 }
 
@@ -54,7 +61,7 @@ func TestWebTool_WebFetch_JSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := NewWebFetchTool(50000)
+	tool := newLocalWebFetchTool(50000)
 	ctx := context.Background()
 	args := map[string]interface{}{
 		"url": server.URL,
@@ -145,7 +152,7 @@ func TestWebTool_WebFetch_Truncation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := NewWebFetchTool(1000) // Limit to 1000 chars
+	tool := newLocalWebFetchTool(1000) // Limit to 1000 chars
 	ctx := context.Background()
 	args := map[string]interface{}{
 		"url": server.URL,
@@ -210,7 +217,7 @@ func TestWebTool_WebFetch_HTMLExtraction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := NewWebFetchTool(50000)
+	tool := newLocalWebFetchTool(50000)
 	ctx := context.Background()
 	args := map[string]interface{}{
 		"url": server.URL,
@@ -252,5 +259,34 @@ func TestWebTool_WebFetch_MissingDomain(t *testing.T) {
 	// Should mention missing domain
 	if !strings.Contains(result.ForLLM, "domain") && !strings.Contains(result.ForUser, "domain") {
 		t.Errorf("Expected domain error message, got ForLLM: %s", result.ForLLM)
+	}
+}
+
+func TestWebTool_WebFetch_BlocksPrivateHost(t *testing.T) {
+	tool := NewWebFetchTool(50000)
+	ctx := context.Background()
+	args := map[string]interface{}{
+		"url": "http://127.0.0.1:8080",
+	}
+
+	result := tool.Execute(ctx, args)
+	if !result.IsError {
+		t.Fatalf("expected private host to be blocked")
+	}
+	if !strings.Contains(strings.ToLower(result.ForLLM), "blocked url target") {
+		t.Fatalf("expected blocked target error, got %q", result.ForLLM)
+	}
+}
+
+func TestWebTool_WebFetch_ValidateRedirectTarget(t *testing.T) {
+	tool := NewWebFetchTool(50000)
+	ctx := context.Background()
+
+	parsed, err := url.Parse("http://localhost/redirect")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	if err := tool.validateTargetURL(ctx, parsed); err == nil {
+		t.Fatalf("expected localhost redirect target to be blocked")
 	}
 }

@@ -208,3 +208,21 @@ func TestShellTool_RestrictToWorkspace(t *testing.T) {
 		t.Errorf("Expected 'blocked' message for path traversal, got ForLLM: %s, ForUser: %s", result.ForLLM, result.ForUser)
 	}
 }
+
+func TestShellTool_RestrictToWorkspace_BlocksShellOperators(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewExecTool(tmpDir, true)
+
+	ctx := context.Background()
+	args := map[string]interface{}{
+		"command": "echo hello && ls",
+	}
+
+	result := tool.Execute(ctx, args)
+	if !result.IsError {
+		t.Fatalf("expected restricted mode to block shell operators")
+	}
+	if !strings.Contains(strings.ToLower(result.ForLLM), "restricted mode") {
+		t.Fatalf("expected restricted mode guard message, got %q", result.ForLLM)
+	}
+}

@@ -167,3 +167,16 @@ func TestConfig_Complete(t *testing.T) {
 		t.Error("Heartbeat should be enabled by default")
 	}
 }
+
+func TestLoadConfig_EnvOverridesWithoutFile(t *testing.T) {
+	t.Setenv("DOTAGENT_AGENTS_DEFAULTS_MODEL", "env/model")
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if got := cfg.Agents.Defaults.Model; got != "env/model" {
+		t.Fatalf("expected env override model, got %q", got)
+	}
+}

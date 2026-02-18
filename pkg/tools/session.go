@@ -138,7 +138,7 @@ func (t *SessionTool) list(ctx context.Context, args map[string]interface{}) *To
 }
 
 func (t *SessionTool) status(ctx context.Context, args map[string]interface{}) *ToolResult {
-	sk, err := t.resolveSessionKey(args, "")
+	sk, err := t.resolveSessionKey(ctx, args, "")
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
@@ -157,7 +157,7 @@ func (t *SessionTool) status(ctx context.Context, args map[string]interface{}) *
 }
 
 func (t *SessionTool) history(ctx context.Context, args map[string]interface{}) *ToolResult {
-	sk, err := t.resolveSessionKey(args, "")
+	sk, err := t.resolveSessionKey(ctx, args, "")
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
@@ -183,7 +183,7 @@ func (t *SessionTool) send(ctx context.Context, args map[string]interface{}, spa
 		return ErrorResult("message is required")
 	}
 
-	channel, chatID := t.currentContext()
+	channel, chatID := t.currentContext(ctx)
 	if raw, ok := args["channel"].(string); ok && strings.TrimSpace(raw) != "" {
 		channel = strings.TrimSpace(raw)
 	}
@@ -197,7 +197,7 @@ func (t *SessionTool) send(ctx context.Context, args map[string]interface{}, spa
 		if spawn {
 			sessionKey = "spawn:" + uuid.NewString()
 		} else {
-			resolved, err := t.resolveSessionKey(args, "")
+			resolved, err := t.resolveSessionKey(ctx, args, "")
 			if err != nil {
 				return ErrorResult(err.Error())
 			}
@@ -219,7 +219,7 @@ func (t *SessionTool) send(ctx context.Context, args map[string]interface{}, spa
 	return UserResult(fmt.Sprintf("Session %s %s.\nResponse:\n%s", sessionKey, label, resp))
 }
 
-func (t *SessionTool) resolveSessionKey(args map[string]interface{}, fallbackUserID string) (string, error) {
+func (t *SessionTool) resolveSessionKey(ctx context.Context, args map[string]interface{}, fallbackUserID string) (string, error) {
 	if sk, ok := args["session_key"].(string); ok && strings.TrimSpace(sk) != "" {
 		return strings.TrimSpace(sk), nil
 	}
@@ -230,17 +230,28 @@ func (t *SessionTool) resolveSessionKey(args map[string]interface{}, fallbackUse
 	if raw, ok := args["user_id"].(string); ok && strings.TrimSpace(raw) != "" {
 		userID = strings.TrimSpace(raw)
 	}
-	channel, chatID := t.currentContext()
+	channel, chatID := t.currentContext(ctx)
 	if channel == "" || chatID == "" {
 		return "", fmt.Errorf("session_key is required (no active context)")
 	}
 	return t.resolver(channel, chatID, userID)
 }
 
-func (t *SessionTool) currentContext() (string, string) {
+func (t *SessionTool) currentContext(ctx context.Context) (string, string) {
+	ctxChannel, ctxChatID := channelChatFromContext(ctx)
+
 	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.channel, t.chatID
+	channel, chatID := t.channel, t.chatID
+	t.mu.RUnlock()
+
+	if strings.TrimSpace(ctxChannel) != "" {
+		channel = strings.TrimSpace(ctxChannel)
+	}
+	if strings.TrimSpace(ctxChatID) != "" {
+		chatID = strings.TrimSpace(ctxChatID)
+	}
+
+	return channel, chatID
 }
 
 func parseLimit(raw interface{}, fallback int) int {
