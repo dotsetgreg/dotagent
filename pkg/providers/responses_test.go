@@ -55,6 +55,22 @@ func TestBuildResponsesInput_ConvertsToolMessages(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesInput_AssistantUsesOutputText(t *testing.T) {
+	input := buildResponsesInput([]Message{
+		{Role: "assistant", Content: "assistant reply"},
+	})
+	if len(input) != 1 {
+		t.Fatalf("expected one input item, got %d", len(input))
+	}
+	content, ok := input[0]["content"].([]map[string]interface{})
+	if !ok || len(content) == 0 {
+		t.Fatalf("expected assistant content array")
+	}
+	if got, _ := content[0]["type"].(string); got != "output_text" {
+		t.Fatalf("expected assistant content type output_text, got %q", got)
+	}
+}
+
 func TestParseResponsesResponse_ParsesToolCallsAndText(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_1",

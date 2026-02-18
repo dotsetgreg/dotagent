@@ -458,11 +458,15 @@ func buildResponsesInput(messages []Message) []map[string]interface{} {
 		default:
 			content := strings.TrimSpace(msg.Content)
 			if content != "" {
+				contentType := "input_text"
+				if role == "assistant" {
+					contentType = "output_text"
+				}
 				out = append(out, map[string]interface{}{
 					"role": role,
 					"content": []map[string]interface{}{
 						{
-							"type": "input_text",
+							"type": contentType,
 							"text": content,
 						},
 					},
