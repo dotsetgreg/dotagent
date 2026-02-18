@@ -322,6 +322,9 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		if _, found := req["max_output_tokens"]; found {
 			t.Fatalf("expected max_output_tokens removed for codex payload")
 		}
+		if _, found := req["temperature"]; found {
+			t.Fatalf("expected temperature removed for codex payload")
+		}
 		instructions, ok := req["instructions"].(string)
 		if !ok || strings.TrimSpace(instructions) == "" {
 			t.Fatalf("expected non-empty instructions, got %v", req["instructions"])

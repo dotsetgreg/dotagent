@@ -28,6 +28,9 @@ func augmentProviderError(providerName, message string) string {
 		if strings.Contains(lower, "unsupported parameter: max_output_tokens") {
 			return msg + " Hint: Codex backend does not accept max_output_tokens; update to a build that strips this field for openai-codex requests."
 		}
+		if strings.Contains(lower, "unsupported parameter: temperature") {
+			return msg + " Hint: Codex backend does not accept temperature for this model; update to a build that strips this field for openai-codex requests."
+		}
 		if strings.Contains(lower, "just a moment") ||
 			strings.Contains(lower, "enable javascript and cookies to continue") {
 			return msg + " Hint: ChatGPT backend rejected this request at the edge. Use providers.openai_codex.api_base=https://chatgpt.com/backend-api and avoid VPN/datacenter/proxy egress that triggers Cloudflare challenges."

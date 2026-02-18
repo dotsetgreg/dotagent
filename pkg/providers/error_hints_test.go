@@ -39,3 +39,10 @@ func TestAugmentProviderError_OpenAICodexMaxOutputTokensHint(t *testing.T) {
 		t.Fatalf("expected max_output_tokens hint, got %q", msg)
 	}
 }
+
+func TestAugmentProviderError_OpenAICodexTemperatureHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOpenAICodex, "Unsupported parameter: temperature")
+	if !strings.Contains(strings.ToLower(msg), "temperature") {
+		t.Fatalf("expected temperature hint, got %q", msg)
+	}
+}
