@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	ProviderOpenRouter = "openrouter"
-	ProviderOpenAI     = "openai"
+	ProviderOpenRouter  = "openrouter"
+	ProviderOpenAI      = "openai"
+	ProviderOpenAICodex = "openai-codex"
 )
 
 type providerFactory struct {

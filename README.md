@@ -2,7 +2,7 @@
 
 DotAgent is a Go-based personal agent runtime with:
 - Messaging: Discord
-- LLM providers: OpenRouter, OpenAI
+- LLM providers: OpenRouter, OpenAI API, OpenAI Codex OAuth
 - Memory: unified SQLite store (`workspace/state/memory.db`)
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 - Context continuity: strict fail-closed checks when durable context is unavailable
@@ -14,7 +14,8 @@ DotAgent is a Go-based personal agent runtime with:
 - Go 1.25+
 - Provider credentials:
   - OpenRouter API key, or
-  - OpenAI API key / bearer token
+  - OpenAI API key / bearer token, or
+  - OpenAI Codex OAuth token (for `openai-codex`)
 - Discord bot token (for `gateway` mode)
 
 ## Install
@@ -37,6 +38,8 @@ Update at least:
 - `providers.openrouter.api_key` (OpenRouter), or set:
   - `agents.defaults.provider=openai`
   - `providers.openai.api_key` (or `providers.openai.oauth_access_token` / `providers.openai.oauth_token_file`)
+  - or `agents.defaults.provider=openai-codex`
+  - `providers.openai_codex.oauth_access_token` (or `providers.openai_codex.oauth_token_file`)
 - `channels.discord.token` (for gateway mode)
 
 Validate setup:
@@ -82,10 +85,13 @@ docker compose start dotagent-gateway
 
 ## Config Notes
 
-- Supported providers: `openrouter` and `openai` (`agents.defaults.provider`)
-- OpenAI auth modes: API key, direct bearer token, or bearer token file (for externally refreshed OAuth tokens)
+- Supported providers: `openrouter`, `openai`, and `openai-codex` (`agents.defaults.provider`)
+- OpenAI (`openai`) auth modes: API key, direct bearer token, or bearer token file (for externally refreshed OAuth tokens)
   - Set exactly one auth source: `providers.openai.api_key`, `providers.openai.oauth_access_token`, or `providers.openai.oauth_token_file`.
   - `providers.openai.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
+- OpenAI Codex (`openai-codex`) auth modes: direct bearer token or bearer token file
+  - Set exactly one auth source: `providers.openai_codex.oauth_access_token` or `providers.openai_codex.oauth_token_file`.
+  - `providers.openai_codex.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
   - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2` (OpenRouter default)
@@ -148,6 +154,11 @@ DOTAGENT_PROVIDERS_OPENAI_API_BASE=https://api.openai.com/v1
 DOTAGENT_PROVIDERS_OPENAI_ORGANIZATION=org_xxx
 DOTAGENT_PROVIDERS_OPENAI_PROJECT=proj_xxx
 
+DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_ACCESS_TOKEN=
+DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE=~/.codex/auth.json
+DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE=https://api.openai.com/v1
+DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY=
+
 DOTAGENT_AGENTS_DEFAULTS_PROVIDER=openrouter
 DOTAGENT_AGENTS_DEFAULTS_MODEL=openai/gpt-5.2
 
@@ -167,6 +178,26 @@ DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE=export_only
 DOTAGENT_MEMORY_PERSONA_POLICY_MODE=balanced
 DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE=0.52
 ```
+
+OpenAI Codex OAuth in Docker:
+
+```yaml
+# docker-compose.yml (dotagent-gateway.volumes)
+- ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
+```
+
+```json
+{
+  "agents": { "defaults": { "provider": "openai-codex", "model": "gpt-5" } },
+  "providers": {
+    "openai_codex": {
+      "oauth_token_file": "/root/.codex/auth.json"
+    }
+  }
+}
+```
+
+Switching providers does not clear memory. Memory remains in `workspace/state/memory.db`.
 
 ## Commands
 

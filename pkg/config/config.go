@@ -83,8 +83,9 @@ type HeartbeatConfig struct {
 }
 
 type ProvidersConfig struct {
-	OpenRouter OpenRouterProviderConfig `json:"openrouter"`
-	OpenAI     OpenAIProviderConfig     `json:"openai"`
+	OpenRouter  OpenRouterProviderConfig  `json:"openrouter"`
+	OpenAI      OpenAIProviderConfig      `json:"openai"`
+	OpenAICodex OpenAICodexProviderConfig `json:"openai_codex"`
 }
 
 type OpenRouterProviderConfig struct {
@@ -101,6 +102,13 @@ type OpenAIProviderConfig struct {
 	Proxy            string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_PROXY"`
 	Organization     string `json:"organization,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_ORGANIZATION"`
 	Project          string `json:"project,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_PROJECT"`
+}
+
+type OpenAICodexProviderConfig struct {
+	OAuthAccessToken string `json:"oauth_access_token,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_ACCESS_TOKEN"`
+	OAuthTokenFile   string `json:"oauth_token_file,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE"`
+	APIBase          string `json:"api_base" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE"`
+	Proxy            string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY"`
 }
 
 type GatewayConfig struct {
@@ -171,8 +179,9 @@ func DefaultConfig() *Config {
 			},
 		},
 		Providers: ProvidersConfig{
-			OpenRouter: OpenRouterProviderConfig{},
-			OpenAI:     OpenAIProviderConfig{},
+			OpenRouter:  OpenRouterProviderConfig{},
+			OpenAI:      OpenAIProviderConfig{},
+			OpenAICodex: OpenAICodexProviderConfig{},
 		},
 		Gateway: GatewayConfig{
 			Host: "0.0.0.0",
@@ -195,8 +204,9 @@ func DefaultConfig() *Config {
 				Allow:       []string{},
 				Deny:        []string{},
 				ProviderModes: map[string]string{
-					"openrouter": "auto",
-					"openai":     "auto",
+					"openrouter":   "auto",
+					"openai":       "auto",
+					"openai-codex": "auto",
 				},
 			},
 		},

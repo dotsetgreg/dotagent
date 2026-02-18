@@ -246,6 +246,177 @@ func TestValidateProviderConfig_MissingCredentials(t *testing.T) {
 	}
 }
 
+func TestResolveOpenAICodexAuthConfig_RejectsMultipleCredentialSources(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAICodex
+	cfg.Providers.OpenAICodex.OAuthAccessToken = "inline-token"
+	cfg.Providers.OpenAICodex.OAuthTokenFile = "/tmp/codex-auth.json"
+
+	mode, source, err := resolveOpenAICodexAuthConfig(cfg)
+	if err == nil {
+		t.Fatalf("expected multi-credential configuration error")
+	}
+	if mode != "" || source != "" {
+		t.Fatalf("expected empty mode/source on error, got mode=%q source=%q", mode, source)
+	}
+	if want := "multiple OpenAI Codex credential sources configured"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected error containing %q, got %v", want, err)
+	}
+}
+
+func TestValidateProviderConfig_MissingCredentials_OpenAICodex(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAICodex
+
+	if err := ValidateProviderConfig(cfg); err == nil {
+		t.Fatalf("expected missing credentials error for openai-codex")
+	}
+}
+
+func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
+	var seenAuth string
+	var seenPath string
+	var seenTools []interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenPath = r.URL.Path
+
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got := req["model"]; got != "gpt-5" {
+			t.Fatalf("expected model gpt-5, got %v", got)
+		}
+		if tools, ok := req["tools"].([]interface{}); ok {
+			seenTools = tools
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_test_1",
+			"status":"completed",
+			"output":[
+				{
+					"type":"function_call",
+					"call_id":"call_1",
+					"name":"read_file",
+					"arguments":"{\"path\":\"README.md\"}"
+				}
+			],
+			"usage":{"input_tokens":6,"output_tokens":3,"total_tokens":9}
+		}`))
+	}))
+	defer server.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "codex-token.txt")
+	if err := os.WriteFile(tokenFile, []byte("codex-oauth-token"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAICodex
+	cfg.Providers.OpenAICodex.APIBase = server.URL
+	cfg.Providers.OpenAICodex.OAuthTokenFile = tokenFile
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	resp, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "read file"}}, []ToolDefinition{{
+		Type: "function",
+		Function: ToolFunctionDefinition{
+			Name:       "read_file",
+			Parameters: map[string]interface{}{"type": "object"},
+		},
+	}}, "gpt-5", map[string]interface{}{"max_tokens": 128, "temperature": 0.3})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+
+	if seenAuth != "Bearer codex-oauth-token" {
+		t.Fatalf("expected bearer token from file, got %q", seenAuth)
+	}
+	if seenPath != "/responses" {
+		t.Fatalf("expected /responses path, got %q", seenPath)
+	}
+	if len(seenTools) != 1 {
+		t.Fatalf("expected one tool definition in responses payload, got %d", len(seenTools))
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(resp.ToolCalls))
+	}
+	if got := resp.ToolCalls[0].Name; got != "read_file" {
+		t.Fatalf("expected tool call name read_file, got %q", got)
+	}
+	if got := resp.ToolCalls[0].Arguments["path"]; got != "README.md" {
+		t.Fatalf("expected tool argument path README.md, got %v", got)
+	}
+}
+
+func TestCreateProvider_OpenAICodex_StatefulResponseID(t *testing.T) {
+	var seenPrevious string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if prev, ok := req["previous_response_id"].(string); ok {
+			seenPrevious = prev
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_next_1",
+			"status":"completed",
+			"output":[
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "codex-token.txt")
+	if err := os.WriteFile(tokenFile, []byte("codex-oauth-token"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAICodex
+	cfg.Providers.OpenAICodex.APIBase = server.URL
+	cfg.Providers.OpenAICodex.OAuthTokenFile = tokenFile
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	stateful, ok := provider.(StatefulLLMProvider)
+	if !ok {
+		t.Fatalf("expected openai-codex provider to implement StatefulLLMProvider")
+	}
+
+	resp, newState, err := stateful.ChatWithState(
+		context.Background(),
+		"resp_prev_1",
+		[]Message{{Role: "user", Content: "hello"}},
+		nil,
+		"gpt-5",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("chat with state: %v", err)
+	}
+	if seenPrevious != "resp_prev_1" {
+		t.Fatalf("expected previous_response_id resp_prev_1, got %q", seenPrevious)
+	}
+	if newState != "resp_next_1" {
+		t.Fatalf("expected returned state resp_next_1, got %q", newState)
+	}
+	if resp.Content != "done" {
+		t.Fatalf("expected content done, got %q", resp.Content)
+	}
+}
+
 func TestRegisterFactory_InvalidRegistrationDoesNotPanic(t *testing.T) {
 	factoryMu.RLock()
 	origFactories := make(map[string]providerFactory, len(factories))

@@ -30,6 +30,12 @@
       "proxy": "",
       "organization": "",
       "project": ""
+    },
+    "openai_codex": {
+      "oauth_access_token": "",
+      "oauth_token_file": "~/.codex/auth.json",
+      "api_base": "https://api.openai.com/v1",
+      "proxy": ""
     }
   },
   "tools": {
@@ -50,7 +56,8 @@
       "deny": [],
       "provider_modes": {
         "openrouter": "auto",
-        "openai": "auto"
+        "openai": "auto",
+        "openai-codex": "auto"
       }
     }
   },

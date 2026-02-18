@@ -124,7 +124,8 @@ func (p *chatCompletionsProvider) Chat(ctx context.Context, messages []Message, 
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("%s API request failed: status=%d error=%s", p.providerName, resp.StatusCode, extractAPIError(body))
+		msg := augmentProviderError(p.providerName, extractAPIError(body))
+		return nil, fmt.Errorf("%s API request failed: status=%d error=%s", p.providerName, resp.StatusCode, msg)
 	}
 
 	result, err := parseChatCompletionsResponse(body)

@@ -92,6 +92,12 @@ func TestDefaultConfig_Providers(t *testing.T) {
 	if cfg.Providers.OpenAI.OAuthAccessToken != "" {
 		t.Error("OpenAI OAuth access token should be empty by default")
 	}
+	if cfg.Providers.OpenAICodex.OAuthAccessToken != "" {
+		t.Error("OpenAI Codex OAuth access token should be empty by default")
+	}
+	if cfg.Providers.OpenAICodex.OAuthTokenFile != "" {
+		t.Error("OpenAI Codex OAuth token file should be empty by default")
+	}
 }
 
 // TestDefaultConfig_Channels verifies Discord config defaults
@@ -116,6 +122,9 @@ func TestDefaultConfig_WebTools(t *testing.T) {
 	}
 	if cfg.Tools.Web.DuckDuckGo.MaxResults != 5 {
 		t.Error("Expected DuckDuckGo MaxResults 5, got ", cfg.Tools.Web.DuckDuckGo.MaxResults)
+	}
+	if got := cfg.Tools.Policy.ProviderModes["openai-codex"]; got != "auto" {
+		t.Fatalf("expected provider mode default auto for openai-codex, got %q", got)
 	}
 }
 
@@ -205,5 +214,22 @@ func TestLoadConfig_OpenAIEnvOverrides(t *testing.T) {
 	}
 	if got := cfg.Providers.OpenAI.Project; got != "proj_test" {
 		t.Fatalf("expected openai project from env, got %q", got)
+	}
+}
+
+func TestLoadConfig_OpenAICodexEnvOverrides(t *testing.T) {
+	t.Setenv("DOTAGENT_AGENTS_DEFAULTS_PROVIDER", "openai-codex")
+	t.Setenv("DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE", "/tmp/codex-auth.json")
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if got := cfg.Agents.Defaults.Provider; got != "openai-codex" {
+		t.Fatalf("expected provider openai-codex, got %q", got)
+	}
+	if got := cfg.Providers.OpenAICodex.OAuthTokenFile; got != "/tmp/codex-auth.json" {
+		t.Fatalf("expected openai-codex oauth token file from env, got %q", got)
 	}
 }
