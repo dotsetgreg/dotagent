@@ -316,6 +316,24 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		if got, ok := req["store"].(bool); !ok || got {
 			t.Fatalf("expected store=false in codex payload, got %v", req["store"])
 		}
+		instructions, ok := req["instructions"].(string)
+		if !ok || strings.TrimSpace(instructions) == "" {
+			t.Fatalf("expected non-empty instructions, got %v", req["instructions"])
+		}
+		if strings.TrimSpace(instructions) != "system prompt" {
+			t.Fatalf("expected instructions from system prompt, got %q", instructions)
+		}
+		if input, ok := req["input"].([]interface{}); ok {
+			for _, item := range input {
+				im, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if role, _ := im["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+					t.Fatalf("expected system messages removed from codex input")
+				}
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -350,7 +368,10 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		t.Fatalf("create provider: %v", err)
 	}
 
-	resp, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "read file"}}, []ToolDefinition{{
+	resp, err := provider.Chat(context.Background(), []Message{
+		{Role: "system", Content: "system prompt"},
+		{Role: "user", Content: "read file"},
+	}, []ToolDefinition{{
 		Type: "function",
 		Function: ToolFunctionDefinition{
 			Name:       "read_file",
@@ -387,6 +408,50 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 	}
 	if got := resp.ToolCalls[0].Arguments["path"]; got != "README.md" {
 		t.Fatalf("expected tool argument path README.md, got %v", got)
+	}
+}
+
+func TestCreateProvider_OpenAICodex_SetsFallbackInstructions(t *testing.T) {
+	var seenInstructions string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if inst, ok := req["instructions"].(string); ok {
+			seenInstructions = strings.TrimSpace(inst)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_test_fallback",
+			"status":"completed",
+			"output":[
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "codex-token.txt")
+	token := makeOpenAICodexToken(t, "acct_test_777")
+	if err := os.WriteFile(tokenFile, []byte(token), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAICodex
+	cfg.Providers.OpenAICodex.APIBase = server.URL
+	cfg.Providers.OpenAICodex.OAuthTokenFile = tokenFile
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if _, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, nil, "gpt-5", nil); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if seenInstructions == "" {
+		t.Fatalf("expected fallback instructions to be set")
 	}
 }
 

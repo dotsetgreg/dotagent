@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	defaultOpenAICodexAPIBase = "https://chatgpt.com/backend-api"
-	defaultOpenAICodexModel   = "gpt-5"
-	openAICodexJWTClaimPath   = "https://api.openai.com/auth"
+	defaultOpenAICodexAPIBase      = "https://chatgpt.com/backend-api"
+	defaultOpenAICodexModel        = "gpt-5"
+	openAICodexJWTClaimPath        = "https://api.openai.com/auth"
+	defaultOpenAICodexInstructions = "You are a helpful assistant."
 )
 
 func init() {
@@ -74,6 +75,7 @@ func newOpenAICodexProviderFromConfig(cfg *config.Config) (LLMProvider, error) {
 				if _, hasStream := body["stream"]; !hasStream {
 					body["stream"] = false
 				}
+				ensureOpenAICodexInstructions(body)
 			},
 			beforeSend: decorateOpenAICodexRequest,
 		},
@@ -221,4 +223,99 @@ func decodeBase64URL(raw string) ([]byte, error) {
 
 func openAICodexUserAgent() string {
 	return fmt.Sprintf("dotagent (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+}
+
+func ensureOpenAICodexInstructions(body map[string]interface{}) {
+	if body == nil {
+		return
+	}
+	if current, ok := body["instructions"].(string); ok && strings.TrimSpace(current) != "" {
+		return
+	}
+
+	inputItems := normalizeResponsesInputItems(body["input"])
+	if len(inputItems) == 0 {
+		body["instructions"] = defaultOpenAICodexInstructions
+		return
+	}
+
+	filtered := make([]map[string]interface{}, 0, len(inputItems))
+	instructionParts := make([]string, 0, 2)
+	for _, item := range inputItems {
+		role := strings.ToLower(strings.TrimSpace(asString(item["role"])))
+		if role == "system" || role == "developer" {
+			if text := extractResponsesContentText(item["content"]); text != "" {
+				instructionParts = append(instructionParts, text)
+			}
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	if len(filtered) > 0 {
+		body["input"] = filtered
+	}
+
+	instructions := strings.TrimSpace(strings.Join(instructionParts, "\n\n"))
+	if instructions == "" {
+		instructions = defaultOpenAICodexInstructions
+	}
+	body["instructions"] = instructions
+}
+
+func normalizeResponsesInputItems(raw any) []map[string]interface{} {
+	switch v := raw.(type) {
+	case []map[string]interface{}:
+		return v
+	case []interface{}:
+		items := make([]map[string]interface{}, 0, len(v))
+		for _, entry := range v {
+			if item, ok := entry.(map[string]interface{}); ok {
+				items = append(items, item)
+			}
+		}
+		return items
+	default:
+		return nil
+	}
+}
+
+func extractResponsesContentText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []map[string]interface{}:
+		parts := make([]string, 0, len(v))
+		for _, part := range v {
+			ptype := strings.ToLower(strings.TrimSpace(asString(part["type"])))
+			if ptype == "input_text" || ptype == "text" || ptype == "output_text" {
+				if text := strings.TrimSpace(asString(part["text"])); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, entry := range v {
+			if part, ok := entry.(map[string]interface{}); ok {
+				ptype := strings.ToLower(strings.TrimSpace(asString(part["type"])))
+				if ptype == "input_text" || ptype == "text" || ptype == "output_text" {
+					if text := strings.TrimSpace(asString(part["text"])); text != "" {
+						parts = append(parts, text)
+					}
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func asString(value any) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
 }
