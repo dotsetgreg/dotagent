@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/dotsetgreg/dotagent/pkg/config"
@@ -140,7 +141,7 @@ func TestCreateProvider_OpenAI_WithAPIKeyAndToolCalls(t *testing.T) {
 	}
 }
 
-func TestOpenAIAuthPrecedence(t *testing.T) {
+func TestResolveOpenAIAuthConfig_RejectsMultipleCredentialSources(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token.txt")
 	if err := os.WriteFile(tokenFile, []byte("from-file"), 0o600); err != nil {
 		t.Fatalf("write token file: %v", err)
@@ -153,14 +154,14 @@ func TestOpenAIAuthPrecedence(t *testing.T) {
 	cfg.Providers.OpenAI.OAuthTokenFile = tokenFile
 
 	mode, source, err := resolveOpenAIAuthConfig(cfg)
-	if err != nil {
-		t.Fatalf("resolve auth config: %v", err)
+	if err == nil {
+		t.Fatalf("expected multi-credential configuration error")
 	}
-	if mode != "api_key" {
-		t.Fatalf("expected api_key mode, got %q", mode)
+	if mode != "" || source != "" {
+		t.Fatalf("expected empty mode/source on error, got mode=%q source=%q", mode, source)
 	}
-	if source != "api-key-wins" {
-		t.Fatalf("expected api key source, got %q", source)
+	if want := "multiple OpenAI credential sources configured"; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected error containing %q, got %v", want, err)
 	}
 }
 
@@ -192,6 +193,38 @@ func TestCreateProvider_OpenAI_UsesOAuthTokenFile(t *testing.T) {
 	}
 	if seenAuth != "Bearer oauth-token-from-file" {
 		t.Fatalf("expected oauth bearer from file, got %q", seenAuth)
+	}
+}
+
+func TestCreateProvider_OpenAI_UsesOAuthTokenFile_CodexAuthJSON(t *testing.T) {
+	var seenAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "auth.json")
+	payload := `{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-token-from-codex"}}`
+	if err := os.WriteFile(tokenFile, []byte(payload), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOpenAI
+	cfg.Providers.OpenAI.APIBase = server.URL
+	cfg.Providers.OpenAI.OAuthTokenFile = tokenFile
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if _, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, nil, "", nil); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if seenAuth != "Bearer oauth-token-from-codex" {
+		t.Fatalf("expected oauth bearer from codex json token file, got %q", seenAuth)
 	}
 }
 

@@ -3,6 +3,7 @@ package providers
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/dotsetgreg/dotagent/pkg/config"
@@ -104,14 +105,50 @@ func resolveOpenAIAuthConfig(cfg *config.Config) (mode string, source string, er
 	if cfg == nil {
 		return "", "", fmt.Errorf("config is required")
 	}
+
+	type candidate struct {
+		mode   string
+		source string
+		field  string
+	}
+	candidates := make([]candidate, 0, 3)
 	if apiKey := strings.TrimSpace(cfg.Providers.OpenAI.APIKey); apiKey != "" {
-		return "api_key", apiKey, nil
+		candidates = append(candidates, candidate{
+			mode:   "api_key",
+			source: apiKey,
+			field:  "providers.openai.api_key",
+		})
 	}
 	if token := strings.TrimSpace(cfg.Providers.OpenAI.OAuthAccessToken); token != "" {
-		return "oauth_access_token", token, nil
+		candidates = append(candidates, candidate{
+			mode:   "oauth_access_token",
+			source: token,
+			field:  "providers.openai.oauth_access_token",
+		})
 	}
 	if tokenFile := strings.TrimSpace(cfg.Providers.OpenAI.OAuthTokenFile); tokenFile != "" {
-		return "oauth_token_file", tokenFile, nil
+		candidates = append(candidates, candidate{
+			mode:   "oauth_token_file",
+			source: tokenFile,
+			field:  "providers.openai.oauth_token_file",
+		})
 	}
-	return "", "", fmt.Errorf("OpenAI credentials are required (set providers.openai.api_key, providers.openai.oauth_access_token, or providers.openai.oauth_token_file)")
+
+	switch len(candidates) {
+	case 0:
+		return "", "", fmt.Errorf("OpenAI credentials are required (set providers.openai.api_key, providers.openai.oauth_access_token, or providers.openai.oauth_token_file)")
+	case 1:
+		chosen := candidates[0]
+		return chosen.mode, chosen.source, nil
+	default:
+		fields := make([]string, 0, len(candidates))
+		for _, item := range candidates {
+			fields = append(fields, item.field)
+		}
+		slices.Sort(fields)
+		return "", "", fmt.Errorf(
+			"multiple OpenAI credential sources configured (%s); set exactly one",
+			strings.Join(fields, ", "),
+		)
+	}
 }

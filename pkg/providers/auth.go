@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -34,8 +35,8 @@ func NewStaticTokenSource(token, source string) TokenSource {
 
 func (s *staticTokenSource) Token(context.Context) (string, error) {
 	tok := strings.TrimSpace(s.token)
-	if tok == "" {
-		return "", fmt.Errorf("token is empty for %s", s.Source())
+	if err := validateTokenLiteral(tok, s.Source()); err != nil {
+		return "", err
 	}
 	return tok, nil
 }
@@ -64,9 +65,9 @@ func (s *fileTokenSource) Token(context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read token file %s: %w", resolved, err)
 	}
-	tok := strings.TrimSpace(string(data))
-	if tok == "" {
-		return "", fmt.Errorf("token file %s is empty", resolved)
+	tok, err := parseTokenFileContent(data, resolved)
+	if err != nil {
+		return "", err
 	}
 	return tok, nil
 }
@@ -145,4 +146,66 @@ func expandHome(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+func parseTokenFileContent(data []byte, source string) (string, error) {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return "", fmt.Errorf("token file %s is empty", source)
+	}
+
+	// Support both plain-token files and Codex/OpenAI OAuth auth.json format.
+	if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") {
+		token, err := extractTokenFromJSON(raw)
+		if err != nil {
+			return "", fmt.Errorf("parse token JSON from %s: %w", source, err)
+		}
+		if err := validateTokenLiteral(token, source); err != nil {
+			return "", err
+		}
+		return token, nil
+	}
+
+	if err := validateTokenLiteral(raw, source); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+func extractTokenFromJSON(raw string) (string, error) {
+	var payload struct {
+		AccessToken string `json:"access_token"`
+		Tokens      struct {
+			AccessToken string `json:"access_token"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", err
+	}
+
+	token := strings.TrimSpace(payload.AccessToken)
+	if token == "" {
+		token = strings.TrimSpace(payload.Tokens.AccessToken)
+	}
+	if token == "" {
+		return "", fmt.Errorf("missing access_token (expected access_token or tokens.access_token)")
+	}
+	return token, nil
+}
+
+func validateTokenLiteral(tok, source string) error {
+	token := strings.TrimSpace(tok)
+	if token == "" {
+		return fmt.Errorf("token is empty for %s", source)
+	}
+	if strings.HasPrefix(token, "<") && strings.HasSuffix(token, ">") {
+		return fmt.Errorf("token for %s appears to be a placeholder template", source)
+	}
+	if strings.HasPrefix(token, "$") || strings.Contains(token, "${") {
+		return fmt.Errorf("token for %s appears to be an unresolved environment reference", source)
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		return fmt.Errorf("token for %s must be a single value without whitespace", source)
+	}
+	return nil
 }

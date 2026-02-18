@@ -84,6 +84,8 @@ docker compose start dotagent-gateway
 
 - Supported providers: `openrouter` and `openai` (`agents.defaults.provider`)
 - OpenAI auth modes: API key, direct bearer token, or bearer token file (for externally refreshed OAuth tokens)
+  - Set exactly one auth source: `providers.openai.api_key`, `providers.openai.oauth_access_token`, or `providers.openai.oauth_token_file`.
+  - `providers.openai.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
   - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2` (OpenRouter default)
@@ -141,7 +143,7 @@ DOTAGENT_PROVIDERS_OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 
 DOTAGENT_PROVIDERS_OPENAI_API_KEY=sk-proj-...
 DOTAGENT_PROVIDERS_OPENAI_OAUTH_ACCESS_TOKEN=
-DOTAGENT_PROVIDERS_OPENAI_OAUTH_TOKEN_FILE=~/.dotagent/openai-token.txt
+DOTAGENT_PROVIDERS_OPENAI_OAUTH_TOKEN_FILE=~/.codex/auth.json
 DOTAGENT_PROVIDERS_OPENAI_API_BASE=https://api.openai.com/v1
 DOTAGENT_PROVIDERS_OPENAI_ORGANIZATION=org_xxx
 DOTAGENT_PROVIDERS_OPENAI_PROJECT=proj_xxx
