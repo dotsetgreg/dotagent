@@ -316,6 +316,9 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 		if got, ok := req["store"].(bool); !ok || got {
 			t.Fatalf("expected store=false in codex payload, got %v", req["store"])
 		}
+		if got, ok := req["stream"].(bool); !ok || !got {
+			t.Fatalf("expected stream=true in codex payload, got %v", req["stream"])
+		}
 		instructions, ok := req["instructions"].(string)
 		if !ok || strings.TrimSpace(instructions) == "" {
 			t.Fatalf("expected non-empty instructions, got %v", req["instructions"])
@@ -335,20 +338,9 @@ func TestCreateProvider_OpenAICodex_UsesResponsesEndpoint(t *testing.T) {
 			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"resp_test_1",
-			"status":"completed",
-			"output":[
-				{
-					"type":"function_call",
-					"call_id":"call_1",
-					"name":"read_file",
-					"arguments":"{\"path\":\"README.md\"}"
-				}
-			],
-			"usage":{"input_tokens":6,"output_tokens":3,"total_tokens":9}
-		}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test_1\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}],\"usage\":{\"input_tokens\":6,\"output_tokens\":3,\"total_tokens\":9}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()
 

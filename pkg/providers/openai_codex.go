@@ -72,9 +72,7 @@ func newOpenAICodexProviderFromConfig(cfg *config.Config) (LLMProvider, error) {
 			buildEndpoint: resolveOpenAICodexResponsesEndpoint,
 			beforeMarshal: func(body map[string]interface{}) {
 				body["store"] = false
-				if _, hasStream := body["stream"]; !hasStream {
-					body["stream"] = false
-				}
+				body["stream"] = true
 				ensureOpenAICodexInstructions(body)
 			},
 			beforeSend: decorateOpenAICodexRequest,

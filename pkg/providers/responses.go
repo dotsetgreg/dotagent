@@ -131,6 +131,7 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 	if p.options.beforeMarshal != nil {
 		p.options.beforeMarshal(requestBody)
 	}
+	streaming := responsesBoolField(requestBody["stream"])
 
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
@@ -175,7 +176,12 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 		return nil, "", fmt.Errorf("%s API request failed: status=%d error=%s", p.providerName, resp.StatusCode, msg)
 	}
 
-	parsed, err := parseResponsesResponse(body)
+	var parsed *parsedResponsesResult
+	if streaming {
+		parsed, err = parseResponsesStreamBody(body)
+	} else {
+		parsed, err = parseResponsesResponse(body)
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("parse %s response: %w", p.providerName, err)
 	}
@@ -195,6 +201,17 @@ func defaultResponsesEndpoint(apiBase string) string {
 		return ""
 	}
 	return base + "/responses"
+}
+
+func responsesBoolField(value interface{}) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
 }
 
 type parsedResponsesResult struct {
@@ -298,6 +315,123 @@ func parseResponsesResponse(body []byte) (*parsedResponsesResult, error) {
 			Usage:        usage,
 		},
 	}, nil
+}
+
+func parseResponsesStreamBody(body []byte) (*parsedResponsesResult, error) {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty streaming response body")
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return parseResponsesResponse([]byte(trimmed))
+	}
+
+	normalized := strings.ReplaceAll(trimmed, "\r\n", "\n")
+	chunks := strings.Split(normalized, "\n\n")
+	var content strings.Builder
+
+	for _, chunk := range chunks {
+		data := extractSSEDataChunk(chunk)
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		eventType := strings.TrimSpace(responsesAsString(event["type"]))
+		switch eventType {
+		case "error":
+			return nil, fmt.Errorf("%s", extractSSEErrorMessage(event))
+		case "response.failed":
+			if msg := extractResponsesErrorMessage(event); msg != "" {
+				return nil, fmt.Errorf("%s", msg)
+			}
+			return nil, fmt.Errorf("response.failed")
+		case "response.done", "response.completed":
+			raw, ok := event["response"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			payload, err := json.Marshal(raw)
+			if err != nil {
+				return nil, err
+			}
+			return parseResponsesResponse(payload)
+		case "response.output_text.delta", "response.refusal.delta":
+			if delta := responsesAsString(event["delta"]); delta != "" {
+				content.WriteString(delta)
+			}
+		case "response.output_text.done":
+			text := strings.TrimSpace(responsesAsString(event["text"]))
+			if text != "" {
+				if content.Len() > 0 {
+					content.WriteString("\n")
+				}
+				content.WriteString(text)
+			}
+		}
+	}
+
+	if fallback := strings.TrimSpace(content.String()); fallback != "" {
+		return &parsedResponsesResult{
+			Response: &LLMResponse{
+				Content:      fallback,
+				FinishReason: "completed",
+			},
+		}, nil
+	}
+
+	return nil, fmt.Errorf("streaming responses payload missing completion event")
+}
+
+func extractSSEDataChunk(chunk string) string {
+	lines := strings.Split(chunk, "\n")
+	dataLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data:") {
+			continue
+		}
+		dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+	}
+	return strings.TrimSpace(strings.Join(dataLines, "\n"))
+}
+
+func extractSSEErrorMessage(event map[string]interface{}) string {
+	if msg := strings.TrimSpace(responsesAsString(event["message"])); msg != "" {
+		return msg
+	}
+	if rawErr, ok := event["error"].(map[string]interface{}); ok {
+		if msg := strings.TrimSpace(responsesAsString(rawErr["message"])); msg != "" {
+			return msg
+		}
+	}
+	return "stream error"
+}
+
+func extractResponsesErrorMessage(event map[string]interface{}) string {
+	rawResp, ok := event["response"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	rawErr, ok := rawResp["error"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(responsesAsString(rawErr["message"]))
+}
+
+func responsesAsString(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func buildResponsesInput(messages []Message) []map[string]interface{} {

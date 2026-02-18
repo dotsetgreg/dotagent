@@ -119,3 +119,28 @@ func TestToResponsesTools(t *testing.T) {
 		t.Fatalf("expected non-empty marshaled tool payload")
 	}
 }
+
+func TestParseResponsesStreamBody_CompletionEvent(t *testing.T) {
+	body := []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\ndata: [DONE]\n\n")
+	parsed, err := parseResponsesStreamBody(body)
+	if err != nil {
+		t.Fatalf("parse stream body: %v", err)
+	}
+	if parsed.ResponseID != "resp_stream_1" {
+		t.Fatalf("expected response id resp_stream_1, got %q", parsed.ResponseID)
+	}
+	if got := parsed.Response.Content; got != "hello" {
+		t.Fatalf("expected content hello, got %q", got)
+	}
+}
+
+func TestParseResponsesStreamBody_DeltaFallback(t *testing.T) {
+	body := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\ndata: [DONE]\n\n")
+	parsed, err := parseResponsesStreamBody(body)
+	if err != nil {
+		t.Fatalf("parse stream body fallback: %v", err)
+	}
+	if got := parsed.Response.Content; got != "hello world" {
+		t.Fatalf("expected fallback content hello world, got %q", got)
+	}
+}
