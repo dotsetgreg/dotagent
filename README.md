@@ -121,6 +121,7 @@ Operational safeguards:
 - Sensitive-content filtering before durable memory writes
 - Durable audit log (`memory_audit_log`) for memory upserts/deletes
 - Retention sweeps for archived events, expired/deleted memory, cache, and audit records
+- Turn-level tool governance: conversational turns do not expose local filesystem/shell tools, and runtime state paths (`workspace/state/*`) are blocked from tool-based continuity introspection
 
 ## Environment Variables
 

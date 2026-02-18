@@ -62,14 +62,13 @@ Use the dynamic persona context block as the canonical source of identity, role,
 
 ## Workspace
 Your workspace is at: %s
-- Memory DB: %s/state/memory.db
 - Skills: %s/skills/{skill-name}/SKILL.md
 
 %s
 
 ## Important Rules
 
-1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.
+1. **Use tools when needed** - Use tools for external actions or verification (file edits, command execution, web lookups). Do not call tools for conversational continuity if recalled context already provides the answer.
 
 2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
@@ -77,8 +76,10 @@ Your workspace is at: %s
 
 4. **Context honesty** - Never claim you cannot access prior messages or memory unless the current turn explicitly lacks that context and you state that limitation precisely.
 
-5. **Capability clarity** - If you cannot comply with a requested style/behavior because of model/provider constraints, say that explicitly instead of denying stored persona.`,
-		runtime, workspacePath, workspacePath, workspacePath, toolsSection)
+5. **No runtime introspection for continuity** - Do not inspect runtime state files/databases (workspace/state/*, memory.db, state.json) to answer "do you remember" or identity-continuity questions. Use memory/context provided in the prompt.
+
+6. **Capability clarity** - If you cannot comply with a requested style/behavior because of model/provider constraints, say that explicitly instead of denying stored persona.`,
+		runtime, workspacePath, workspacePath, toolsSection)
 }
 
 func (cb *ContextBuilder) buildToolsSection() string {
@@ -93,7 +94,7 @@ func (cb *ContextBuilder) buildToolsSection() string {
 
 	var sb strings.Builder
 	sb.WriteString("## Available Tools\n\n")
-	sb.WriteString("**CRITICAL**: You MUST use tools to perform actions. Do NOT pretend to execute commands or schedule tasks.\n\n")
+	sb.WriteString("Use tools when required by user intent or external verification. Do not use tools to infer conversational memory/identity continuity from runtime files.\n\n")
 	sb.WriteString("You have access to the following tools:\n\n")
 	for _, s := range summaries {
 		sb.WriteString(s)

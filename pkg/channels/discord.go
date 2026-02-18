@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -14,13 +15,21 @@ import (
 )
 
 const (
-	sendTimeout = 10 * time.Second
+	sendTimeout           = 10 * time.Second
+	typingRefreshInterval = 8 * time.Second
 )
 
 type DiscordChannel struct {
 	*BaseChannel
-	session *discordgo.Session
-	config  config.DiscordConfig
+	session  *discordgo.Session
+	config   config.DiscordConfig
+	typing   map[string]*typingSession
+	typingMu sync.Mutex
+}
+
+type typingSession struct {
+	pending int
+	cancel  context.CancelFunc
 }
 
 func NewDiscordChannel(cfg config.DiscordConfig, bus *bus.MessageBus) (*DiscordChannel, error) {
@@ -35,6 +44,7 @@ func NewDiscordChannel(cfg config.DiscordConfig, bus *bus.MessageBus) (*DiscordC
 		BaseChannel: base,
 		session:     session,
 		config:      cfg,
+		typing:      make(map[string]*typingSession),
 	}, nil
 }
 
@@ -64,6 +74,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
 func (c *DiscordChannel) Stop(ctx context.Context) error {
 	logger.InfoC("discord", "Stopping Discord bot")
 	c.setRunning(false)
+	c.stopAllTyping()
 
 	if err := c.session.Close(); err != nil {
 		return fmt.Errorf("failed to close discord session: %w", err)
@@ -81,6 +92,7 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) erro
 	if channelID == "" {
 		return fmt.Errorf("channel ID is empty")
 	}
+	defer c.endTyping(channelID)
 
 	runes := []rune(msg.Content)
 	if len(runes) == 0 {
@@ -246,6 +258,86 @@ func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content strin
 	}
 }
 
+func (c *DiscordChannel) sendTyping(channelID string) {
+	if channelID == "" || c.session == nil {
+		return
+	}
+	if err := c.session.ChannelTyping(channelID); err != nil {
+		logger.ErrorCF("discord", "Failed to send typing indicator", map[string]any{
+			"error": err.Error(),
+		})
+	}
+}
+
+func (c *DiscordChannel) beginTyping(channelID string) {
+	if channelID == "" {
+		return
+	}
+
+	c.typingMu.Lock()
+	if sess, ok := c.typing[channelID]; ok {
+		sess.pending++
+		c.typingMu.Unlock()
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.typing[channelID] = &typingSession{
+		pending: 1,
+		cancel:  cancel,
+	}
+	c.typingMu.Unlock()
+
+	c.sendTyping(channelID)
+
+	go func() {
+		ticker := time.NewTicker(typingRefreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !c.IsRunning() {
+					return
+				}
+				c.sendTyping(channelID)
+			}
+		}
+	}()
+}
+
+func (c *DiscordChannel) endTyping(channelID string) {
+	if channelID == "" {
+		return
+	}
+
+	c.typingMu.Lock()
+	defer c.typingMu.Unlock()
+
+	sess, ok := c.typing[channelID]
+	if !ok {
+		return
+	}
+	sess.pending--
+	if sess.pending > 0 {
+		return
+	}
+	delete(c.typing, channelID)
+	sess.cancel()
+}
+
+func (c *DiscordChannel) stopAllTyping() {
+	c.typingMu.Lock()
+	defer c.typingMu.Unlock()
+
+	for channelID, sess := range c.typing {
+		sess.cancel()
+		delete(c.typing, channelID)
+	}
+}
+
 // appendContent safely appends suffix text to existing content.
 func appendContent(content, suffix string) string {
 	if content == "" {
@@ -261,12 +353,6 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
 
 	if m.Author.ID == s.State.User.ID {
 		return
-	}
-
-	if err := c.session.ChannelTyping(m.ChannelID); err != nil {
-		logger.ErrorCF("discord", "Failed to send typing indicator", map[string]any{
-			"error": err.Error(),
-		})
 	}
 
 	// Check allowlist before downloading attachments or transcribing audio.
@@ -305,6 +391,8 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
 	if content == "" {
 		content = "[media only]"
 	}
+
+	c.beginTyping(m.ChannelID)
 
 	logger.DebugCF("discord", "Received message", map[string]any{
 		"sender_name": senderName,
