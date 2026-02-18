@@ -11,6 +11,7 @@ import (
 )
 
 var namePattern = regexp.MustCompile(`^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$`)
+var frontmatterPattern = regexp.MustCompile(`(?s)^---\r?\n(.*?)\r?\n---(?:\r?\n|$)`)
 
 const (
 	MaxNameLength        = 64
@@ -83,7 +84,9 @@ func (sl *SkillsLoader) ListSkills() []SkillInfo {
 						metadata := sl.getSkillMetadata(skillFile)
 						if metadata != nil {
 							info.Description = metadata.Description
-							info.Name = metadata.Name
+							if strings.TrimSpace(metadata.Name) != "" {
+								info.Name = metadata.Name
+							}
 						}
 						if err := info.validate(); err != nil {
 							slog.Warn("invalid skill from workspace", "name", info.Name, "error", err)
@@ -123,7 +126,9 @@ func (sl *SkillsLoader) ListSkills() []SkillInfo {
 						metadata := sl.getSkillMetadata(skillFile)
 						if metadata != nil {
 							info.Description = metadata.Description
-							info.Name = metadata.Name
+							if strings.TrimSpace(metadata.Name) != "" {
+								info.Name = metadata.Name
+							}
 						}
 						if err := info.validate(); err != nil {
 							slog.Warn("invalid skill from global", "name", info.Name, "error", err)
@@ -162,7 +167,9 @@ func (sl *SkillsLoader) ListSkills() []SkillInfo {
 						metadata := sl.getSkillMetadata(skillFile)
 						if metadata != nil {
 							info.Description = metadata.Description
-							info.Name = metadata.Name
+							if strings.TrimSpace(metadata.Name) != "" {
+								info.Name = metadata.Name
+							}
 						}
 						if err := info.validate(); err != nil {
 							slog.Warn("invalid skill from builtin", "name", info.Name, "error", err)
@@ -292,10 +299,7 @@ func (sl *SkillsLoader) parseSimpleYAML(content string) map[string]string {
 }
 
 func (sl *SkillsLoader) extractFrontmatter(content string) string {
-	// (?s) enables DOTALL mode so . matches newlines
-	// Match first ---, capture everything until next --- on its own line
-	re := regexp.MustCompile(`(?s)^---\n(.*)\n---`)
-	match := re.FindStringSubmatch(content)
+	match := frontmatterPattern.FindStringSubmatch(content)
 	if len(match) > 1 {
 		return match[1]
 	}
@@ -303,8 +307,7 @@ func (sl *SkillsLoader) extractFrontmatter(content string) string {
 }
 
 func (sl *SkillsLoader) stripFrontmatter(content string) string {
-	re := regexp.MustCompile(`^---\n.*?\n---\n`)
-	return re.ReplaceAllString(content, "")
+	return frontmatterPattern.ReplaceAllString(content, "")
 }
 
 func escapeXML(s string) string {

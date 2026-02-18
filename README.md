@@ -2,7 +2,7 @@
 
 DotAgent is a Go-based personal agent runtime with:
 - Messaging: Discord
-- LLM provider: OpenRouter
+- LLM providers: OpenRouter, OpenAI
 - Memory: unified SQLite store (`workspace/state/memory.db`)
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 - Context continuity: strict fail-closed checks when durable context is unavailable
@@ -12,7 +12,9 @@ DotAgent is a Go-based personal agent runtime with:
 ## Requirements
 
 - Go 1.25+
-- OpenRouter API key
+- Provider credentials:
+  - OpenRouter API key, or
+  - OpenAI API key / bearer token
 - Discord bot token (for `gateway` mode)
 
 ## Install
@@ -32,7 +34,9 @@ go build -o dotagent ./cmd/dotagent
 This creates `~/.dotagent/config.json` and a default workspace.
 
 Update at least:
-- `providers.openrouter.api_key`
+- `providers.openrouter.api_key` (OpenRouter), or set:
+  - `agents.defaults.provider=openai`
+  - `providers.openai.api_key` (or `providers.openai.oauth_access_token` / `providers.openai.oauth_token_file`)
 - `channels.discord.token` (for gateway mode)
 
 Validate setup:
@@ -78,9 +82,11 @@ docker compose start dotagent-gateway
 
 ## Config Notes
 
-- Provider is OpenRouter (`agents.defaults.provider=openrouter`)
+- Supported providers: `openrouter` and `openai` (`agents.defaults.provider`)
+- OpenAI auth modes: API key, direct bearer token, or bearer token file (for externally refreshed OAuth tokens)
+  - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
 - Discord is the only messaging channel (`channels.discord`)
-- Default model is `openai/gpt-5.2`
+- Default model is `openai/gpt-5.2` (OpenRouter default)
 - Canonical memory DB: `~/.dotagent/workspace/state/memory.db`
 - Canonical persona profile and revision history are stored in the same SQLite DB
 
@@ -132,6 +138,14 @@ Operational safeguards:
 ```bash
 DOTAGENT_PROVIDERS_OPENROUTER_API_KEY=sk-or-v1-...
 DOTAGENT_PROVIDERS_OPENROUTER_API_BASE=https://openrouter.ai/api/v1
+
+DOTAGENT_PROVIDERS_OPENAI_API_KEY=sk-proj-...
+DOTAGENT_PROVIDERS_OPENAI_OAUTH_ACCESS_TOKEN=
+DOTAGENT_PROVIDERS_OPENAI_OAUTH_TOKEN_FILE=~/.dotagent/openai-token.txt
+DOTAGENT_PROVIDERS_OPENAI_API_BASE=https://api.openai.com/v1
+DOTAGENT_PROVIDERS_OPENAI_ORGANIZATION=org_xxx
+DOTAGENT_PROVIDERS_OPENAI_PROJECT=proj_xxx
+
 DOTAGENT_AGENTS_DEFAULTS_PROVIDER=openrouter
 DOTAGENT_AGENTS_DEFAULTS_MODEL=openai/gpt-5.2
 

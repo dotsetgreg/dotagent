@@ -82,9 +82,15 @@ func TestDefaultConfig_Gateway(t *testing.T) {
 func TestDefaultConfig_Providers(t *testing.T) {
 	cfg := DefaultConfig()
 
-	// Verify OpenRouter provider is empty by default.
+	// Verify provider credentials are empty by default.
 	if cfg.Providers.OpenRouter.APIKey != "" {
 		t.Error("OpenRouter API key should be empty by default")
+	}
+	if cfg.Providers.OpenAI.APIKey != "" {
+		t.Error("OpenAI API key should be empty by default")
+	}
+	if cfg.Providers.OpenAI.OAuthAccessToken != "" {
+		t.Error("OpenAI OAuth access token should be empty by default")
 	}
 }
 
@@ -178,5 +184,26 @@ func TestLoadConfig_EnvOverridesWithoutFile(t *testing.T) {
 	}
 	if got := cfg.Agents.Defaults.Model; got != "env/model" {
 		t.Fatalf("expected env override model, got %q", got)
+	}
+}
+
+func TestLoadConfig_OpenAIEnvOverrides(t *testing.T) {
+	t.Setenv("DOTAGENT_AGENTS_DEFAULTS_PROVIDER", "openai")
+	t.Setenv("DOTAGENT_PROVIDERS_OPENAI_API_KEY", "sk-openai")
+	t.Setenv("DOTAGENT_PROVIDERS_OPENAI_PROJECT", "proj_test")
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if got := cfg.Agents.Defaults.Provider; got != "openai" {
+		t.Fatalf("expected provider openai, got %q", got)
+	}
+	if got := cfg.Providers.OpenAI.APIKey; got != "sk-openai" {
+		t.Fatalf("expected openai api key from env, got %q", got)
+	}
+	if got := cfg.Providers.OpenAI.Project; got != "proj_test" {
+		t.Fatalf("expected openai project from env, got %q", got)
 	}
 }

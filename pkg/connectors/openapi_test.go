@@ -60,8 +60,9 @@ func TestOpenAPIRuntime_Invoke(t *testing.T) {
 	}
 
 	rt, err := NewOpenAPIRuntime("users", OpenAPIConfig{
-		SpecPath: specPath,
-		BaseURL:  server.URL + "/v1",
+		SpecPath:          specPath,
+		BaseURL:           server.URL + "/v1",
+		AllowPrivateHosts: true,
 	})
 	if err != nil {
 		t.Fatalf("new runtime: %v", err)
@@ -135,10 +136,11 @@ func TestOpenAPIRuntime_Invoke_WithAuthHeaderOnly(t *testing.T) {
 
 	t.Setenv("DOTAGENT_TEST_OPENAPI_TOKEN", "Bearer test-token")
 	rt, err := NewOpenAPIRuntime("users-auth", OpenAPIConfig{
-		SpecPath:   specPath,
-		BaseURL:    server.URL + "/v1",
-		AuthHeader: "Authorization",
-		AuthToken:  "env:DOTAGENT_TEST_OPENAPI_TOKEN",
+		SpecPath:          specPath,
+		BaseURL:           server.URL + "/v1",
+		AllowPrivateHosts: true,
+		AuthHeader:        "Authorization",
+		AuthToken:         "env:DOTAGENT_TEST_OPENAPI_TOKEN",
 	})
 	if err != nil {
 		t.Fatalf("new runtime: %v", err)
@@ -195,5 +197,76 @@ func TestOpenAPIRuntime_MissingBaseURLFails(t *testing.T) {
 
 	if err := rt.Health(context.Background()); err == nil {
 		t.Fatalf("expected health to fail without base url")
+	}
+}
+
+func TestOpenAPIRuntime_PrivateBaseURLBlockedByDefault(t *testing.T) {
+	spec := map[string]interface{}{
+		"openapi": "3.1.0",
+		"paths": map[string]interface{}{
+			"/users": map[string]interface{}{
+				"get": map[string]interface{}{
+					"operationId": "listUsers",
+				},
+			},
+		},
+	}
+	tmp := t.TempDir()
+	specPath := filepath.Join(tmp, "spec.json")
+	raw, _ := json.Marshal(spec)
+	if err := os.WriteFile(specPath, raw, 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+
+	rt, err := NewOpenAPIRuntime("users-private", OpenAPIConfig{
+		SpecPath: specPath,
+		BaseURL:  "http://127.0.0.1:8080",
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	if err := rt.Health(context.Background()); err == nil {
+		t.Fatalf("expected health to fail for private base_url")
+	}
+}
+
+func TestOpenAPIRuntime_PrivateBaseURLAllowedWhenConfigured(t *testing.T) {
+	spec := map[string]interface{}{
+		"openapi": "3.1.0",
+		"paths": map[string]interface{}{
+			"/users": map[string]interface{}{
+				"get": map[string]interface{}{
+					"operationId": "listUsers",
+				},
+			},
+		},
+	}
+	tmp := t.TempDir()
+	specPath := filepath.Join(tmp, "spec.json")
+	raw, _ := json.Marshal(spec)
+	if err := os.WriteFile(specPath, raw, 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+
+	rt, err := NewOpenAPIRuntime("users-private-allowed", OpenAPIConfig{
+		SpecPath:          specPath,
+		BaseURL:           "http://127.0.0.1:8080",
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	if err := rt.Health(context.Background()); err != nil {
+		t.Fatalf("expected health to succeed with allow_private_hosts=true, got %v", err)
+	}
+}
+
+func TestOpenAPIRuntime_PrivateSpecURLBlockedByDefault(t *testing.T) {
+	_, err := NewOpenAPIRuntime("spec-private", OpenAPIConfig{
+		SpecURL: "http://localhost/spec.json",
+		BaseURL: "https://api.example.com",
+	})
+	if err == nil {
+		t.Fatalf("expected constructor to fail for private spec_url")
 	}
 }

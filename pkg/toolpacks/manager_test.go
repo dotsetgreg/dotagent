@@ -228,8 +228,9 @@ func TestManager_LoadEnabledTools_OpenAPIConnector(t *testing.T) {
 				ID:   "api",
 				Type: "openapi",
 				OpenAPI: connectors.OpenAPIConfig{
-					SpecPath: "spec.json",
-					BaseURL:  server.URL + "/v1",
+					SpecPath:          "spec.json",
+					BaseURL:           server.URL + "/v1",
+					AllowPrivateHosts: true,
 				},
 			},
 		},

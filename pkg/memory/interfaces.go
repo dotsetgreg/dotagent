@@ -11,8 +11,8 @@ type Store interface {
 	MarkSessionConsolidated(ctx context.Context, sessionKey string, atMS int64) error
 	GetSessionSummary(ctx context.Context, sessionKey string) (string, error)
 	SetSessionSummary(ctx context.Context, sessionKey, summary string) error
-	GetSessionProviderState(ctx context.Context, sessionKey string) (string, error)
-	SetSessionProviderState(ctx context.Context, sessionKey, stateID string) error
+	GetSessionProviderState(ctx context.Context, sessionKey, provider string) (string, error)
+	SetSessionProviderState(ctx context.Context, sessionKey, provider, stateID string) error
 	GetLatestSessionSnapshot(ctx context.Context, sessionKey string) (SessionSnapshot, error)
 	UpsertSessionSnapshot(ctx context.Context, snap SessionSnapshot) error
 	AppendEvent(ctx context.Context, ev Event) error

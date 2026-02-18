@@ -229,33 +229,23 @@ func (si *SkillInstaller) ListBuiltinSkills() []BuiltinSkill {
 
 	var skills []BuiltinSkill
 	for _, entry := range entries {
-		if entry.IsDir() {
-			_ = entry
-			skillName := entry.Name()
-			skillFile := filepath.Join(builtinSkillsDir, skillName, "SKILL.md")
-
-			data, err := os.ReadFile(skillFile)
-			description := ""
-			if err == nil {
-				content := string(data)
-				if idx := strings.Index(content, "\n"); idx > 0 {
-					firstLine := content[:idx]
-					if strings.Contains(firstLine, "description:") {
-						descLine := strings.Index(content[idx:], "\n")
-						if descLine > 0 {
-							description = strings.TrimSpace(content[idx+descLine : idx+descLine])
-						}
-					}
-				}
-			}
-
-			status := "✓"
-			fmt.Printf("  %s  %s\n", status, entry.Name())
-			if description != "" {
-				fmt.Printf("    %s\n", description)
-			}
+		if !entry.IsDir() {
+			continue
 		}
+		skillName := entry.Name()
+		skillFile := filepath.Join(builtinSkillsDir, skillName, "SKILL.md")
+		if _, err := os.Stat(skillFile); err != nil {
+			continue
+		}
+		skills = append(skills, BuiltinSkill{
+			Name:    skillName,
+			Path:    skillFile,
+			Enabled: true,
+		})
 	}
+	sort.SliceStable(skills, func(i, j int) bool {
+		return strings.ToLower(skills[i].Name) < strings.ToLower(skills[j].Name)
+	})
 	return skills
 }
 

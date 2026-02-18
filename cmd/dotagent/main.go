@@ -206,8 +206,10 @@ func onboard() {
 
 	fmt.Printf("%s is ready!\n", appName)
 	fmt.Println("\nNext steps:")
-	fmt.Println("  1. Add your API key to", configPath)
-	fmt.Println("     Get one at: https://openrouter.ai/keys")
+	fmt.Println("  1. Configure your LLM provider credentials in", configPath)
+	fmt.Println("     - OpenRouter: providers.openrouter.api_key (https://openrouter.ai/keys)")
+	fmt.Println("     - OpenAI: set agents.defaults.provider=openai and configure providers.openai.api_key")
+	fmt.Println("       (or providers.openai.oauth_access_token / providers.openai.oauth_token_file)")
 	fmt.Println("  2. (Gateway mode) Add your Discord bot token to channels.discord.token")
 	fmt.Println("  3. Chat locally: dotagent agent -m \"Hello!\"")
 	fmt.Println("  4. Run gateway: dotagent gateway")
@@ -266,11 +268,11 @@ func createWorkspaceTemplates(workspace string) error {
 }
 
 func validateRuntimeConfig(cfg *config.Config, requireDiscord bool) error {
-	configPath := getConfigPath()
-	if strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) == "" {
-		return fmt.Errorf("providers.openrouter.api_key is required in %s or DOTAGENT_PROVIDERS_OPENROUTER_API_KEY", configPath)
+	if err := providers.ValidateProviderConfig(cfg); err != nil {
+		return fmt.Errorf("provider configuration error: %w", err)
 	}
 	if requireDiscord && strings.TrimSpace(cfg.Channels.Discord.Token) == "" {
+		configPath := getConfigPath()
 		return fmt.Errorf("channels.discord.token is required in %s or DOTAGENT_CHANNELS_DISCORD_TOKEN", configPath)
 	}
 	return nil
@@ -608,7 +610,9 @@ func statusCmd() {
 	}
 
 	if _, err := os.Stat(configPath); err == nil {
+		selectedProvider := providers.ActiveProviderName(cfg)
 		fmt.Printf("Model: %s\n", cfg.Agents.Defaults.Model)
+		fmt.Printf("Provider: %s\n", selectedProvider)
 
 		status := func(enabled bool) string {
 			if enabled {
@@ -616,10 +620,25 @@ func statusCmd() {
 			}
 			return "not set"
 		}
-		apiReady := strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) != ""
+		_, apiReady, authMode, providerErr := providers.ProviderCredentialStatus(cfg)
+		if providerErr == nil {
+			if err := providers.ValidateProviderConfig(cfg); err != nil {
+				providerErr = err
+				apiReady = false
+			}
+		} else {
+			apiReady = false
+		}
 		discordReady := strings.TrimSpace(cfg.Channels.Discord.Token) != ""
 
-		fmt.Println("OpenRouter API:", status(apiReady))
+		providerLine := "Provider credentials: " + status(apiReady)
+		if authMode != "" {
+			providerLine += fmt.Sprintf(" (%s)", authMode)
+		}
+		if providerErr != nil {
+			providerLine += fmt.Sprintf(" (%v)", providerErr)
+		}
+		fmt.Println(providerLine)
 		fmt.Println("Discord token:", status(discordReady))
 		fmt.Println("Agent ready:", status(apiReady))
 		fmt.Println("Gateway ready:", status(apiReady && discordReady))

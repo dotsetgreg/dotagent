@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -25,16 +27,17 @@ var (
 )
 
 type OpenAPIConfig struct {
-	SpecPath         string            `json:"spec_path,omitempty"`
-	SpecURL          string            `json:"spec_url,omitempty"`
-	BaseURL          string            `json:"base_url,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
-	TimeoutSeconds   int               `json:"timeout_seconds,omitempty"`
-	MaxConcurrency   int               `json:"max_concurrency,omitempty"`
-	RetryMaxAttempts int               `json:"retry_max_attempts,omitempty"`
-	RetryBackoffMS   int               `json:"retry_backoff_ms,omitempty"`
-	AuthHeader       string            `json:"auth_header,omitempty"`
-	AuthToken        string            `json:"auth_token,omitempty"`
+	SpecPath          string            `json:"spec_path,omitempty"`
+	SpecURL           string            `json:"spec_url,omitempty"`
+	BaseURL           string            `json:"base_url,omitempty"`
+	AllowPrivateHosts bool              `json:"allow_private_hosts,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	TimeoutSeconds    int               `json:"timeout_seconds,omitempty"`
+	MaxConcurrency    int               `json:"max_concurrency,omitempty"`
+	RetryMaxAttempts  int               `json:"retry_max_attempts,omitempty"`
+	RetryBackoffMS    int               `json:"retry_backoff_ms,omitempty"`
+	AuthHeader        string            `json:"auth_header,omitempty"`
+	AuthToken         string            `json:"auth_token,omitempty"`
 }
 
 type openAPIOperation struct {
@@ -82,6 +85,11 @@ func NewOpenAPIRuntime(id string, cfg OpenAPIConfig) (*OpenAPIRuntime, error) {
 	cfg = normalizeOpenAPIConfig(cfg)
 	if strings.TrimSpace(cfg.SpecPath) == "" && strings.TrimSpace(cfg.SpecURL) == "" {
 		return nil, fmt.Errorf("openapi connector requires spec_path or spec_url")
+	}
+	if strings.TrimSpace(cfg.SpecURL) != "" {
+		if err := validateAbsoluteHTTPURL(cfg.SpecURL, cfg.AllowPrivateHosts); err != nil {
+			return nil, fmt.Errorf("invalid openapi spec_url %q: %w", cfg.SpecURL, err)
+		}
 	}
 	timeout := 30 * time.Second
 	if cfg.TimeoutSeconds > 0 {
@@ -266,7 +274,7 @@ func (r *OpenAPIRuntime) ensureCompiled(ctx context.Context) (*openAPICompiledSp
 		}
 	}
 
-	compiled, err := compileOpenAPISpec(raw, strings.TrimSpace(r.cfg.BaseURL))
+	compiled, err := compileOpenAPISpec(raw, strings.TrimSpace(r.cfg.BaseURL), r.cfg.AllowPrivateHosts)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +312,7 @@ func (r *OpenAPIRuntime) loadSpecBytes(ctx context.Context) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 }
 
-func compileOpenAPISpec(raw []byte, configuredBaseURL string) (*openAPICompiledSpec, error) {
+func compileOpenAPISpec(raw []byte, configuredBaseURL string, allowPrivateHosts bool) (*openAPICompiledSpec, error) {
 	spec := map[string]interface{}{}
 	if err := json.Unmarshal(raw, &spec); err != nil {
 		return nil, fmt.Errorf("parse openapi spec (JSON expected): %w", err)
@@ -326,7 +334,7 @@ func compileOpenAPISpec(raw []byte, configuredBaseURL string) (*openAPICompiledS
 	if baseURL == "" {
 		return nil, fmt.Errorf("openapi base url is required (set connector.openapi.base_url or spec servers[0].url)")
 	}
-	if err := validateAbsoluteHTTPURL(baseURL); err != nil {
+	if err := validateAbsoluteHTTPURL(baseURL, allowPrivateHosts); err != nil {
 		return nil, fmt.Errorf("invalid openapi base url %q: %w", baseURL, err)
 	}
 	operations := map[string]openAPIOperation{}
@@ -608,7 +616,7 @@ func appendCookie(existing, key, value string) string {
 	return existing + "; " + entry
 }
 
-func validateAbsoluteHTTPURL(raw string) error {
+func validateAbsoluteHTTPURL(raw string, allowPrivateHosts bool) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return err
@@ -620,7 +628,98 @@ func validateAbsoluteHTTPURL(raw string) error {
 	if strings.TrimSpace(parsed.Host) == "" {
 		return fmt.Errorf("host is required")
 	}
+	if allowPrivateHosts {
+		return nil
+	}
+	if err := validatePublicHost(parsed.Hostname()); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validatePublicHost(host string) error {
+	normalizedHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if normalizedHost == "" {
+		return fmt.Errorf("missing host")
+	}
+	if normalizedHost == "localhost" ||
+		strings.HasSuffix(normalizedHost, ".localhost") ||
+		strings.HasSuffix(normalizedHost, ".local") ||
+		strings.HasSuffix(normalizedHost, ".internal") {
+		return fmt.Errorf("host %q resolves to local/private network", host)
+	}
+
+	if ip := net.ParseIP(normalizedHost); ip != nil {
+		if isBlockedConnectorIP(ip) {
+			return fmt.Errorf("IP %s is not allowed", ip.String())
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, normalizedHost)
+	if err != nil {
+		return fmt.Errorf("resolve host %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("resolve host %q: no addresses found", host)
+	}
+	for _, addr := range addrs {
+		if isBlockedConnectorIP(addr.IP) {
+			return fmt.Errorf("resolved address %s is not allowed", addr.IP.String())
+		}
+	}
+	return nil
+}
+
+var blockedConnectorPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func isBlockedConnectorIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	for _, prefix := range blockedConnectorPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *OpenAPIRuntime) acquire(ctx context.Context) error {

@@ -125,6 +125,7 @@ Runtime behavior:
 - Executes HTTP calls with timeout/retries and connector headers.
 - Supports `env:VAR_NAME` references for spec/base/auth/header values.
 - Requires a concrete absolute base URL (`base_url` or `servers[0].url`).
+- Blocks localhost/private/reserved hosts by default; set `allow_private_hosts: true` only for trusted local APIs.
 
 ## Validation Rules
 

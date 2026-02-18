@@ -411,12 +411,12 @@ func (s *Service) AddMetric(ctx context.Context, metric string, value float64, l
 	return s.store.AddMetric(ctx, metric, value, labels)
 }
 
-func (s *Service) GetProviderState(ctx context.Context, sessionKey string) (string, error) {
-	return s.store.GetSessionProviderState(ctx, sessionKey)
+func (s *Service) GetProviderState(ctx context.Context, sessionKey, provider string) (string, error) {
+	return s.store.GetSessionProviderState(ctx, sessionKey, provider)
 }
 
-func (s *Service) SetProviderState(ctx context.Context, sessionKey, stateID string) error {
-	return s.store.SetSessionProviderState(ctx, sessionKey, stateID)
+func (s *Service) SetProviderState(ctx context.Context, sessionKey, provider, stateID string) error {
+	return s.store.SetSessionProviderState(ctx, sessionKey, provider, stateID)
 }
 
 func (s *Service) ForceCompact(ctx context.Context, sessionKey, userID string, maxTokens int) error {

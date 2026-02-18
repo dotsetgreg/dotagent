@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -170,5 +171,53 @@ func TestSkillInstaller_UninstallRemovesLockEntry(t *testing.T) {
 	}
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("expected lock file to be removed when last entry is deleted")
+	}
+}
+
+func TestSkillInstaller_ListBuiltinSkills_ReturnsEntriesWithoutPrinting(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+
+	builtinDir := filepath.Join(root, "dotagent", "skills", "builtin-a")
+	if err := os.MkdirAll(builtinDir, 0o755); err != nil {
+		t.Fatalf("mkdir builtin dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(builtinDir, "SKILL.md"), []byte("# builtin"), 0o644); err != nil {
+		t.Fatalf("write builtin skill: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "dotagent", "skills", "invalid"), 0o755); err != nil {
+		t.Fatalf("mkdir invalid builtin dir: %v", err)
+	}
+
+	installer := NewSkillInstaller(workspace)
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() {
+		os.Stdout = stdout
+	}()
+	skills := installer.ListBuiltinSkills()
+	_ = w.Close()
+	var printed bytes.Buffer
+	_, _ = printed.ReadFrom(r)
+	_ = r.Close()
+
+	if printed.Len() != 0 {
+		t.Fatalf("expected no stdout output, got %q", printed.String())
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected one builtin skill, got %d", len(skills))
+	}
+	if skills[0].Name != "builtin-a" {
+		t.Fatalf("expected builtin skill name builtin-a, got %q", skills[0].Name)
+	}
+	if !skills[0].Enabled {
+		t.Fatalf("expected builtin skill to be enabled")
 	}
 }

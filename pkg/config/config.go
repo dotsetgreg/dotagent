@@ -83,13 +83,24 @@ type HeartbeatConfig struct {
 }
 
 type ProvidersConfig struct {
-	OpenRouter ProviderConfig `json:"openrouter"`
+	OpenRouter OpenRouterProviderConfig `json:"openrouter"`
+	OpenAI     OpenAIProviderConfig     `json:"openai"`
 }
 
-type ProviderConfig struct {
+type OpenRouterProviderConfig struct {
 	APIKey  string `json:"api_key" env:"DOTAGENT_PROVIDERS_OPENROUTER_API_KEY"`
 	APIBase string `json:"api_base" env:"DOTAGENT_PROVIDERS_OPENROUTER_API_BASE"`
 	Proxy   string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OPENROUTER_PROXY"`
+}
+
+type OpenAIProviderConfig struct {
+	APIKey           string `json:"api_key" env:"DOTAGENT_PROVIDERS_OPENAI_API_KEY"`
+	OAuthAccessToken string `json:"oauth_access_token,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_OAUTH_ACCESS_TOKEN"`
+	OAuthTokenFile   string `json:"oauth_token_file,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_OAUTH_TOKEN_FILE"`
+	APIBase          string `json:"api_base" env:"DOTAGENT_PROVIDERS_OPENAI_API_BASE"`
+	Proxy            string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_PROXY"`
+	Organization     string `json:"organization,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_ORGANIZATION"`
+	Project          string `json:"project,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_PROJECT"`
 }
 
 type GatewayConfig struct {
@@ -160,7 +171,8 @@ func DefaultConfig() *Config {
 			},
 		},
 		Providers: ProvidersConfig{
-			OpenRouter: ProviderConfig{},
+			OpenRouter: OpenRouterProviderConfig{},
+			OpenAI:     OpenAIProviderConfig{},
 		},
 		Gateway: GatewayConfig{
 			Host: "0.0.0.0",
@@ -184,6 +196,7 @@ func DefaultConfig() *Config {
 				Deny:        []string{},
 				ProviderModes: map[string]string{
 					"openrouter": "auto",
+					"openai":     "auto",
 				},
 			},
 		},
@@ -250,21 +263,6 @@ func (c *Config) WorkspacePath() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return expandHome(c.Agents.Defaults.Workspace)
-}
-
-func (c *Config) GetAPIKey() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.Providers.OpenRouter.APIKey
-}
-
-func (c *Config) GetAPIBase() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.Providers.OpenRouter.APIBase != "" {
-		return c.Providers.OpenRouter.APIBase
-	}
-	return "https://openrouter.ai/api/v1"
 }
 
 func expandHome(path string) string {

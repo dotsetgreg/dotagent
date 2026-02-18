@@ -33,9 +33,12 @@ import (
 type AgentLoop struct {
 	bus            *bus.MessageBus
 	provider       providers.LLMProvider
+	providerName   string
 	workspace      string
 	workspaceID    string
 	model          string
+	temperature    float64
+	completionMax  int
 	contextWindow  int // Maximum context window size in tokens
 	maxIterations  int
 	memory         *memory.Service
@@ -225,12 +228,24 @@ TURN TRANSCRIPT:
 		return nil, fmt.Errorf("initialize memory service: %w", err)
 	}
 
+	completionMax := cfg.Agents.Defaults.MaxTokens
+	if completionMax <= 0 {
+		completionMax = 8192
+	}
+	temperature := cfg.Agents.Defaults.Temperature
+	if temperature < 0 {
+		temperature = 0
+	}
+
 	agentLoop := &AgentLoop{
 		bus:            msgBus,
 		provider:       provider,
+		providerName:   providers.ActiveProviderName(cfg),
 		workspace:      workspace,
 		workspaceID:    workspaceNamespace(workspace),
 		model:          cfg.Agents.Defaults.Model,
+		temperature:    temperature,
+		completionMax:  completionMax,
 		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
 		memory:         memSvc,
@@ -642,7 +657,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 	toolCallSignatures := map[string]int{}
 	providerStateID := ""
 	if !opts.NoHistory {
-		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey); err == nil {
+		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey, al.providerName); err == nil {
 			providerStateID = strings.TrimSpace(sid)
 		}
 	}
@@ -663,15 +678,19 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		}
 
 		// Log LLM request details
+		systemPromptLen := 0
+		if len(messages) > 0 {
+			systemPromptLen = len(messages[0].Content)
+		}
 		logger.DebugCF("agent", "LLM request",
 			map[string]interface{}{
 				"iteration":         iteration,
 				"model":             al.model,
 				"messages_count":    len(messages),
 				"tools_count":       len(providerToolDefs),
-				"max_tokens":        8192,
-				"temperature":       0.7,
-				"system_prompt_len": len(messages[0].Content),
+				"max_tokens":        al.completionMax,
+				"temperature":       al.temperature,
+				"system_prompt_len": systemPromptLen,
 			})
 
 		// Log full messages (detailed)
@@ -689,8 +708,8 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
 			callOpts := map[string]interface{}{
-				"max_tokens":  8192,
-				"temperature": 0.7,
+				"max_tokens":  al.completionMax,
+				"temperature": al.temperature,
 			}
 			if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
 				var newState string
@@ -699,7 +718,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					newState = strings.TrimSpace(newState)
 					if newState != "" && newState != providerStateID {
 						providerStateID = newState
-						_ = al.memory.SetProviderState(ctx, opts.SessionKey, newState)
+						_ = al.memory.SetProviderState(ctx, opts.SessionKey, al.providerName, newState)
 					}
 				}
 			} else {
@@ -1243,7 +1262,7 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		}
 		switch args[0] {
 		case "models":
-			return "OpenRouter model is configured via config/env. Current default: openai/gpt-5.2", true
+			return fmt.Sprintf("Model is configured via config/env. Provider: %s. Provider default: %s", al.providerName, al.provider.GetDefaultModel()), true
 		case "channels":
 			if al.channelManager == nil {
 				return "Channel manager not initialized", true

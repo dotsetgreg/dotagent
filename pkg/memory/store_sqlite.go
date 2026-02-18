@@ -68,10 +68,12 @@ func (s *SQLiteStore) init() error {
 			summary TEXT NOT NULL DEFAULT '',
 			last_consolidated_ms INTEGER NOT NULL DEFAULT 0
 		);`,
-		`CREATE TABLE IF NOT EXISTS session_provider_state (
-			session_key TEXT PRIMARY KEY,
+		`CREATE TABLE IF NOT EXISTS session_provider_states (
+			session_key TEXT NOT NULL,
+			provider TEXT NOT NULL,
 			state_id TEXT NOT NULL DEFAULT '',
-			updated_at_ms INTEGER NOT NULL
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(session_key, provider)
 		);`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id TEXT PRIMARY KEY,
@@ -337,6 +339,9 @@ WHERE TRIM(scope_type) = 'session' AND TRIM(scope_id) = '' AND TRIM(session_key)
 	if _, err := s.db.Exec(`DROP INDEX IF EXISTS memory_items_legacy_scope_idx`); err != nil {
 		return fmt.Errorf("drop legacy memory scope compatibility index: %w", err)
 	}
+	if err := s.migrateLegacyProviderStateTable(); err != nil {
+		return err
+	}
 
 	if _, err := s.db.Exec(`DELETE FROM retrieval_cache WHERE expires_at_ms <= ?`, time.Now().UnixMilli()); err != nil {
 		return fmt.Errorf("purge retrieval cache: %w", err)
@@ -385,6 +390,37 @@ func ensureColumnExists(db *sql.DB, table, column, definition string) error {
 		return fmt.Errorf("alter table add column %s.%s: %w", table, column, err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) migrateLegacyProviderStateTable() error {
+	exists, err := tableExists(s.db, "session_provider_state")
+	if err != nil {
+		return fmt.Errorf("check legacy provider state table: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	const migrateSQL = `
+INSERT OR REPLACE INTO session_provider_states(session_key, provider, state_id, updated_at_ms)
+SELECT session_key, 'openrouter', state_id, updated_at_ms
+FROM session_provider_state`
+	if _, err := s.db.Exec(migrateSQL); err != nil {
+		return fmt.Errorf("migrate legacy provider state rows: %w", err)
+	}
+	return nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	row := db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1`, strings.TrimSpace(table))
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func nowMS() int64 { return time.Now().UnixMilli() }
@@ -641,8 +677,13 @@ func (s *SQLiteStore) SetSessionSummary(ctx context.Context, sessionKey, summary
 	return nil
 }
 
-func (s *SQLiteStore) GetSessionProviderState(ctx context.Context, sessionKey string) (string, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT state_id FROM session_provider_state WHERE session_key = ?`, sessionKey)
+func (s *SQLiteStore) GetSessionProviderState(ctx context.Context, sessionKey, provider string) (string, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if sessionKey == "" || provider == "" {
+		return "", nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT state_id FROM session_provider_states WHERE session_key = ? AND provider = ?`, sessionKey, provider)
 	var stateID string
 	if err := row.Scan(&stateID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -653,14 +694,19 @@ func (s *SQLiteStore) GetSessionProviderState(ctx context.Context, sessionKey st
 	return stateID, nil
 }
 
-func (s *SQLiteStore) SetSessionProviderState(ctx context.Context, sessionKey, stateID string) error {
+func (s *SQLiteStore) SetSessionProviderState(ctx context.Context, sessionKey, provider, stateID string) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if sessionKey == "" || provider == "" {
+		return fmt.Errorf("set session provider state: session key and provider are required")
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO session_provider_state(session_key, state_id, updated_at_ms)
-VALUES(?, ?, ?)
-ON CONFLICT(session_key) DO UPDATE SET
+INSERT INTO session_provider_states(session_key, provider, state_id, updated_at_ms)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(session_key, provider) DO UPDATE SET
 	state_id = excluded.state_id,
 	updated_at_ms = excluded.updated_at_ms`,
-		sessionKey, strings.TrimSpace(stateID), nowMS(),
+		sessionKey, provider, strings.TrimSpace(stateID), nowMS(),
 	)
 	if err != nil {
 		return fmt.Errorf("set session provider state: %w", err)

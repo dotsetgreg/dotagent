@@ -21,6 +21,15 @@
       "api_key": "sk-or-v1-xxx",
       "api_base": "https://openrouter.ai/api/v1",
       "proxy": ""
+    },
+    "openai": {
+      "api_key": "",
+      "oauth_access_token": "",
+      "oauth_token_file": "",
+      "api_base": "https://api.openai.com/v1",
+      "proxy": "",
+      "organization": "",
+      "project": ""
     }
   },
   "tools": {
@@ -40,7 +49,8 @@
       "allow": [],
       "deny": [],
       "provider_modes": {
-        "openrouter": "auto"
+        "openrouter": "auto",
+        "openai": "auto"
       }
     }
   },

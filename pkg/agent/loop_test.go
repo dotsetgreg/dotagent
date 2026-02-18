@@ -385,6 +385,28 @@ func (m *simpleMockProvider) GetDefaultModel() string {
 	return "mock-model"
 }
 
+type optionCaptureProvider struct {
+	lastOpts map[string]interface{}
+	calls    int
+}
+
+func (m *optionCaptureProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	m.calls++
+	copied := make(map[string]interface{}, len(opts))
+	for k, v := range opts {
+		copied[k] = v
+	}
+	m.lastOpts = copied
+	return &providers.LLMResponse{
+		Content:   "ok",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *optionCaptureProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
 // mockCustomTool is a simple mock tool for registration testing
 type mockCustomTool struct{}
 
@@ -941,5 +963,36 @@ func TestAgentLoop_UsesProviderStateAcrossTurns(t *testing.T) {
 	}
 	if provider.receivedStateIDs[1] != "state-1" {
 		t.Fatalf("expected persisted state_id on second call, got %q", provider.receivedStateIDs[1])
+	}
+}
+
+func TestAgentLoop_UsesConfiguredLLMCallOptions(t *testing.T) {
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         t.TempDir(),
+				Model:             "test-model",
+				MaxTokens:         2048,
+				Temperature:       0.23,
+				MaxToolIterations: 2,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &optionCaptureProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	if _, err := al.ProcessDirectWithChannel(context.Background(), "Hello", "", "cli", "direct"); err != nil {
+		t.Fatalf("process direct: %v", err)
+	}
+	if provider.calls == 0 {
+		t.Fatalf("expected provider to be called")
+	}
+	if got := provider.lastOpts["max_tokens"]; got != 2048 {
+		t.Fatalf("expected max_tokens=2048, got %v", got)
+	}
+	if got := provider.lastOpts["temperature"]; got != 0.23 {
+		t.Fatalf("expected temperature=0.23, got %v", got)
 	}
 }

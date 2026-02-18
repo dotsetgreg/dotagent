@@ -2,8 +2,10 @@ package memory
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -347,15 +349,75 @@ func TestSQLiteStore_SessionProviderStateRoundTrip(t *testing.T) {
 	if err := store.EnsureSession(ctx, sessionKey, "discord", "provider-state", "u1"); err != nil {
 		t.Fatalf("ensure session: %v", err)
 	}
-	if err := store.SetSessionProviderState(ctx, sessionKey, "state-123"); err != nil {
+	if err := store.SetSessionProviderState(ctx, sessionKey, "openrouter", "state-123"); err != nil {
 		t.Fatalf("set provider state: %v", err)
 	}
-	got, err := store.GetSessionProviderState(ctx, sessionKey)
+	got, err := store.GetSessionProviderState(ctx, sessionKey, "openrouter")
 	if err != nil {
 		t.Fatalf("get provider state: %v", err)
 	}
 	if got != "state-123" {
 		t.Fatalf("expected provider state state-123, got %q", got)
+	}
+
+	if err := store.SetSessionProviderState(ctx, sessionKey, "openai", "state-999"); err != nil {
+		t.Fatalf("set openai provider state: %v", err)
+	}
+	openAIState, err := store.GetSessionProviderState(ctx, sessionKey, "openai")
+	if err != nil {
+		t.Fatalf("get openai provider state: %v", err)
+	}
+	if openAIState != "state-999" {
+		t.Fatalf("expected openai state state-999, got %q", openAIState)
+	}
+
+	openRouterState, err := store.GetSessionProviderState(ctx, sessionKey, "openrouter")
+	if err != nil {
+		t.Fatalf("get openrouter provider state: %v", err)
+	}
+	if openRouterState != "state-123" {
+		t.Fatalf("expected openrouter state state-123 after openai write, got %q", openRouterState)
+	}
+}
+
+func TestSQLiteStore_MigratesLegacySessionProviderState(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state", "memory.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("mkdir db dir: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS session_provider_state (
+		session_key TEXT PRIMARY KEY,
+		state_id TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL
+	);`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO session_provider_state(session_key, state_id, updated_at_ms) VALUES(?, ?, ?)`, "discord:legacy", "legacy-state", 123); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw sqlite: %v", err)
+	}
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer store.Close()
+
+	got, err := store.GetSessionProviderState(ctx, "discord:legacy", "openrouter")
+	if err != nil {
+		t.Fatalf("read migrated provider state: %v", err)
+	}
+	if got != "legacy-state" {
+		t.Fatalf("expected migrated provider state legacy-state, got %q", got)
 	}
 }
 

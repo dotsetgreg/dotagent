@@ -11,6 +11,7 @@
       "openapi": {
         "spec_path": "spec/todo.json",
         "base_url": "http://localhost:8080",
+        "allow_private_hosts": true,
         "timeout_seconds": 30
       }
     }
