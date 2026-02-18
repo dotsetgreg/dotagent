@@ -505,8 +505,8 @@ func TestCreateProvider_OpenAICodex_StatefulResponseID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chat with state: %v", err)
 	}
-	if seenPrevious != "resp_prev_1" {
-		t.Fatalf("expected previous_response_id resp_prev_1, got %q", seenPrevious)
+	if seenPrevious != "" {
+		t.Fatalf("expected previous_response_id omitted for codex backend, got %q", seenPrevious)
 	}
 	if newState != "resp_next_1" {
 		t.Fatalf("expected returned state resp_next_1, got %q", newState)

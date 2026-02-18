@@ -73,6 +73,7 @@ func newOpenAICodexProviderFromConfig(cfg *config.Config) (LLMProvider, error) {
 			beforeMarshal: func(body map[string]interface{}) {
 				delete(body, "max_output_tokens")
 				delete(body, "temperature")
+				delete(body, "previous_response_id")
 				body["store"] = false
 				body["stream"] = true
 				ensureOpenAICodexInstructions(body)

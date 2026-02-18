@@ -46,3 +46,10 @@ func TestAugmentProviderError_OpenAICodexTemperatureHint(t *testing.T) {
 		t.Fatalf("expected temperature hint, got %q", msg)
 	}
 }
+
+func TestAugmentProviderError_OpenAICodexPreviousResponseIDHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOpenAICodex, "Unsupported parameter: previous_response_id")
+	if !strings.Contains(strings.ToLower(msg), "previous_response_id") {
+		t.Fatalf("expected previous_response_id hint, got %q", msg)
+	}
+}
