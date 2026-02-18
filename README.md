@@ -7,6 +7,7 @@ DotAgent is a Go-based personal agent runtime with:
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 - Context continuity: strict fail-closed checks when durable context is unavailable
 - Session identity: canonical v2 session keys derived from workspace/channel/conversation/actor
+- Extensibility: installable toolpacks for command, MCP, and OpenAPI capability expansion
 
 ## Requirements
 
@@ -122,6 +123,9 @@ Operational safeguards:
 - Durable audit log (`memory_audit_log`) for memory upserts/deletes
 - Retention sweeps for archived events, expired/deleted memory, cache, and audit records
 - Turn-level tool governance: conversational turns do not expose local filesystem/shell tools, and runtime state paths (`workspace/state/*`) are blocked from tool-based continuity introspection
+- Runtime process/session tools:
+  - `process` for long-running command lifecycle control (`start/list/poll/write/kill/clear`)
+  - `session` for cross-session inspection and targeted send/spawn flows
 
 ## Environment Variables
 
@@ -157,7 +161,12 @@ dotagent gateway
 dotagent status
 dotagent cron
 dotagent skills
+dotagent toolpacks
 dotagent version
+# Tool policy controls in chat:
+/tools
+/tools mode conversation
+/tools mode workspace_ops
 # In-chat persona diagnostics:
 /persona show
 /persona revisions
@@ -187,3 +196,11 @@ Reference docs:
 
 - `docs/memory-architecture.md`
 - `docs/memory-runbook.md`
+- `docs/toolpacks.md`
+
+Toolpack diagnostics:
+
+```bash
+dotagent toolpacks validate [id]
+dotagent toolpacks doctor [id]
+```

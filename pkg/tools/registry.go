@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,30 @@ func (r *ToolRegistry) Register(tool Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tools[tool.Name()] = tool
+}
+
+// Close closes all registered tools that implement ClosableTool.
+// It attempts all closes and returns an aggregated error if any fail.
+func (r *ToolRegistry) Close() error {
+	r.mu.RLock()
+	closers := make([]ClosableTool, 0, len(r.tools))
+	for _, tool := range r.tools {
+		if closer, ok := tool.(ClosableTool); ok {
+			closers = append(closers, closer)
+		}
+	}
+	r.mu.RUnlock()
+
+	var errs []string
+	for _, closer := range closers {
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", closer.Name(), err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("tool close failures: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (r *ToolRegistry) Get(name string) (Tool, bool) {

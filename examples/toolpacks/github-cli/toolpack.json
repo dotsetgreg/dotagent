@@ -1,0 +1,54 @@
+{
+  "id": "github-cli",
+  "name": "GitHub CLI Basics",
+  "version": "1.0.0",
+  "description": "Command tools built on gh for lightweight repository operations.",
+  "enabled": false,
+  "tools": [
+    {
+      "name": "gh_issue_list",
+      "type": "command",
+      "description": "List open issues in the current repo with an optional limit.",
+      "command_template": "gh issue list --state open --limit {{limit}}",
+      "working_dir": ".",
+      "timeout_seconds": 30,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of issues to return."
+          }
+        },
+        "required": [
+          "limit"
+        ]
+      }
+    },
+    {
+      "name": "gh_pr_list",
+      "type": "command",
+      "description": "List pull requests in the current repo with a target state and limit.",
+      "command_template": "gh pr list --state {{state}} --limit {{limit}}",
+      "working_dir": ".",
+      "timeout_seconds": 30,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "PR state: open, closed, or merged."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of PRs to return."
+          }
+        },
+        "required": [
+          "state",
+          "limit"
+        ]
+      }
+    }
+  ]
+}

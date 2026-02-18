@@ -52,7 +52,7 @@ func (cb *ContextBuilder) getIdentity() string {
 	// Build tools section dynamically
 	toolsSection := cb.buildToolsSection()
 
-	return fmt.Sprintf(`# dotagent 🦞
+	return fmt.Sprintf(`# dotagent
 
 You are the active assistant for this workspace.
 Use the dynamic persona context block as the canonical source of identity, role, and communication style.
@@ -226,25 +226,6 @@ func (cb *ContextBuilder) AddAssistantMessage(messages []providers.Message, cont
 	// Always add assistant message, whether or not it has tool calls
 	messages = append(messages, msg)
 	return messages
-}
-
-func (cb *ContextBuilder) loadSkills() string {
-	allSkills := cb.skillsLoader.ListSkills()
-	if len(allSkills) == 0 {
-		return ""
-	}
-
-	var skillNames []string
-	for _, s := range allSkills {
-		skillNames = append(skillNames, s.Name)
-	}
-
-	content := cb.skillsLoader.LoadSkillsForContext(skillNames)
-	if content == "" {
-		return ""
-	}
-
-	return "# Skill Definitions\n\n" + content
 }
 
 // GetSkillsInfo returns information about loaded skills.

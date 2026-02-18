@@ -51,7 +51,6 @@ type Config struct {
 	Tools     ToolsConfig     `json:"tools"`
 	Memory    MemoryConfig    `json:"memory"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
-	Devices   DevicesConfig   `json:"devices"`
 	mu        sync.RWMutex
 }
 
@@ -81,11 +80,6 @@ type DiscordConfig struct {
 type HeartbeatConfig struct {
 	Enabled  bool `json:"enabled" env:"DOTAGENT_HEARTBEAT_ENABLED"`
 	Interval int  `json:"interval" env:"DOTAGENT_HEARTBEAT_INTERVAL"` // minutes, min 5
-}
-
-type DevicesConfig struct {
-	Enabled    bool `json:"enabled" env:"DOTAGENT_DEVICES_ENABLED"`
-	MonitorUSB bool `json:"monitor_usb" env:"DOTAGENT_DEVICES_MONITOR_USB"`
 }
 
 type ProvidersConfig struct {
@@ -119,8 +113,16 @@ type WebToolsConfig struct {
 	DuckDuckGo DuckDuckGoConfig `json:"duckduckgo"`
 }
 
+type ToolPolicyConfig struct {
+	DefaultMode   string            `json:"default_mode" env:"DOTAGENT_TOOLS_POLICY_DEFAULT_MODE"`
+	Allow         []string          `json:"allow"`
+	Deny          []string          `json:"deny"`
+	ProviderModes map[string]string `json:"provider_modes"`
+}
+
 type ToolsConfig struct {
-	Web WebToolsConfig `json:"web"`
+	Web    WebToolsConfig   `json:"web"`
+	Policy ToolPolicyConfig `json:"policy"`
 }
 
 type MemoryConfig struct {
@@ -176,6 +178,14 @@ func DefaultConfig() *Config {
 					MaxResults: 5,
 				},
 			},
+			Policy: ToolPolicyConfig{
+				DefaultMode: "auto",
+				Allow:       []string{},
+				Deny:        []string{},
+				ProviderModes: map[string]string{
+					"openrouter": "auto",
+				},
+			},
 		},
 		Memory: MemoryConfig{
 			MaxRecallItems:        8,
@@ -194,10 +204,6 @@ func DefaultConfig() *Config {
 		Heartbeat: HeartbeatConfig{
 			Enabled:  true,
 			Interval: 30, // default 30 minutes
-		},
-		Devices: DevicesConfig{
-			Enabled:    false,
-			MonitorUSB: true,
 		},
 	}
 }

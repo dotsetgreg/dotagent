@@ -149,6 +149,21 @@ func (s *Service) EnsureSession(ctx context.Context, sessionKey, channel, chatID
 	return s.store.EnsureSession(ctx, sessionKey, channel, chatID, userID)
 }
 
+func (s *Service) GetSession(ctx context.Context, sessionKey string) (Session, error) {
+	return s.store.GetSession(ctx, sessionKey)
+}
+
+func (s *Service) ListSessions(ctx context.Context, userID string, limit int) ([]Session, error) {
+	return s.store.ListSessions(ctx, userID, limit)
+}
+
+func (s *Service) ListSessionEvents(ctx context.Context, sessionKey string, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	return s.store.ListRecentEvents(ctx, sessionKey, limit, false)
+}
+
 func (s *Service) AppendEvent(ctx context.Context, ev Event) error {
 	ev = normalizeEvent(ev)
 	s.appendSnapshot(ev)

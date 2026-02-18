@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -27,13 +28,12 @@ import (
 	"github.com/dotsetgreg/dotagent/pkg/channels"
 	"github.com/dotsetgreg/dotagent/pkg/config"
 	"github.com/dotsetgreg/dotagent/pkg/cron"
-	"github.com/dotsetgreg/dotagent/pkg/devices"
 	"github.com/dotsetgreg/dotagent/pkg/health"
 	"github.com/dotsetgreg/dotagent/pkg/heartbeat"
 	"github.com/dotsetgreg/dotagent/pkg/logger"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 	"github.com/dotsetgreg/dotagent/pkg/skills"
-	"github.com/dotsetgreg/dotagent/pkg/state"
+	"github.com/dotsetgreg/dotagent/pkg/toolpacks"
 	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
 
@@ -48,7 +48,7 @@ var (
 	goVersion string
 )
 
-const logo = "🦞"
+const appName = "dotagent"
 
 // formatVersion returns the version string with optional git commit
 func formatVersion() string {
@@ -72,7 +72,7 @@ func formatBuildInfo() (build string, goVer string) {
 }
 
 func printVersion() {
-	fmt.Printf("%s dotagent %s\n", logo, formatVersion())
+	fmt.Printf("%s %s\n", appName, formatVersion())
 	build, goVer := formatBuildInfo()
 	if build != "" {
 		fmt.Printf("  Build: %s\n", build)
@@ -80,40 +80,6 @@ func printVersion() {
 	if goVer != "" {
 		fmt.Printf("  Go: %s\n", goVer)
 	}
-}
-
-func copyDirectory(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		relPath, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-
-		dstPath := filepath.Join(dst, relPath)
-
-		if info.IsDir() {
-			return os.MkdirAll(dstPath, info.Mode())
-		}
-
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer srcFile.Close()
-
-		dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-		if err != nil {
-			return err
-		}
-		defer dstFile.Close()
-
-		_, err = io.Copy(dstFile, srcFile)
-		return err
-	})
 }
 
 func main() {
@@ -180,6 +146,8 @@ func main() {
 			fmt.Printf("Unknown skills command: %s\n", subcommand)
 			skillsHelp()
 		}
+	case "toolpacks":
+		toolpacksCmd()
 	case "version", "--version", "-v":
 		printVersion()
 	default:
@@ -190,7 +158,7 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Printf("%s dotagent - Personal AI Assistant v%s\n\n", logo, version)
+	fmt.Printf("%s - Personal AI Assistant v%s\n\n", appName, version)
 	fmt.Println("Usage: dotagent <command>")
 	fmt.Println()
 	fmt.Println("Commands:")
@@ -200,6 +168,7 @@ func printHelp() {
 	fmt.Println("  status      Show dotagent status")
 	fmt.Println("  cron        Manage scheduled tasks")
 	fmt.Println("  skills      Manage skills (install, list, remove)")
+	fmt.Println("  toolpacks   Manage executable tool packs")
 	fmt.Println("  version     Show version information")
 }
 
@@ -235,7 +204,7 @@ func onboard() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("%s dotagent is ready!\n", logo)
+	fmt.Printf("%s is ready!\n", appName)
 	fmt.Println("\nNext steps:")
 	fmt.Println("  1. Add your API key to", configPath)
 	fmt.Println("     Get one at: https://openrouter.ai/keys")
@@ -369,15 +338,15 @@ func agentCmd() {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("\n%s %s\n", logo, response)
+		fmt.Printf("\n%s %s\n", appName, response)
 	} else {
-		fmt.Printf("%s Interactive mode (Ctrl+C to exit)\n\n", logo)
+		fmt.Printf("%s Interactive mode (Ctrl+C to exit)\n\n", appName)
 		interactiveMode(agentLoop, sessionKey)
 	}
 }
 
 func interactiveMode(agentLoop *agent.AgentLoop, sessionKey string) {
-	prompt := fmt.Sprintf("%s You: ", logo)
+	prompt := fmt.Sprintf("%s You: ", appName)
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          prompt,
@@ -423,14 +392,14 @@ func interactiveMode(agentLoop *agent.AgentLoop, sessionKey string) {
 			continue
 		}
 
-		fmt.Printf("\n%s %s\n\n", logo, response)
+		fmt.Printf("\n%s %s\n\n", appName, response)
 	}
 }
 
 func simpleInteractiveMode(agentLoop *agent.AgentLoop, sessionKey string) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print(fmt.Sprintf("%s You: ", logo))
+		fmt.Print(fmt.Sprintf("%s You: ", appName))
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -458,7 +427,7 @@ func simpleInteractiveMode(agentLoop *agent.AgentLoop, sessionKey string) {
 			continue
 		}
 
-		fmt.Printf("\n%s %s\n\n", logo, response)
+		fmt.Printf("\n%s %s\n\n", appName, response)
 	}
 }
 
@@ -569,18 +538,6 @@ func gatewayCmd() {
 	}
 	fmt.Println("✓ Heartbeat service started")
 
-	stateManager := state.NewManager(cfg.WorkspacePath())
-	deviceService := devices.NewService(devices.Config{
-		Enabled:    cfg.Devices.Enabled,
-		MonitorUSB: cfg.Devices.MonitorUSB,
-	}, stateManager)
-	deviceService.SetBus(msgBus)
-	if err := deviceService.Start(ctx); err != nil {
-		fmt.Printf("Error starting device service: %v\n", err)
-	} else if cfg.Devices.Enabled {
-		fmt.Println("✓ Device event service started")
-	}
-
 	if err := channelManager.StartAll(ctx); err != nil {
 		fmt.Printf("Error starting channels: %v\n", err)
 	}
@@ -602,7 +559,6 @@ func gatewayCmd() {
 	fmt.Println("\nShutting down...")
 	cancel()
 	healthServer.Stop(context.Background())
-	deviceService.Stop()
 	heartbeatService.Stop()
 	cronService.Stop()
 	agentLoop.Stop()
@@ -619,7 +575,7 @@ func statusCmd() {
 
 	configPath := getConfigPath()
 
-	fmt.Printf("%s dotagent Status\n", logo)
+	fmt.Printf("%s Status\n", appName)
 	fmt.Printf("Version: %s\n", formatVersion())
 	build, _ := formatBuildInfo()
 	if build != "" {
@@ -1014,4 +970,239 @@ func skillsShowCmd(loader *skills.SkillsLoader, skillName string) {
 	fmt.Printf("\n📦 Skill: %s\n", skillName)
 	fmt.Println("----------------------")
 	fmt.Println(content)
+}
+
+func toolpacksCmd() {
+	if len(os.Args) < 3 {
+		toolpacksHelp()
+		return
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Printf("Error loading config: %v\n", err)
+		return
+	}
+	manager := toolpacks.NewManager(cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
+	action := strings.ToLower(strings.TrimSpace(os.Args[2]))
+
+	switch action {
+	case "list":
+		toolpacksListCmd(manager)
+	case "install":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: dotagent toolpacks install <path|owner/repo[@ref]>")
+			return
+		}
+		toolpacksInstallCmd(manager, os.Args[3])
+	case "enable":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: dotagent toolpacks enable <id>")
+			return
+		}
+		toolpacksEnableCmd(manager, os.Args[3], true)
+	case "disable":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: dotagent toolpacks disable <id>")
+			return
+		}
+		toolpacksEnableCmd(manager, os.Args[3], false)
+	case "remove", "uninstall":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: dotagent toolpacks remove <id>")
+			return
+		}
+		toolpacksRemoveCmd(manager, os.Args[3])
+	case "show":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: dotagent toolpacks show <id>")
+			return
+		}
+		toolpacksShowCmd(manager, os.Args[3])
+	case "validate":
+		id := ""
+		if len(os.Args) >= 4 {
+			id = os.Args[3]
+		}
+		toolpacksValidateCmd(manager, id)
+	case "doctor":
+		id := ""
+		if len(os.Args) >= 4 {
+			id = os.Args[3]
+		}
+		toolpacksDoctorCmd(manager, id)
+	default:
+		fmt.Printf("Unknown toolpacks command: %s\n", action)
+		toolpacksHelp()
+	}
+}
+
+func toolpacksHelp() {
+	fmt.Println("\nToolpacks commands:")
+	fmt.Println("  list                  List installed toolpacks")
+	fmt.Println("  install <src>         Install from local path or GitHub repo")
+	fmt.Println("  enable <id>           Enable a toolpack")
+	fmt.Println("  disable <id>          Disable a toolpack")
+	fmt.Println("  remove <id>           Remove a toolpack")
+	fmt.Println("  show <id>             Show toolpack manifest details")
+	fmt.Println("  validate [id]         Validate manifests and connector configs")
+	fmt.Println("  doctor [id]           Run connector health checks")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  dotagent toolpacks list")
+	fmt.Println("  dotagent toolpacks install ./examples/toolpacks/github-cli")
+	fmt.Println("  dotagent toolpacks install owner/repo@v1.0.0")
+}
+
+func toolpacksListCmd(manager *toolpacks.Manager) {
+	packs, err := manager.List()
+	if err != nil {
+		fmt.Printf("✗ Failed to list toolpacks: %v\n", err)
+		return
+	}
+	if len(packs) == 0 {
+		fmt.Println("No toolpacks installed.")
+		return
+	}
+	fmt.Printf("Installed toolpacks (%d):\n", len(packs))
+	for _, pack := range packs {
+		status := "disabled"
+		if pack.Enabled {
+			status = "enabled"
+		}
+		fmt.Printf("  - %s (%s) %s\n", pack.ID, pack.Version, status)
+		if strings.TrimSpace(pack.Description) != "" {
+			fmt.Printf("      %s\n", pack.Description)
+		}
+		fmt.Printf("      tools: %d\n", len(pack.Tools))
+		if lock, ok, lockErr := manager.GetLock(pack.ID); lockErr == nil && ok {
+			fmt.Printf("      source: %s\n", lock.Source)
+		}
+	}
+}
+
+func toolpacksInstallCmd(manager *toolpacks.Manager, source string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		pack toolpacks.Manifest
+		err  error
+	)
+
+	if fi, statErr := os.Stat(source); statErr == nil && fi.IsDir() {
+		pack, err = manager.InstallFromPath(source)
+	} else {
+		pack, err = manager.InstallFromGitHub(ctx, source)
+	}
+	if err != nil {
+		fmt.Printf("✗ Failed to install toolpack: %v\n", err)
+		return
+	}
+	fmt.Printf("✓ Installed toolpack %s (%s)\n", pack.ID, pack.Version)
+}
+
+func toolpacksEnableCmd(manager *toolpacks.Manager, id string, enabled bool) {
+	if err := manager.Enable(id, enabled); err != nil {
+		fmt.Printf("✗ Failed to update toolpack %s: %v\n", id, err)
+		return
+	}
+	state := "disabled"
+	if enabled {
+		state = "enabled"
+	}
+	fmt.Printf("✓ Toolpack %s %s\n", id, state)
+}
+
+func toolpacksRemoveCmd(manager *toolpacks.Manager, id string) {
+	if err := manager.Remove(id); err != nil {
+		fmt.Printf("✗ Failed to remove toolpack %s: %v\n", id, err)
+		return
+	}
+	fmt.Printf("✓ Toolpack %s removed\n", id)
+}
+
+func toolpacksShowCmd(manager *toolpacks.Manager, id string) {
+	packs, err := manager.List()
+	if err != nil {
+		fmt.Printf("✗ Failed to list toolpacks: %v\n", err)
+		return
+	}
+	for _, pack := range packs {
+		if pack.ID != id {
+			continue
+		}
+		if lock, ok, lockErr := manager.GetLock(id); lockErr == nil && ok {
+			pack.Metadata = mergeToolpackMetadata(pack.Metadata, map[string]interface{}{
+				"lock": lock,
+			})
+		}
+		raw, _ := json.MarshalIndent(pack, "", "  ")
+		fmt.Println(string(raw))
+		return
+	}
+	fmt.Printf("✗ Toolpack %s not found\n", id)
+}
+
+func toolpacksValidateCmd(manager *toolpacks.Manager, id string) {
+	warnings, err := manager.Validate(id)
+	if err != nil {
+		fmt.Printf("✗ Validation failed: %v\n", err)
+		return
+	}
+	if len(warnings) == 0 {
+		fmt.Println("✓ Validation passed with no warnings.")
+		return
+	}
+	fmt.Printf("Validation warnings (%d):\n", len(warnings))
+	for _, w := range warnings {
+		fmt.Printf("  - %s\n", w)
+	}
+}
+
+func toolpacksDoctorCmd(manager *toolpacks.Manager, id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	results, err := manager.Doctor(ctx, id)
+	if err != nil {
+		fmt.Printf("✗ Doctor failed: %v\n", err)
+		return
+	}
+	if len(results) == 0 {
+		fmt.Println("No connectors found.")
+		return
+	}
+	errors := 0
+	fmt.Println("Connector health:")
+	for _, res := range results {
+		if res.Status != "ok" {
+			errors++
+		}
+		if res.ConnectorID == "" {
+			fmt.Printf("  - [%s] %s\n", strings.ToUpper(res.Status), res.Error)
+			continue
+		}
+		if res.Error == "" {
+			fmt.Printf("  - [%s] %s/%s (%s)\n", strings.ToUpper(res.Status), res.PackID, res.ConnectorID, res.Type)
+			continue
+		}
+		fmt.Printf("  - [%s] %s/%s (%s): %s\n", strings.ToUpper(res.Status), res.PackID, res.ConnectorID, res.Type, res.Error)
+	}
+	if errors > 0 {
+		fmt.Printf("✗ Doctor completed with %d error(s)\n", errors)
+		return
+	}
+	fmt.Println("✓ Doctor completed successfully.")
+}
+
+func mergeToolpackMetadata(base map[string]interface{}, extra map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }

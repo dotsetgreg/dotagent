@@ -69,6 +69,13 @@ type AsyncTool interface {
 	SetCallback(cb AsyncCallback)
 }
 
+// ClosableTool is an optional interface for tools that hold runtime resources
+// and require explicit teardown when the agent stops.
+type ClosableTool interface {
+	Tool
+	Close() error
+}
+
 func ToolToSchema(tool Tool) map[string]interface{} {
 	return map[string]interface{}{
 		"type": "function",

@@ -1,0 +1,31 @@
+{
+  "id": "mcp-streamable",
+  "name": "MCP Streamable Example",
+  "version": "1.0.0",
+  "description": "Example MCP toolpack using streamable_http transport",
+  "enabled": false,
+  "connectors": [
+    {
+      "id": "main_mcp",
+      "type": "mcp",
+      "description": "Primary MCP endpoint",
+      "mcp": {
+        "transport": "streamable_http",
+        "url": "env:DOTAGENT_MCP_URL",
+        "headers": {
+          "Authorization": "env:DOTAGENT_MCP_AUTH"
+        },
+        "timeout_seconds": 30
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "mcp_echo",
+      "type": "mcp",
+      "description": "Invoke remote MCP tool named echo",
+      "connector_id": "main_mcp",
+      "remote_tool": "echo"
+    }
+  ]
+}

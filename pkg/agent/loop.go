@@ -24,6 +24,7 @@ import (
 	"github.com/dotsetgreg/dotagent/pkg/memory"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 	"github.com/dotsetgreg/dotagent/pkg/state"
+	"github.com/dotsetgreg/dotagent/pkg/toolpacks"
 	"github.com/dotsetgreg/dotagent/pkg/tools"
 	"github.com/dotsetgreg/dotagent/pkg/utils"
 	"github.com/google/uuid"
@@ -42,6 +43,7 @@ type AgentLoop struct {
 	toolPolicy     *toolPolicy
 	contextBuilder *ContextBuilder
 	tools          *tools.ToolRegistry
+	toolpacks      *toolpacks.Manager
 	running        atomic.Bool
 	channelManager *channels.Manager
 }
@@ -73,6 +75,7 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 
 	// Shell execution
 	registry.Register(tools.NewExecTool(workspace, restrict))
+	registry.Register(tools.NewProcessTool(workspace, restrict))
 
 	if searchTool := tools.NewWebSearchTool(tools.WebSearchToolOptions{
 		BraveAPIKey:          cfg.Tools.Web.Brave.APIKey,
@@ -84,10 +87,6 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 		registry.Register(searchTool)
 	}
 	registry.Register(tools.NewWebFetchTool(50000))
-
-	// Hardware tools (I2C, SPI) - Linux only, returns error on other platforms
-	registry.Register(tools.NewI2CTool())
-	registry.Register(tools.NewSPITool())
 
 	// Message tool - available to both agent and subagent
 	// Subagent uses it to communicate directly with user
@@ -113,6 +112,14 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 
 	// Create tool registry for main agent
 	toolsRegistry := createToolRegistry(workspace, restrict, cfg, msgBus)
+	packManager := toolpacks.NewManager(workspace, restrict)
+	packTools, err := packManager.LoadEnabledTools()
+	for _, t := range packTools {
+		toolsRegistry.Register(t)
+	}
+	if err != nil {
+		logger.WarnCF("agent", "Failed loading toolpacks", map[string]interface{}{"error": err.Error()})
+	}
 
 	// Create subagent manager with its own tool registry
 	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, msgBus)
@@ -218,7 +225,7 @@ TURN TRANSCRIPT:
 		return nil, fmt.Errorf("initialize memory service: %w", err)
 	}
 
-	return &AgentLoop{
+	agentLoop := &AgentLoop{
 		bus:            msgBus,
 		provider:       provider,
 		workspace:      workspace,
@@ -228,10 +235,22 @@ TURN TRANSCRIPT:
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
 		memory:         memSvc,
 		state:          stateManager,
-		toolPolicy:     newToolPolicy(workspace),
+		toolPolicy:     newToolPolicy(workspace, cfg.Agents.Defaults.Provider, cfg.Tools.Policy),
 		contextBuilder: contextBuilder,
 		tools:          toolsRegistry,
-	}, nil
+		toolpacks:      packManager,
+	}
+
+	sessionTool := tools.NewSessionTool(
+		agentLoop.memory,
+		func(channel, chatID, userID string) (string, error) {
+			return resolveSessionKey("", agentLoop.workspaceID, channel, chatID, valueOr(userID, "local-user"))
+		},
+		agentLoop.ProcessDirectWithChannel,
+	)
+	toolsRegistry.Register(sessionTool)
+
+	return agentLoop, nil
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
@@ -278,6 +297,11 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 func (al *AgentLoop) Stop() {
 	al.running.Store(false)
+	if al.tools != nil {
+		if err := al.tools.Close(); err != nil {
+			logger.WarnCF("agent", "Tool teardown reported errors", map[string]interface{}{"error": err.Error()})
+		}
+	}
 	if al.memory != nil {
 		_ = al.memory.Close()
 	}
@@ -548,7 +572,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		allowAll: true,
 	}
 	if al.toolPolicy != nil {
-		turnPolicy = al.toolPolicy.PolicyForTurn(opts.UserMessage)
+		turnPolicy = al.toolPolicy.PolicyForTurn(opts.UserMessage, opts.SessionKey)
 		if policyNote := al.toolPolicy.BuildSystemNote(turnPolicy); policyNote != "" {
 			messages = injectSystemNote(messages, policyNote)
 		}
@@ -624,6 +648,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt string, turnPolicy turnToolPolicy) (string, int, error) {
 	iteration := 0
 	var finalContent string
+	toolCallSignatures := map[string]int{}
 	providerStateID := ""
 	if !opts.NoHistory {
 		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey); err == nil {
@@ -761,6 +786,26 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			break
 		}
 
+		signature := toolCallSignature(response.ToolCalls)
+		if signature != "" {
+			toolCallSignatures[signature]++
+			if toolCallSignatures[signature] >= 3 {
+				logger.WarnCF("agent", "Tool-call loop detected; tripping circuit breaker", map[string]interface{}{
+					"signature": signature,
+					"count":     toolCallSignatures[signature],
+					"iteration": iteration,
+				})
+				if !opts.NoHistory {
+					_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
+						"session_key": opts.SessionKey,
+						"user_id":     opts.UserID,
+					})
+				}
+				finalContent = "I’m stopping tool execution because I detected a repeated tool-call loop. If you still want this action, restate it with a narrower scope."
+				break
+			}
+		}
+
 		// Log tool calls
 		toolNames := make([]string, 0, len(response.ToolCalls))
 		for _, tc := range response.ToolCalls {
@@ -850,6 +895,14 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 						"iteration": iteration,
 						"mode":      string(turnPolicy.Mode),
 					})
+					if !opts.NoHistory {
+						_ = al.memory.AddMetric(ctx, "tool.policy.blocked", 1, map[string]string{
+							"session_key": opts.SessionKey,
+							"user_id":     opts.UserID,
+							"tool":        tc.Name,
+							"mode":        string(turnPolicy.Mode),
+						})
+					}
 					toolResult = &tools.ToolResult{
 						ForLLM: "Tool call blocked by policy: " + reason +
 							". Do not inspect runtime state to answer conversational continuity questions. " +
@@ -925,21 +978,16 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 // updateToolContexts updates the context for tools that need channel/chatID info.
 func (al *AgentLoop) updateToolContexts(channel, chatID string) {
-	// Use ContextualTool interface instead of type assertions
-	if tool, ok := al.tools.Get("message"); ok {
-		if mt, ok := tool.(tools.ContextualTool); ok {
-			mt.SetContext(channel, chatID)
+	for _, toolName := range []string{"message", "spawn", "subagent", "session"} {
+		tool, ok := al.tools.Get(toolName)
+		if !ok {
+			continue
 		}
-	}
-	if tool, ok := al.tools.Get("spawn"); ok {
-		if st, ok := tool.(tools.ContextualTool); ok {
-			st.SetContext(channel, chatID)
+		contextual, ok := tool.(tools.ContextualTool)
+		if !ok {
+			continue
 		}
-	}
-	if tool, ok := al.tools.Get("subagent"); ok {
-		if st, ok := tool.(tools.ContextualTool); ok {
-			st.SetContext(channel, chatID)
-		}
+		contextual.SetContext(channel, chatID)
 	}
 }
 
@@ -956,6 +1004,14 @@ func (al *AgentLoop) GetStartupInfo() map[string]interface{} {
 
 	// Skills info
 	info["skills"] = al.contextBuilder.GetSkillsInfo()
+
+	if al.toolpacks != nil {
+		if packs, err := al.toolpacks.List(); err == nil {
+			info["toolpacks"] = map[string]interface{}{
+				"count": len(packs),
+			}
+		}
+	}
 
 	return info
 }
@@ -1009,6 +1065,18 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	}
 	result += "]"
 	return result
+}
+
+func toolCallSignature(calls []providers.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(calls))
+	for _, tc := range calls {
+		argsJSON, _ := json.Marshal(tc.Arguments)
+		parts = append(parts, tc.Name+":"+string(argsJSON))
+	}
+	return strings.Join(parts, "|")
 }
 
 func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate {
@@ -1242,6 +1310,84 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		default:
 			return fmt.Sprintf("Unknown switch target: %s", target), true
 		}
+
+	case "/tools":
+		if al.toolPolicy == nil {
+			return "Tool policy is not initialized.", true
+		}
+		userID := strings.TrimSpace(msg.SenderID)
+		if userID == "" {
+			userID = "local-user"
+		}
+		resolvedSessionKey := strings.TrimSpace(msg.SessionKey)
+		if resolvedSessionKey == "" {
+			if sk, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, userID); err == nil {
+				resolvedSessionKey = sk
+			}
+		}
+
+		if len(args) == 0 || args[0] == "status" {
+			activePolicy := al.toolPolicy.PolicyForTurn("status", resolvedSessionKey)
+			sessionOverride, hasOverride := al.toolPolicy.SessionMode(resolvedSessionKey)
+			overrideText := "(none)"
+			if hasOverride {
+				overrideText = string(sessionOverride)
+			}
+			allowed := activePolicy.AllowedTools()
+			if len(activePolicy.allowedPrefix) > 0 {
+				for _, prefix := range activePolicy.allowedPrefix {
+					allowed = append(allowed, "prefix:"+prefix+"*")
+				}
+			}
+			allowedText := "all"
+			if len(allowed) > 0 {
+				allowedText = strings.Join(allowed, ", ")
+			}
+			if len(allowed) == 0 && !activePolicy.allowAll {
+				allowedText = "(none)"
+			}
+			denied := sortedKeys(activePolicy.deniedToolSet)
+			if len(activePolicy.deniedPrefix) > 0 {
+				for _, prefix := range activePolicy.deniedPrefix {
+					denied = append(denied, "prefix:"+prefix+"*")
+				}
+			}
+			deniedText := "(none)"
+			if len(denied) > 0 {
+				deniedText = strings.Join(denied, ", ")
+			}
+			return fmt.Sprintf("Tools policy\n- Session: %s\n- Mode: %s\n- Session override: %s\n- Allowed: %s\n- Denied: %s",
+				valueOr(resolvedSessionKey, "(unset)"),
+				activePolicy.Mode,
+				overrideText,
+				allowedText,
+				deniedText,
+			), true
+		}
+
+		if args[0] == "mode" {
+			if len(args) < 2 {
+				return "Usage: /tools mode [auto|conversation|workspace_ops|clear]", true
+			}
+			rawMode := strings.TrimSpace(strings.ToLower(args[1]))
+			switch rawMode {
+			case "clear":
+				al.toolPolicy.ClearSessionMode(resolvedSessionKey)
+				return fmt.Sprintf("Cleared session tools mode override for %s.", valueOr(resolvedSessionKey, "(unset)")), true
+			case "auto":
+				al.toolPolicy.ClearSessionMode(resolvedSessionKey)
+				return fmt.Sprintf("Set tools mode to auto for session %s.", valueOr(resolvedSessionKey, "(unset)")), true
+			case "conversation", "chat", "workspace", "workspace_ops", "ops":
+				mode := normalizeToolMode(rawMode)
+				if err := al.toolPolicy.SetSessionMode(resolvedSessionKey, mode); err != nil {
+					return fmt.Sprintf("Failed to set tools mode: %v", err), true
+				}
+				return fmt.Sprintf("Set tools mode to %s for session %s.", mode, valueOr(resolvedSessionKey, "(unset)")), true
+			default:
+				return "Usage: /tools mode [auto|conversation|workspace_ops|clear]", true
+			}
+		}
+		return "Usage: /tools [status] | /tools mode [auto|conversation|workspace_ops|clear]", true
 
 	case "/persona":
 		if len(args) < 1 {

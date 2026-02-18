@@ -7,6 +7,7 @@ type Store interface {
 	Close() error
 	EnsureSession(ctx context.Context, sessionKey, channel, chatID, userID string) error
 	GetSession(ctx context.Context, sessionKey string) (Session, error)
+	ListSessions(ctx context.Context, userID string, limit int) ([]Session, error)
 	MarkSessionConsolidated(ctx context.Context, sessionKey string, atMS int64) error
 	GetSessionSummary(ctx context.Context, sessionKey string) (string, error)
 	SetSessionSummary(ctx context.Context, sessionKey, summary string) error

@@ -134,7 +134,6 @@ func (s *SQLiteStore) init() error {
 			deleted_at_ms INTEGER NOT NULL DEFAULT 0,
 			metadata_json TEXT NOT NULL DEFAULT '{}'
 		);`,
-		`CREATE INDEX IF NOT EXISTS memory_items_legacy_scope_idx ON memory_items(user_id, agent_id, session_key, deleted_at_ms, expires_at_ms, last_seen_at_ms DESC);`,
 		`CREATE TABLE IF NOT EXISTS memory_observations (
 			id TEXT PRIMARY KEY,
 			item_id TEXT NOT NULL,
@@ -556,6 +555,54 @@ FROM sessions WHERE session_key = ?`, sessionKey)
 			return Session{}, sql.ErrNoRows
 		}
 		return Session{}, fmt.Errorf("get session: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) ListSessions(ctx context.Context, userID string, limit int) ([]Session, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	query := `
+SELECT session_key, channel, chat_id, user_id, created_at_ms, updated_at_ms, message_count, summary, last_consolidated_ms
+FROM sessions`
+	args := []interface{}{}
+	if strings.TrimSpace(userID) != "" {
+		query += ` WHERE user_id = ?`
+		args = append(args, userID)
+	}
+	query += ` ORDER BY updated_at_ms DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Session, 0, limit)
+	for rows.Next() {
+		var sess Session
+		if scanErr := rows.Scan(
+			&sess.SessionKey,
+			&sess.Channel,
+			&sess.ChatID,
+			&sess.UserID,
+			&sess.CreatedAtMS,
+			&sess.UpdatedAtMS,
+			&sess.MessageCount,
+			&sess.Summary,
+			&sess.LastConsolidatedMS,
+		); scanErr != nil {
+			return nil, fmt.Errorf("scan session row: %w", scanErr)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions: %w", err)
 	}
 	return out, nil
 }

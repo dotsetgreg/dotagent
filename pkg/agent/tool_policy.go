@@ -6,13 +6,16 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
+	"github.com/dotsetgreg/dotagent/pkg/config"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 )
 
 type turnToolMode string
 
 const (
+	turnToolModeAuto         turnToolMode = "auto"
 	turnToolModeConversation turnToolMode = "conversation"
 	turnToolModeWorkspaceOps turnToolMode = "workspace_ops"
 )
@@ -21,14 +24,33 @@ type turnToolPolicy struct {
 	Mode           turnToolMode
 	allowAll       bool
 	allowedToolSet map[string]struct{}
+	allowedPrefix  []string
+	deniedToolSet  map[string]struct{}
+	deniedPrefix   []string
 }
 
 func (p turnToolPolicy) Allows(toolName string) bool {
+	if _, denied := p.deniedToolSet[toolName]; denied {
+		return false
+	}
+	for _, prefix := range p.deniedPrefix {
+		if strings.HasPrefix(toolName, prefix) {
+			return false
+		}
+	}
 	if p.allowAll {
 		return true
 	}
 	_, ok := p.allowedToolSet[toolName]
-	return ok
+	if ok {
+		return true
+	}
+	for _, prefix := range p.allowedPrefix {
+		if strings.HasPrefix(toolName, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p turnToolPolicy) AllowedTools() []string {
@@ -37,6 +59,9 @@ func (p turnToolPolicy) AllowedTools() []string {
 	}
 	out := make([]string, 0, len(p.allowedToolSet))
 	for name := range p.allowedToolSet {
+		if _, denied := p.deniedToolSet[name]; denied {
+			continue
+		}
 		out = append(out, name)
 	}
 	sort.Strings(out)
@@ -46,6 +71,11 @@ func (p turnToolPolicy) AllowedTools() []string {
 type toolPolicy struct {
 	workspaceAbs string
 	stateDirAbs  string
+	providerName string
+	cfg          config.ToolPolicyConfig
+
+	mu           sync.RWMutex
+	sessionModes map[string]turnToolMode
 }
 
 var workspaceCommandCueRegex = regexp.MustCompile(`(?i)\b(run|execute)\b.{0,40}\b(command|shell|terminal|bash|zsh|powershell|script|docker|git|npm|pnpm|yarn|make|go\s+test|go\s+build|go\s+run|pytest|cargo|mvn|gradle)\b`)
@@ -55,7 +85,15 @@ var shellLiteralCueRegex = regexp.MustCompile(`(?i)^\s*(ls|cat|pwd|grep|rg|sed|a
 
 var commandTokenRegex = regexp.MustCompile(`"[^"]*"|'[^']*'|[^\s]+`)
 
-func newToolPolicy(workspace string) *toolPolicy {
+var toolGroups = map[string][]string{
+	"filesystem": {"read_file", "write_file", "list_dir", "edit_file", "append_file"},
+	"shell":      {"exec", "process"},
+	"web":        {"web_search", "web_fetch"},
+	"messaging":  {"message"},
+	"workflow":   {"cron", "spawn", "subagent", "session"},
+}
+
+func newToolPolicy(workspace, providerName string, cfg config.ToolPolicyConfig) *toolPolicy {
 	workspaceAbs := ""
 	stateDirAbs := ""
 	if strings.TrimSpace(workspace) != "" {
@@ -64,34 +102,125 @@ func newToolPolicy(workspace string) *toolPolicy {
 			stateDirAbs = filepath.Join(workspaceAbs, "state")
 		}
 	}
+	cfg.DefaultMode = string(normalizeToolMode(cfg.DefaultMode))
+	if cfg.ProviderModes == nil {
+		cfg.ProviderModes = map[string]string{}
+	}
+
 	return &toolPolicy{
 		workspaceAbs: workspaceAbs,
 		stateDirAbs:  stateDirAbs,
+		providerName: strings.TrimSpace(strings.ToLower(providerName)),
+		cfg:          cfg,
+		sessionModes: map[string]turnToolMode{},
 	}
 }
 
-func (p *toolPolicy) PolicyForTurn(userMessage string) turnToolPolicy {
-	if looksLikeWorkspaceOperationRequest(userMessage) {
-		return turnToolPolicy{
-			Mode:     turnToolModeWorkspaceOps,
-			allowAll: true,
+func normalizeToolMode(raw string) turnToolMode {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "workspace", "workspace_ops", "ops":
+		return turnToolModeWorkspaceOps
+	case "conversation", "chat":
+		return turnToolModeConversation
+	case "auto", "":
+		return turnToolModeAuto
+	default:
+		return turnToolModeAuto
+	}
+}
+
+func (p *toolPolicy) SetSessionMode(sessionKey string, mode turnToolMode) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return fmt.Errorf("session key is required")
+	}
+	mode = normalizeToolMode(string(mode))
+	if mode == turnToolModeAuto {
+		p.ClearSessionMode(sessionKey)
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sessionModes[sessionKey] = mode
+	return nil
+}
+
+func (p *toolPolicy) ClearSessionMode(sessionKey string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.sessionModes, strings.TrimSpace(sessionKey))
+}
+
+func (p *toolPolicy) SessionMode(sessionKey string) (turnToolMode, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	mode, ok := p.sessionModes[strings.TrimSpace(sessionKey)]
+	return mode, ok
+}
+
+func (p *toolPolicy) baseModeForProvider() turnToolMode {
+	if p == nil {
+		return turnToolModeAuto
+	}
+	if modeRaw, ok := p.cfg.ProviderModes[p.providerName]; ok {
+		return normalizeToolMode(modeRaw)
+	}
+	return normalizeToolMode(p.cfg.DefaultMode)
+}
+
+func (p *toolPolicy) resolveMode(sessionKey, userMessage string) turnToolMode {
+	mode := p.baseModeForProvider()
+	if sessionMode, ok := p.SessionMode(sessionKey); ok {
+		mode = sessionMode
+	}
+	if mode == turnToolModeAuto {
+		if looksLikeWorkspaceOperationRequest(userMessage) {
+			return turnToolModeWorkspaceOps
 		}
+		return turnToolModeConversation
+	}
+	return mode
+}
+
+func (p *toolPolicy) PolicyForTurn(userMessage, sessionKey string) turnToolPolicy {
+	mode := p.resolveMode(sessionKey, userMessage)
+	policy := turnToolPolicy{
+		Mode:           mode,
+		allowAll:       mode == turnToolModeWorkspaceOps,
+		allowedToolSet: map[string]struct{}{},
+		allowedPrefix:  []string{},
+		deniedToolSet:  map[string]struct{}{},
+		deniedPrefix:   []string{},
 	}
 
-	// Conversation mode: keep local system tools off to avoid runtime-state
-	// introspection and force continuity responses through memory context.
-	return turnToolPolicy{
-		Mode: turnToolModeConversation,
-		allowedToolSet: map[string]struct{}{
-			"web_search": {},
-			"web_fetch":  {},
-		},
+	if mode == turnToolModeConversation {
+		policy.allowedToolSet["web_search"] = struct{}{}
+		policy.allowedToolSet["web_fetch"] = struct{}{}
 	}
+
+	allowSet, allowPrefixes := expandToolSelectors(p.cfg.Allow)
+	denySet, denyPrefixes := expandToolSelectors(p.cfg.Deny)
+	if len(allowSet) > 0 {
+		policy.allowAll = false
+		policy.allowedToolSet = allowSet
+	}
+	if len(allowPrefixes) > 0 {
+		policy.allowAll = false
+		policy.allowedPrefix = allowPrefixes
+	}
+	for denied := range denySet {
+		policy.deniedToolSet[denied] = struct{}{}
+	}
+	if len(denyPrefixes) > 0 {
+		policy.deniedPrefix = denyPrefixes
+	}
+	return policy
 }
 
 func (p *toolPolicy) BuildSystemNote(policy turnToolPolicy) string {
 	lines := []string{
 		"## Tool Usage Policy (Current Turn)",
+		fmt.Sprintf("- Active mode: `%s`", policy.Mode),
 		"- Use recalled memory context + visible conversation history for continuity/identity answers.",
 		"- Never inspect runtime state files/databases (`workspace/state/*`, `memory.db`, `state.json`) to answer conversational questions.",
 	}
@@ -102,10 +231,13 @@ func (p *toolPolicy) BuildSystemNote(policy turnToolPolicy) string {
 		} else {
 			lines = append(lines, "- Enabled tools this turn: "+joinBackticked(allowed))
 		}
-		lines = append(lines, "- Local filesystem/shell/hardware tools are disabled unless the user explicitly requests workspace/system operations.")
+		lines = append(lines, "- Local filesystem/shell tools are disabled unless the user explicitly requests workspace/system operations.")
 		return strings.Join(lines, "\n")
 	}
 
+	if len(policy.deniedToolSet) > 0 {
+		lines = append(lines, "- Blocked by policy: "+joinBackticked(sortedKeys(policy.deniedToolSet)))
+	}
 	lines = append(lines,
 		"- Local tools are enabled because this turn appears to request workspace/system operations.",
 		"- Internal runtime state paths remain protected.",
@@ -114,7 +246,7 @@ func (p *toolPolicy) BuildSystemNote(policy turnToolPolicy) string {
 }
 
 func (p *toolPolicy) FilterDefinitions(defs []providers.ToolDefinition, policy turnToolPolicy) []providers.ToolDefinition {
-	if policy.allowAll {
+	if policy.allowAll && len(policy.deniedToolSet) == 0 {
 		return defs
 	}
 	out := make([]providers.ToolDefinition, 0, len(defs))
@@ -145,7 +277,7 @@ func (p *toolPolicy) touchesInternalState(toolName string, args map[string]inter
 	case "read_file", "write_file", "append_file", "edit_file", "list_dir":
 		path, _ := args["path"].(string)
 		return p.isInternalStatePath(path)
-	case "exec":
+	case "exec", "process":
 		command, _ := args["command"].(string)
 		return p.execTouchesInternalState(command)
 	default:
@@ -225,6 +357,37 @@ func looksLikeWorkspaceOperationRequest(userMessage string) bool {
 		workspaceFileOpCueRegex.MatchString(msg)
 }
 
+func expandToolSelectors(selectors []string) (map[string]struct{}, []string) {
+	out := map[string]struct{}{}
+	prefixes := []string{}
+	for _, raw := range selectors {
+		sel := strings.TrimSpace(strings.ToLower(raw))
+		if sel == "" {
+			continue
+		}
+		if strings.HasPrefix(sel, "group:") {
+			group := strings.TrimPrefix(sel, "group:")
+			for _, toolName := range toolGroups[group] {
+				out[toolName] = struct{}{}
+			}
+			continue
+		}
+		if strings.HasPrefix(sel, "prefix:") {
+			prefix := strings.TrimSpace(strings.TrimPrefix(sel, "prefix:"))
+			if prefix != "" {
+				prefixes = append(prefixes, prefix)
+			}
+			continue
+		}
+		if strings.HasSuffix(sel, "*") && len(sel) > 1 {
+			prefixes = append(prefixes, strings.TrimSuffix(sel, "*"))
+			continue
+		}
+		out[sel] = struct{}{}
+	}
+	return out, prefixes
+}
+
 func isPathWithin(candidate, root string) bool {
 	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
 	if err != nil {
@@ -234,6 +397,15 @@ func isPathWithin(candidate, root string) bool {
 		return true
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func joinBackticked(items []string) string {

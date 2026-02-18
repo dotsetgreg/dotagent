@@ -34,6 +34,14 @@
         "enabled": true,
         "max_results": 5
       }
+    },
+    "policy": {
+      "default_mode": "auto",
+      "allow": [],
+      "deny": [],
+      "provider_modes": {
+        "openrouter": "auto"
+      }
     }
   },
   "memory": {
@@ -41,15 +49,18 @@
     "candidate_limit": 80,
     "retrieval_cache_seconds": 20,
     "worker_poll_ms": 700,
-    "worker_lease_seconds": 60
+    "worker_lease_seconds": 60,
+    "embedding_model": "dotagent-chargram-384-v1",
+    "event_retention_days": 90,
+    "audit_retention_days": 365,
+    "persona_sync_apply": true,
+    "persona_file_sync_mode": "export_only",
+    "persona_policy_mode": "balanced",
+    "persona_min_confidence": 0.52
   },
   "heartbeat": {
     "enabled": true,
     "interval": 30
-  },
-  "devices": {
-    "enabled": false,
-    "monitor_usb": true
   },
   "gateway": {
     "host": "0.0.0.0",
