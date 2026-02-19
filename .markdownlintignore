@@ -1,0 +1,5 @@
+# Generated documentation references (source of truth is code, not hand-edited markdown)
+docs/reference/cli/*.md
+docs/reference/config.md
+docs/reference/providers.md
+docs/reference/tools.md
