@@ -821,6 +821,70 @@ func TestAgentLoop_DerivesSessionKeyFromChannelContext(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_ToolsModeCommandUsesCanonicalSessionKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Tools: config.ToolsConfig{
+			Policy: config.ToolPolicyConfig{
+				DefaultMode: "conversation",
+			},
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &mockProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	legacySessionKey := "discord:1473162646134980752"
+	channel := "discord"
+	chatID := "1473162646134980752"
+
+	resp, err := al.ProcessDirectWithChannel(context.Background(), "/tools mode workspace_ops", legacySessionKey, channel, chatID)
+	if err != nil {
+		t.Fatalf("tools mode command failed: %v", err)
+	}
+	if !strings.Contains(resp, "Set tools mode to workspace_ops") {
+		t.Fatalf("unexpected mode response: %s", resp)
+	}
+
+	canonicalSessionKey, err := resolveSessionKey(legacySessionKey, al.workspaceID, channel, chatID, "local-user")
+	if err != nil {
+		t.Fatalf("resolve canonical session key: %v", err)
+	}
+	if canonicalSessionKey == legacySessionKey {
+		t.Fatalf("expected canonical session key to differ from legacy key")
+	}
+
+	if _, ok := al.toolPolicy.SessionMode(legacySessionKey); ok {
+		t.Fatalf("expected no override stored under legacy session key")
+	}
+	mode, ok := al.toolPolicy.SessionMode(canonicalSessionKey)
+	if !ok {
+		t.Fatalf("expected override stored under canonical session key")
+	}
+	if mode != turnToolModeWorkspaceOps {
+		t.Fatalf("expected workspace_ops override, got %s", mode)
+	}
+
+	statusResp, err := al.ProcessDirectWithChannel(context.Background(), "/tools status", legacySessionKey, channel, chatID)
+	if err != nil {
+		t.Fatalf("tools status command failed: %v", err)
+	}
+	if !strings.Contains(statusResp, "Session: "+canonicalSessionKey) {
+		t.Fatalf("expected status to report canonical session key, got: %s", statusResp)
+	}
+	if !strings.Contains(statusResp, "Mode: workspace_ops") {
+		t.Fatalf("expected workspace_ops mode in status, got: %s", statusResp)
+	}
+}
+
 func TestAgentLoop_AppliesPersonaSyncBeforeResponseGeneration(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{

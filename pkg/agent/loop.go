@@ -1217,6 +1217,14 @@ func valueOr(v, fallback string) string {
 	return v
 }
 
+func (al *AgentLoop) resolveCommandSessionKey(msg bus.InboundMessage, userID string) string {
+	// Commands should target the same canonical session key used by normal turns.
+	if sk, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, userID); err == nil {
+		return sk
+	}
+	return strings.TrimSpace(msg.SessionKey)
+}
+
 func historyContainsUserMessage(history []providers.Message, content string) bool {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -1316,12 +1324,7 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		if userID == "" {
 			userID = "local-user"
 		}
-		resolvedSessionKey := strings.TrimSpace(msg.SessionKey)
-		if resolvedSessionKey == "" {
-			if sk, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, userID); err == nil {
-				resolvedSessionKey = sk
-			}
-		}
+		resolvedSessionKey := al.resolveCommandSessionKey(msg, userID)
 
 		if len(args) == 0 || args[0] == "status" {
 			activePolicy := al.toolPolicy.PolicyForTurn("status", resolvedSessionKey)
@@ -1394,12 +1397,7 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		if userID == "" {
 			userID = "local-user"
 		}
-		resolvedSessionKey := strings.TrimSpace(msg.SessionKey)
-		if resolvedSessionKey == "" {
-			if sk, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, userID); err == nil {
-				resolvedSessionKey = sk
-			}
-		}
+		resolvedSessionKey := al.resolveCommandSessionKey(msg, userID)
 		switch args[0] {
 		case "show":
 			profile, err := al.memory.GetPersonaProfile(ctx, userID)
