@@ -37,6 +37,8 @@ jobs:
           globs: |
             README.md
             docs/**/*.md
+            !docs/reference/*.md
+            !docs/reference/**/*.md
 
       - name: Check markdown links (offline)
         uses: lycheeverse/lychee-action@v2

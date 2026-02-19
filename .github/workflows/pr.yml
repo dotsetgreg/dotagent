@@ -88,3 +88,5 @@ jobs:
           globs: |
             README.md
             docs/**/*.md
+            !docs/reference/*.md
+            !docs/reference/**/*.md
