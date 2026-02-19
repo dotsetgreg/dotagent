@@ -83,76 +83,8 @@ func printVersion() {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		printHelp()
-		os.Exit(1)
-	}
-
-	command := os.Args[1]
-
-	switch command {
-	case "onboard":
-		onboard()
-	case "agent":
-		agentCmd()
-	case "gateway":
-		gatewayCmd()
-	case "status":
-		statusCmd()
-	case "cron":
-		cronCmd()
-	case "skills":
-		if len(os.Args) < 3 {
-			skillsHelp()
-			return
-		}
-
-		subcommand := os.Args[2]
-
-		cfg, err := loadConfig()
-		if err != nil {
-			fmt.Printf("Error loading config: %v\n", err)
-			os.Exit(1)
-		}
-
-		workspace := cfg.WorkspacePath()
-		installer := skills.NewSkillInstaller(workspace)
-		// Resolve global config directory and optional bundled skills directory.
-		globalDir := filepath.Dir(getConfigPath())
-		globalSkillsDir := filepath.Join(globalDir, "skills")
-		builtinSkillsDir := filepath.Join(globalDir, "dotagent", "skills")
-		skillsLoader := skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir)
-
-		switch subcommand {
-		case "list":
-			skillsListCmd(skillsLoader)
-		case "install":
-			skillsInstallCmd(installer)
-		case "remove", "uninstall":
-			if len(os.Args) < 4 {
-				fmt.Println("Usage: dotagent skills remove <skill-name>")
-				return
-			}
-			skillsRemoveCmd(installer, os.Args[3])
-		case "search":
-			skillsSearchCmd(installer)
-		case "show":
-			if len(os.Args) < 4 {
-				fmt.Println("Usage: dotagent skills show <skill-name>")
-				return
-			}
-			skillsShowCmd(skillsLoader, os.Args[3])
-		default:
-			fmt.Printf("Unknown skills command: %s\n", subcommand)
-			skillsHelp()
-		}
-	case "toolpacks":
-		toolpacksCmd()
-	case "version", "--version", "-v":
-		printVersion()
-	default:
-		fmt.Printf("Unknown command: %s\n", command)
-		printHelp()
+	if err := executeCLI(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

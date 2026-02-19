@@ -1,0 +1,78 @@
+site_name: DotAgent
+site_description: DotAgent user and operator documentation
+repo_url: https://github.com/dotsetgreg/dotagent
+repo_name: dotsetgreg/dotagent
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+
+extra:
+  version:
+    provider: mike
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quickstart: getting-started/quickstart.md
+  - Guides:
+    - Provider and Auth: guides/provider-auth.md
+    - Tool Policy Modes: guides/tool-policy.md
+    - Docker Operations: guides/docker-operations.md
+    - Troubleshooting: guides/troubleshooting.md
+  - Architecture:
+    - Runtime: architecture/runtime.md
+    - Memory: architecture/memory.md
+    - Extensibility: architecture/extensibility.md
+  - Operations:
+    - Release Checklist: operations/release-checklist.md
+    - Incident Response: operations/incident-response.md
+  - Contributing:
+    - Docs Workflow: contributing/docs-workflow.md
+  - Docs System: docs-system.md
+  - Reference:
+    - Overview: reference/index.md
+    - Config: reference/config.md
+    - Providers: reference/providers.md
+    - Tools: reference/tools.md
+    - CLI:
+      - Root: reference/cli/dotagent.md
+      - agent: reference/cli/dotagent_agent.md
+      - cron: reference/cli/dotagent_cron.md
+      - cron add: reference/cli/dotagent_cron_add.md
+      - cron disable: reference/cli/dotagent_cron_disable.md
+      - cron enable: reference/cli/dotagent_cron_enable.md
+      - cron list: reference/cli/dotagent_cron_list.md
+      - cron remove: reference/cli/dotagent_cron_remove.md
+      - gateway: reference/cli/dotagent_gateway.md
+      - onboard: reference/cli/dotagent_onboard.md
+      - skills: reference/cli/dotagent_skills.md
+      - skills install: reference/cli/dotagent_skills_install.md
+      - skills list: reference/cli/dotagent_skills_list.md
+      - skills remove: reference/cli/dotagent_skills_remove.md
+      - skills search: reference/cli/dotagent_skills_search.md
+      - skills show: reference/cli/dotagent_skills_show.md
+      - status: reference/cli/dotagent_status.md
+      - toolpacks: reference/cli/dotagent_toolpacks.md
+      - toolpacks disable: reference/cli/dotagent_toolpacks_disable.md
+      - toolpacks doctor: reference/cli/dotagent_toolpacks_doctor.md
+      - toolpacks enable: reference/cli/dotagent_toolpacks_enable.md
+      - toolpacks install: reference/cli/dotagent_toolpacks_install.md
+      - toolpacks list: reference/cli/dotagent_toolpacks_list.md
+      - toolpacks remove: reference/cli/dotagent_toolpacks_remove.md
+      - toolpacks show: reference/cli/dotagent_toolpacks_show.md
+      - toolpacks validate: reference/cli/dotagent_toolpacks_validate.md
+      - version: reference/cli/dotagent_version.md

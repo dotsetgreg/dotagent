@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -175,6 +176,7 @@ func (r *ToolRegistry) List() []string {
 	for name := range r.tools {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
@@ -191,8 +193,15 @@ func (r *ToolRegistry) GetSummaries() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	summaries := make([]string, 0, len(r.tools))
-	for _, tool := range r.tools {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	summaries := make([]string, 0, len(names))
+	for _, name := range names {
+		tool := r.tools[name]
 		summaries = append(summaries, fmt.Sprintf("- `%s` - %s", tool.Name(), tool.Description()))
 	}
 	return summaries

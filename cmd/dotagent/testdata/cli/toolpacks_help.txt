@@ -1,0 +1,19 @@
+Install, inspect, validate, and doctor executable toolpacks that extend agent capabilities.
+
+Usage:
+  dotagent toolpacks [command]
+
+Available Commands:
+  disable     Disable a toolpack
+  doctor      Run connector health checks
+  enable      Enable a toolpack
+  install     Install a toolpack from local path or GitHub
+  list        List installed toolpacks
+  remove      Remove an installed toolpack
+  show        Show resolved manifest metadata
+  validate    Validate all toolpacks or one target
+
+Flags:
+  -h, --help   help for toolpacks
+
+Use "dotagent toolpacks [command] --help" for more information about a command.

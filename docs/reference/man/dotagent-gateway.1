@@ -1,0 +1,37 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-gateway - Run the Discord gateway + health server
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent gateway [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Start channel adapters, memory-backed agent loop, cron service, and heartbeat worker.
+
+
+.SH OPTIONS
+.PP
+\fB-d\fP, \fB--debug\fP[=false]
+	Enable debug logging
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for gateway
+
+
+.SH EXAMPLE
+.EX
+  dotagent gateway --debug
+.EE
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent(1)\fP

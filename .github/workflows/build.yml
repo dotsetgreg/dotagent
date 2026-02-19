@@ -23,3 +23,24 @@ jobs:
 
       - name: Build
         run: make build-all
+
+      - name: Verify generated docs
+        run: go run ./cmd/dotagent docs generate --output docs --check
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build docs site (strict)
+        run: mkdocs build --strict
+
+      - name: Lint markdown
+        uses: DavidAnson/markdownlint-cli2-action@v17
+        with:
+          globs: |
+            README.md
+            docs/**/*.md

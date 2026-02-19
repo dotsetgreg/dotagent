@@ -241,11 +241,25 @@ make memory-eval
 make memory-canary
 ```
 
-Reference docs:
+Documentation:
 
-- `docs/memory-architecture.md`
-- `docs/memory-runbook.md`
-- `docs/toolpacks.md`
+- Site source: `docs/`
+- Configured by: `mkdocs.yml`
+- Generated references:
+  - `docs/reference/cli/*`
+  - `docs/reference/man/*`
+  - `docs/reference/config.md`
+  - `docs/reference/providers.md`
+  - `docs/reference/tools.md`
+
+Docs commands:
+
+```bash
+make docs-gen
+make docs-check
+make docs-build
+make docs-serve
+```
 
 Toolpack diagnostics:
 

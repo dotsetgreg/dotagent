@@ -226,3 +226,25 @@ func TestShellTool_RestrictToWorkspace_BlocksShellOperators(t *testing.T) {
 		t.Fatalf("expected restricted mode guard message, got %q", result.ForLLM)
 	}
 }
+
+func TestShellTool_RestrictToWorkspace_AllowsHTTPSURLToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewExecTool(tmpDir, true)
+
+	if guardErr := tool.guardCommand("git clone https://github.com/dotsetlabs/bellwether", tmpDir); guardErr != "" {
+		t.Fatalf("expected HTTPS URL token to pass guard, got %q", guardErr)
+	}
+}
+
+func TestShellTool_RestrictToWorkspace_BlocksAbsolutePathOutsideWorkspace(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewExecTool(tmpDir, true)
+
+	guardErr := tool.guardCommand("cat /etc/passwd", tmpDir)
+	if guardErr == "" {
+		t.Fatalf("expected absolute path outside workspace to be blocked")
+	}
+	if !strings.Contains(strings.ToLower(guardErr), "outside working dir") {
+		t.Fatalf("expected outside working dir message, got %q", guardErr)
+	}
+}

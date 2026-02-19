@@ -1,0 +1,46 @@
+name: docs-check
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify generated references are up to date
+        run: go run ./cmd/dotagent docs generate --output docs --check
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build docs site (strict)
+        run: mkdocs build --strict
+
+      - name: Lint markdown
+        uses: DavidAnson/markdownlint-cli2-action@v17
+        with:
+          globs: |
+            README.md
+            docs/**/*.md
+
+      - name: Check markdown links (offline)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --no-progress README.md docs/**/*.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

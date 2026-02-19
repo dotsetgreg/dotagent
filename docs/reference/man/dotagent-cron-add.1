@@ -1,0 +1,62 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-cron-add - Add a scheduled job
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent cron add [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Add a recurring job with either --every (seconds) or --cron expression.
+
+
+.SH OPTIONS
+.PP
+\fB--channel\fP=""
+	Channel name for delivery
+
+.PP
+\fB-c\fP, \fB--cron\fP=""
+	Cron expression (e.g. '0 9 * * *')
+
+.PP
+\fB-d\fP, \fB--deliver\fP[=false]
+	Deliver result back to a channel target
+
+.PP
+\fB-e\fP, \fB--every\fP=0
+	Run every N seconds
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for add
+
+.PP
+\fB-m\fP, \fB--message\fP=""
+	Message payload for the job
+
+.PP
+\fB-n\fP, \fB--name\fP=""
+	Job name
+
+.PP
+\fB--to\fP=""
+	Recipient/chat target
+
+
+.SH EXAMPLE
+.EX
+  dotagent cron add --name backup --message "run backup" --every 3600
+  dotagent cron add --name digest --message "send daily digest" --cron '0 9 * * *' --deliver --channel discord --to 1234
+.EE
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent-cron(1)\fP

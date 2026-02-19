@@ -992,9 +992,11 @@ func (al *AgentLoop) GetStartupInfo() map[string]interface{} {
 
 	// Tools info
 	tools := al.tools.List()
+	toolSummaries := al.tools.GetSummaries()
 	info["tools"] = map[string]interface{}{
-		"count": len(tools),
-		"names": tools,
+		"count":     len(tools),
+		"names":     tools,
+		"summaries": toolSummaries,
 	}
 
 	// Skills info

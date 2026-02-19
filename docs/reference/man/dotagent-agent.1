@@ -1,0 +1,47 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-agent - Run direct local chat with the agent (CLI mode)
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent agent [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run an interactive local agent session or send one-shot messages without Discord.
+
+
+.SH OPTIONS
+.PP
+\fB-d\fP, \fB--debug\fP[=false]
+	Enable debug logging
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for agent
+
+.PP
+\fB-m\fP, \fB--message\fP=""
+	One-shot prompt to send to the agent
+
+.PP
+\fB-s\fP, \fB--session\fP="cli:default"
+	Session key for continuity
+
+
+.SH EXAMPLE
+.EX
+  dotagent agent
+  dotagent agent --session cli:workspace
+  dotagent agent --message "summarize my TODOs"
+.EE
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent(1)\fP

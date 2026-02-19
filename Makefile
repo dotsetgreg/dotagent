@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall clean help test test-memory test-persona memory-eval memory-canary
+.PHONY: all build install uninstall clean help test test-memory test-persona memory-eval memory-canary docs-gen docs-check docs-build docs-serve
 
 # Build variables
 BINARY_NAME=dotagent
@@ -145,6 +145,23 @@ memory-canary:
 ## fmt: Format Go code
 fmt:
 	@$(GO) fmt ./...
+
+## docs-gen: Generate reference documentation from code
+docs-gen:
+	@$(GO) run ./cmd/dotagent docs generate --output docs
+
+## docs-build: Build MkDocs site (strict mode)
+docs-build:
+	@mkdocs build --strict
+
+## docs-check: Verify generated docs are current and site builds
+docs-check:
+	@$(GO) run ./cmd/dotagent docs generate --output docs --check
+	@mkdocs build --strict
+
+## docs-serve: Serve docs locally at http://127.0.0.1:8000
+docs-serve:
+	@mkdocs serve
 
 ## deps: Download dependencies
 deps:

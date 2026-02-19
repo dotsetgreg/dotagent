@@ -1,0 +1,16 @@
+Create and manage recurring or cron-expression based jobs for the agent.
+
+Usage:
+  dotagent cron [command]
+
+Available Commands:
+  add         Add a scheduled job
+  disable     Disable a job
+  enable      Enable a disabled job
+  list        List scheduled jobs
+  remove      Remove a scheduled job
+
+Flags:
+  -h, --help   help for cron
+
+Use "dotagent cron [command] --help" for more information about a command.

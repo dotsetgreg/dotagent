@@ -43,3 +43,7 @@ tasks/
 
 # Added by goreleaser init:
 dist/
+
+# Docs build and local tooling
+site/
+.venv-docs/

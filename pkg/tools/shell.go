@@ -14,6 +14,8 @@ import (
 )
 
 var restrictedShellMetaPattern = regexp.MustCompile("(\\|\\||&&|[;&|]|`|\\$\\(|[<>]{1,2}|\\r|\\n)")
+var shellTokenPattern = regexp.MustCompile(`"[^"]*"|'[^']*'|[^\s]+`)
+var windowsAbsPathPattern = regexp.MustCompile(`^[A-Za-z]:\\`)
 
 type ExecTool struct {
 	workingDir          string
@@ -187,11 +189,20 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 			return ""
 		}
 
-		pathPattern := regexp.MustCompile(`[A-Za-z]:\\[^\\\"']+|/[^\s\"']+`)
-		matches := pathPattern.FindAllString(cmd, -1)
+		for _, raw := range shellTokenPattern.FindAllString(cmd, -1) {
+			token := strings.Trim(raw, "\"'")
+			if token == "" {
+				continue
+			}
+			if strings.Contains(token, "://") {
+				// URLs are not local filesystem paths.
+				continue
+			}
+			if !looksLikeAbsolutePath(token) {
+				continue
+			}
 
-		for _, raw := range matches {
-			p, err := filepath.Abs(raw)
+			p, err := filepath.Abs(token)
 			if err != nil {
 				continue
 			}
@@ -208,6 +219,19 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 	}
 
 	return ""
+}
+
+func looksLikeAbsolutePath(token string) bool {
+	if token == "" {
+		return false
+	}
+	if strings.HasPrefix(token, "/") {
+		return true
+	}
+	if runtime.GOOS == "windows" && windowsAbsPathPattern.MatchString(token) {
+		return true
+	}
+	return false
 }
 
 func (t *ExecTool) SetTimeout(timeout time.Duration) {

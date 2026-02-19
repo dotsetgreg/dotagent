@@ -1,0 +1,25 @@
+dotagent is a lean, extensible agent runtime.
+
+Use CLI commands to onboard, run local agent sessions, run the Discord gateway,
+manage cron jobs, install skills, and manage executable toolpacks.
+
+Usage:
+  dotagent [flags]
+  dotagent [command]
+
+Available Commands:
+  agent       Run direct local chat with the agent (CLI mode)
+  cron        Manage scheduled jobs
+  gateway     Run the Discord gateway + health server
+  help        Help about any command
+  onboard     Initialize ~/.dotagent config and workspace templates
+  skills      Install, remove, search, and inspect skills
+  status      Show configuration, provider, and runtime readiness
+  toolpacks   Manage executable tool packs
+  version     Show build/version metadata
+
+Flags:
+  -h, --help      help for dotagent
+  -v, --version   Show build/version metadata
+
+Use "dotagent [command] --help" for more information about a command.
