@@ -31,7 +31,6 @@ dotagent gateway
 ## 3. Verify Commands
 
 In Discord:
-- `/tools status`
 - `/persona show`
 
 ## 4. Local One-Shot Test

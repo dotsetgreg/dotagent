@@ -123,9 +123,6 @@ func TestDefaultConfig_WebTools(t *testing.T) {
 	if cfg.Tools.Web.DuckDuckGo.MaxResults != 5 {
 		t.Error("Expected DuckDuckGo MaxResults 5, got ", cfg.Tools.Web.DuckDuckGo.MaxResults)
 	}
-	if got := cfg.Tools.Policy.ProviderModes["openai-codex"]; got != "auto" {
-		t.Fatalf("expected provider mode default auto for openai-codex, got %q", got)
-	}
 }
 
 func TestSaveConfig_FilePermissions(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -19,20 +20,48 @@ import (
 var (
 	personaNameRegex          = regexp.MustCompile(`(?i)\b(?:my name is|call me)\s+([A-Za-z0-9][A-Za-z0-9 _\-]{1,50}?)(?:\s+and\b|[.!?,]|$)`)
 	personaAgentNameRegex     = regexp.MustCompile(`(?i)\b(?:your name is|call yourself|you are called|you're called)\s+([A-Za-z0-9][A-Za-z0-9 _\-.']{1,60}?)(?:\s+and\b|[.!?,]|$)`)
-	personaTimezoneRegex      = regexp.MustCompile(`(?i)\b(?:my timezone is|i am in timezone)\s+([A-Za-z0-9_/\-+]{2,64})`)
-	personaLocationRegex      = regexp.MustCompile(`(?i)\b(?:i live in|i am in|i'm in)\s+([A-Za-z0-9 _\-/]{2,80})`)
-	personaLanguageRegex      = regexp.MustCompile(`(?i)\b(?:my preferred language is|respond in|speak in)\s+([A-Za-z]{2,32})`)
+	personaTimezoneRegex      = regexp.MustCompile(`(?i)\b(?:my timezone is|timezone is|i am in timezone)\s+([A-Za-z0-9_/\-+]{2,64})`)
+	personaLocationRegex      = regexp.MustCompile(`(?i)\b(?:i live in|i'm based in|i am located in|my location is)\s+([A-Za-z0-9][A-Za-z0-9 ,._\-/]{1,80}?)(?:\s+and\b|[.!?,]|$)`)
+	personaLanguageRegex      = regexp.MustCompile(`(?i)\b(?:my preferred language is|my language is|respond in|speak in)\s+([A-Za-z][A-Za-z \-]{1,32}?)(?:\s+and\b|[.!?,]|$)`)
 	personaCommStyleRegex     = regexp.MustCompile(`(?i)\b(?:be|respond|talk|write)\s+(more\s+)?(concise|detailed|formal|casual|direct|friendly)\b`)
 	personaPreferenceRegex    = regexp.MustCompile(`(?i)\b(i (?:really )?(?:like|love|prefer|hate|dislike)\b[^.!?\n]*)`)
-	personaGoalRegex          = regexp.MustCompile(`(?i)\b(?:my goal is|i want to|help me)\s+([^.!?\n]{4,140})`)
+	personaGoalRegex          = regexp.MustCompile(`(?i)\b(?:my goal is|my goals are|one of my goals is)\s+([^.!?\n]{4,140})`)
 	personaSessionIntentRegex = regexp.MustCompile(`(?i)\b(?:right now|for this session|today)\b[:\s-]*([^.!?\n]{4,140})`)
-	personaForgetRegex        = regexp.MustCompile(`(?i)\b(?:forget|remove|don't remember)\b\s+(.+)$`)
+	personaForgetRegex        = regexp.MustCompile(`(?i)\b(?:please\s+)?(?:forget|remove)\b(?:\s+(?:that|this|about))?\s+(.+)$`)
 	personaDirectiveRegex     = regexp.MustCompile(`(?i)\b(?:you should|from now on|always)\s+([^.!?\n]{4,200})`)
 	personaYouAreRegex        = regexp.MustCompile(`(?i)\b(?:you are|you're)\s+([^.!?\n]{3,180})`)
 	personaYouHaveRegex       = regexp.MustCompile(`(?i)\b(?:you have|you've got)\s+([^.!?\n]{3,180})`)
 	personaYourFieldIsRegex   = regexp.MustCompile(`(?i)\byour\s+([A-Za-z][A-Za-z0-9 _\-]{1,32})\s+is\s+([^.!?\n]{1,180})`)
 	personaSensitiveRegex     = regexp.MustCompile(`(?i)(api[_ -]?key|password|secret|token|private key|ssh-rsa|-----BEGIN|sk-[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{20,})`)
+
+	personaLikelyQuestionLeadRegex = regexp.MustCompile(`(?i)^\s*(?:what|why|how|when|where|who|can|could|would|do|does|did|is|are|am|if|whether)\b`)
+	personaQuestionDirectiveCue    = regexp.MustCompile(`(?i)\b(?:call me|call yourself|your name is|from now on|please be|please respond|respond in|speak in|forget|remove|remember|note|save|store|set)\b`)
+	personaLanguageCodeRegex       = regexp.MustCompile(`(?i)^[a-z]{2,3}(?:-[a-z0-9]{2,8})?$`)
+	personaSlugNormalizeRegex      = regexp.MustCompile(`[^a-z0-9]+`)
+	intentWordRegex                = regexp.MustCompile(`[a-z0-9]+`)
 )
+
+var personaKnownLanguages = map[string]struct{}{
+	"arabic": {}, "bengali": {}, "chinese": {}, "czech": {}, "danish": {}, "dutch": {}, "english": {}, "finnish": {},
+	"french": {}, "german": {}, "greek": {}, "hindi": {}, "indonesian": {}, "italian": {}, "japanese": {}, "korean": {},
+	"norwegian": {}, "polish": {}, "portuguese": {}, "romanian": {}, "russian": {}, "spanish": {}, "swedish": {}, "thai": {},
+	"turkish": {}, "ukrainian": {}, "urdu": {}, "vietnamese": {},
+}
+
+var personaNonLocationTokens = map[string]struct{}{
+	"rush": {}, "hurry": {}, "middle": {}, "meeting": {}, "queue": {}, "process": {}, "trouble": {}, "mood": {}, "flow": {},
+	"pain": {}, "love": {}, "fear": {}, "sync": {}, "session": {}, "chat": {}, "call": {},
+}
+
+var intentPreferenceTokens = map[string]struct{}{"prefer": {}, "preferences": {}, "preference": {}, "like": {}, "likes": {}, "favorite": {}, "favourite": {}}
+var intentIdentityTokens = map[string]struct{}{"name": {}, "timezone": {}, "location": {}, "profile": {}, "identity": {}, "remember": {}}
+var intentStyleTokens = map[string]struct{}{"style": {}, "tone": {}, "voice": {}, "respond": {}, "communication": {}}
+var intentTaskTokens = map[string]struct{}{"task": {}, "tasks": {}, "todo": {}, "todos": {}, "deadline": {}, "remind": {}, "reminder": {}}
+
+var intentPreferencePhrases = []string{"what do i like", "what do i prefer", "my preferences"}
+var intentIdentityPhrases = []string{"who am i", "what is my name", "my timezone", "my location", "my profile", "about me", "what do you remember about me"}
+var intentStylePhrases = []string{"communication style", "response style", "how should you respond", "what tone"}
+var intentTaskPhrases = []string{"what are my tasks", "what are my todos", "todo list", "remind me", "deadline"}
 
 type promptCacheEntry struct {
 	prompt      string
@@ -503,6 +532,9 @@ func (pm *PersonaManager) extractHeuristicCandidates(events []Event, sessionKey,
 		if content == "" {
 			continue
 		}
+		if isLikelyQuestionContent(content) && !personaQuestionDirectiveCue.MatchString(content) {
+			continue
+		}
 
 		for _, m := range personaNameRegex.FindAllStringSubmatch(content, -1) {
 			if len(m) < 2 {
@@ -526,13 +558,21 @@ func (pm *PersonaManager) extractHeuristicCandidates(events []Event, sessionKey,
 			if len(m) < 2 {
 				continue
 			}
-			out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.location", "set", m[1], 0.74, content, "heuristic"))
+			location := normalizePersonaLocation(m[1])
+			if location == "" {
+				continue
+			}
+			out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.location", "set", location, 0.74, content, "heuristic"))
 		}
 		for _, m := range personaLanguageRegex.FindAllStringSubmatch(content, -1) {
 			if len(m) < 2 {
 				continue
 			}
-			out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.language", "set", strings.ToLower(m[1]), 0.72, content, "heuristic"))
+			lang := normalizePersonaLanguage(m[1])
+			if lang == "" {
+				continue
+			}
+			out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.language", "set", lang, 0.72, content, "heuristic"))
 		}
 		for _, m := range personaCommStyleRegex.FindAllStringSubmatch(content, -1) {
 			if len(m) < 3 {
@@ -602,20 +642,111 @@ func (pm *PersonaManager) extractHeuristicCandidates(events []Event, sessionKey,
 			if len(m) < 2 {
 				continue
 			}
-			target := strings.ToLower(strings.TrimSpace(m[1]))
-			switch {
-			case strings.Contains(target, "name"):
-				out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.name", "delete", "", 0.88, content, "heuristic"))
-			case strings.Contains(target, "timezone"):
-				out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.timezone", "delete", "", 0.88, content, "heuristic"))
-			case strings.Contains(target, "location"):
-				out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.location", "delete", "", 0.88, content, "heuristic"))
-			case strings.Contains(target, "preference"):
-				out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, "user.preferences", "delete", "", 0.75, content, "heuristic"))
+			target := strings.TrimSpace(m[1])
+			fieldPath := mapForgetTargetPath(target)
+			if fieldPath == "" {
+				continue
 			}
+			confidence := 0.88
+			if fieldPath == "user.preferences" {
+				confidence = 0.75
+			}
+			out = append(out, newCandidate(sessionKey, turnID, userID, agentID, ev.ID, fieldPath, "delete", "", confidence, content, "heuristic"))
 		}
 	}
 	return out
+}
+
+func isLikelyQuestionContent(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if strings.Contains(content, "?") {
+		return true
+	}
+	return personaLikelyQuestionLeadRegex.MatchString(content)
+}
+
+func normalizePersonaLanguage(raw string) string {
+	lang := strings.ToLower(strings.TrimSpace(raw))
+	lang = strings.Trim(lang, " .,!?:;\"'")
+	if lang == "" {
+		return ""
+	}
+	if strings.HasPrefix(lang, "the ") {
+		lang = strings.TrimSpace(strings.TrimPrefix(lang, "the "))
+	}
+	if personaLanguageCodeRegex.MatchString(lang) {
+		return lang
+	}
+	if _, ok := personaKnownLanguages[lang]; ok {
+		return lang
+	}
+	return ""
+}
+
+func normalizePersonaLocation(raw string) string {
+	location := strings.TrimSpace(raw)
+	location = strings.Trim(location, " .,!?:;\"'")
+	if location == "" {
+		return ""
+	}
+	low := strings.ToLower(location)
+	tokens := intentWordRegex.FindAllString(low, -1)
+	if len(tokens) == 0 || len(tokens) > 8 {
+		return ""
+	}
+	hasLetter := false
+	for _, r := range location {
+		if unicode.IsLetter(r) {
+			hasLetter = true
+			break
+		}
+	}
+	if !hasLetter {
+		return ""
+	}
+	if len(tokens) == 1 {
+		if _, blocked := personaNonLocationTokens[tokens[0]]; blocked {
+			return ""
+		}
+	}
+	return location
+}
+
+func mapForgetTargetPath(target string) string {
+	_, tokenSet := normalizeIntentQuery(target)
+	if len(tokenSet) == 0 {
+		return ""
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"preference": {}, "preferences": {}, "pref": {}, "prefs": {}}) {
+		return "user.preferences"
+	}
+	if _, ok := tokenSet["timezone"]; ok {
+		return "user.timezone"
+	}
+	if _, hasTime := tokenSet["time"]; hasTime {
+		if _, hasZone := tokenSet["zone"]; hasZone {
+			return "user.timezone"
+		}
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"location": {}, "city": {}, "where": {}, "place": {}}) {
+		return "user.location"
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"language": {}, "lang": {}}) {
+		return "user.language"
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"style": {}, "tone": {}}) {
+		return "user.communication_style"
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"goal": {}, "goals": {}}) {
+		return "user.goals"
+	}
+	if hasAnyToken(tokenSet, map[string]struct{}{"name": {}, "nickname": {}}) {
+		return "user.name"
+	}
+	return ""
 }
 
 func newCandidate(sessionKey, turnID, userID, agentID, sourceEventID, fieldPath, op, value string, confidence float64, evidence, source string) PersonaUpdateCandidate {
@@ -747,26 +878,26 @@ func isStableField(fieldPath string) bool {
 }
 
 func isExplicitOverride(fieldPath, evidence string) bool {
-	ev := strings.ToLower(evidence)
-	if strings.Contains(ev, "actually") ||
-		strings.Contains(ev, "correction") ||
-		strings.Contains(ev, "instead") ||
-		strings.Contains(ev, "from now on") {
+	normalized, _ := normalizeIntentQuery(evidence)
+	if normalized == "" {
+		return false
+	}
+	if containsAnyIntentPhrase(normalized, []string{"actually", "correction", "instead", "from now on"}) {
 		return true
 	}
 	switch fieldPath {
 	case "user.name":
-		return strings.Contains(ev, "my name is") || strings.Contains(ev, "call me") || strings.Contains(ev, "don't call me")
+		return containsAnyIntentPhrase(normalized, []string{"my name is", "call me", "dont call me"})
 	case "identity.agent_name":
-		return strings.Contains(ev, "your name is") || strings.Contains(ev, "call yourself") || strings.Contains(ev, "you are called")
+		return containsAnyIntentPhrase(normalized, []string{"your name is", "call yourself", "you are called"})
 	case "user.timezone":
-		return strings.Contains(ev, "my timezone is") || strings.Contains(ev, "i am in timezone")
+		return containsAnyIntentPhrase(normalized, []string{"my timezone is", "timezone is", "i am in timezone"})
 	case "user.location":
-		return strings.Contains(ev, "i live in") || strings.Contains(ev, "i am in") || strings.Contains(ev, "i'm in")
+		return containsAnyIntentPhrase(normalized, []string{"i live in", "im based in", "i am located in", "my location is"})
 	case "identity.role":
-		return strings.Contains(ev, "you are") || strings.Contains(ev, "you're") || strings.Contains(ev, "your role is")
+		return containsAnyIntentPhrase(normalized, []string{"you are", "youre", "your role is"})
 	case "identity.purpose":
-		return strings.Contains(ev, "your purpose is")
+		return containsAnyIntentPhrase(normalized, []string{"your purpose is"})
 	default:
 		return false
 	}
@@ -1090,24 +1221,32 @@ func (pm *PersonaManager) invalidatePromptCache(userID, agentID string) {
 }
 
 func detectQueryIntent(query string) string {
-	q := strings.ToLower(strings.TrimSpace(query))
-	switch {
-	case strings.Contains(q, "prefer") || strings.Contains(q, "like") || strings.Contains(q, "favorite"):
-		return "preference"
-	case strings.Contains(q, "name") || strings.Contains(q, "who am i") || strings.Contains(q, "timezone") || strings.Contains(q, "profile"):
-		return "identity"
-	case strings.Contains(q, "style") || strings.Contains(q, "tone") || strings.Contains(q, "respond"):
-		return "style"
-	case strings.Contains(q, "task") || strings.Contains(q, "todo") || strings.Contains(q, "deadline") || strings.Contains(q, "remind"):
-		return "task"
-	default:
+	normalized, tokenSet := normalizeIntentQuery(query)
+	if normalized == "" {
 		return "general"
 	}
+
+	scores := map[string]int{
+		"preference": scoreIntent(normalized, tokenSet, intentPreferenceTokens, intentPreferencePhrases),
+		"identity":   scoreIntent(normalized, tokenSet, intentIdentityTokens, intentIdentityPhrases),
+		"style":      scoreIntent(normalized, tokenSet, intentStyleTokens, intentStylePhrases),
+		"task":       scoreIntent(normalized, tokenSet, intentTaskTokens, intentTaskPhrases),
+	}
+
+	bestIntent := "general"
+	bestScore := 0
+	for _, candidate := range []string{"task", "identity", "preference", "style"} {
+		if score := scores[candidate]; score > bestScore {
+			bestIntent = candidate
+			bestScore = score
+		}
+	}
+	return bestIntent
 }
 
 func shortStableSlug(in string) string {
 	in = strings.ToLower(strings.TrimSpace(in))
-	in = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(in, "_")
+	in = personaSlugNormalizeRegex.ReplaceAllString(in, "_")
 	in = strings.Trim(in, "_")
 	if len(in) > 24 {
 		in = in[:24]
@@ -1116,6 +1255,60 @@ func shortStableSlug(in string) string {
 		return hashLower(in)[:10]
 	}
 	return in
+}
+
+func scoreIntent(normalized string, tokenSet map[string]struct{}, tokens map[string]struct{}, phrases []string) int {
+	score := 0
+	for token := range tokens {
+		if _, ok := tokenSet[token]; ok {
+			score++
+		}
+	}
+	for _, phrase := range phrases {
+		if containsIntentPhrase(normalized, phrase) {
+			score += 2
+		}
+	}
+	return score
+}
+
+func normalizeIntentQuery(query string) (string, map[string]struct{}) {
+	rawTokens := intentWordRegex.FindAllString(strings.ToLower(strings.TrimSpace(query)), -1)
+	if len(rawTokens) == 0 {
+		return "", nil
+	}
+	tokenSet := make(map[string]struct{}, len(rawTokens))
+	for _, token := range rawTokens {
+		tokenSet[token] = struct{}{}
+	}
+	return " " + strings.Join(rawTokens, " ") + " ", tokenSet
+}
+
+func containsIntentPhrase(normalizedQuery, phrase string) bool {
+	phraseTokens := intentWordRegex.FindAllString(strings.ToLower(strings.TrimSpace(phrase)), -1)
+	if len(phraseTokens) == 0 {
+		return false
+	}
+	normalizedPhrase := " " + strings.Join(phraseTokens, " ") + " "
+	return strings.Contains(normalizedQuery, normalizedPhrase)
+}
+
+func containsAnyIntentPhrase(normalizedQuery string, phrases []string) bool {
+	for _, phrase := range phrases {
+		if containsIntentPhrase(normalizedQuery, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyToken(tokens map[string]struct{}, candidates map[string]struct{}) bool {
+	for candidate := range candidates {
+		if _, ok := tokens[candidate]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func mapPersonaDirectiveField(field string) (string, string) {

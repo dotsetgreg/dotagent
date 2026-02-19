@@ -43,7 +43,6 @@ type AgentLoop struct {
 	maxIterations  int
 	memory         *memory.Service
 	state          *state.Manager
-	toolPolicy     *toolPolicy
 	contextBuilder *ContextBuilder
 	tools          *tools.ToolRegistry
 	toolpacks      *toolpacks.Manager
@@ -250,7 +249,6 @@ TURN TRANSCRIPT:
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
 		memory:         memSvc,
 		state:          stateManager,
-		toolPolicy:     newToolPolicy(workspace, cfg.Agents.Defaults.Provider, cfg.Tools.Policy),
 		contextBuilder: contextBuilder,
 		tools:          toolsRegistry,
 		toolpacks:      packManager,
@@ -573,22 +571,12 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		opts.Channel,
 		opts.ChatID,
 	)
-	turnPolicy := turnToolPolicy{
-		Mode:     turnToolModeWorkspaceOps,
-		allowAll: true,
-	}
-	if al.toolPolicy != nil {
-		turnPolicy = al.toolPolicy.PolicyForTurn(opts.UserMessage, opts.SessionKey)
-		if policyNote := al.toolPolicy.BuildSystemNote(turnPolicy); policyNote != "" {
-			messages = injectSystemNote(messages, policyNote)
-		}
-	}
 	if note := buildPersonaDecisionSystemNote(syncPersonaReport); note != "" {
 		messages = injectSystemNote(messages, note)
 	}
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt, turnPolicy)
+	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt)
 	if err != nil {
 		return "", err
 	}
@@ -651,7 +639,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 // runLLMIteration executes the LLM call loop with tool handling.
 // Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt string, turnPolicy turnToolPolicy) (string, int, error) {
+func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt string) (string, int, error) {
 	iteration := 0
 	var finalContent string
 	toolCallSignatures := map[string]int{}
@@ -673,9 +661,6 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 		// Build tool definitions
 		providerToolDefs := al.tools.ToProviderDefs()
-		if al.toolPolicy != nil {
-			providerToolDefs = al.toolPolicy.FilterDefinitions(providerToolDefs, turnPolicy)
-		}
 
 		// Log LLM request details
 		systemPromptLen := 0
@@ -897,36 +882,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			}
 
 			var toolResult *tools.ToolResult
-			if al.toolPolicy != nil {
-				if allowed, reason := al.toolPolicy.ValidateToolCall(turnPolicy, tc.Name, tc.Arguments); !allowed {
-					logger.WarnCF("agent", "Tool call blocked by policy", map[string]interface{}{
-						"tool":      tc.Name,
-						"reason":    reason,
-						"iteration": iteration,
-						"mode":      string(turnPolicy.Mode),
-					})
-					if !opts.NoHistory {
-						_ = al.memory.AddMetric(ctx, "tool.policy.blocked", 1, map[string]string{
-							"session_key": opts.SessionKey,
-							"user_id":     opts.UserID,
-							"tool":        tc.Name,
-							"mode":        string(turnPolicy.Mode),
-						})
-					}
-					toolResult = &tools.ToolResult{
-						ForLLM: "Tool call blocked by policy: " + reason +
-							". Do not inspect runtime state to answer conversational continuity questions. " +
-							"Use recalled memory and visible conversation context, or ask for explicit workspace/system-operation intent.",
-						Silent:  true,
-						IsError: true,
-						Async:   false,
-						Err:     fmt.Errorf("tool call blocked by policy: %s", reason),
-					}
-				}
-			}
-			if toolResult == nil {
-				toolResult = al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
-			}
+			toolResult = al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
 
 			// Send ForUser content to user immediately if not Silent
 			if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
@@ -1315,79 +1271,6 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		default:
 			return fmt.Sprintf("Unknown switch target: %s", target), true
 		}
-
-	case "/tools":
-		if al.toolPolicy == nil {
-			return "Tool policy is not initialized.", true
-		}
-		userID := strings.TrimSpace(msg.SenderID)
-		if userID == "" {
-			userID = "local-user"
-		}
-		resolvedSessionKey := al.resolveCommandSessionKey(msg, userID)
-
-		if len(args) == 0 || args[0] == "status" {
-			activePolicy := al.toolPolicy.PolicyForTurn("status", resolvedSessionKey)
-			sessionOverride, hasOverride := al.toolPolicy.SessionMode(resolvedSessionKey)
-			overrideText := "(none)"
-			if hasOverride {
-				overrideText = string(sessionOverride)
-			}
-			allowed := activePolicy.AllowedTools()
-			if len(activePolicy.allowedPrefix) > 0 {
-				for _, prefix := range activePolicy.allowedPrefix {
-					allowed = append(allowed, "prefix:"+prefix+"*")
-				}
-			}
-			allowedText := "all"
-			if len(allowed) > 0 {
-				allowedText = strings.Join(allowed, ", ")
-			}
-			if len(allowed) == 0 && !activePolicy.allowAll {
-				allowedText = "(none)"
-			}
-			denied := sortedKeys(activePolicy.deniedToolSet)
-			if len(activePolicy.deniedPrefix) > 0 {
-				for _, prefix := range activePolicy.deniedPrefix {
-					denied = append(denied, "prefix:"+prefix+"*")
-				}
-			}
-			deniedText := "(none)"
-			if len(denied) > 0 {
-				deniedText = strings.Join(denied, ", ")
-			}
-			return fmt.Sprintf("Tools policy\n- Session: %s\n- Mode: %s\n- Session override: %s\n- Allowed: %s\n- Denied: %s",
-				valueOr(resolvedSessionKey, "(unset)"),
-				activePolicy.Mode,
-				overrideText,
-				allowedText,
-				deniedText,
-			), true
-		}
-
-		if args[0] == "mode" {
-			if len(args) < 2 {
-				return "Usage: /tools mode [auto|conversation|workspace_ops|clear]", true
-			}
-			rawMode := strings.TrimSpace(strings.ToLower(args[1]))
-			switch rawMode {
-			case "clear":
-				al.toolPolicy.ClearSessionMode(resolvedSessionKey)
-				return fmt.Sprintf("Cleared session tools mode override for %s.", valueOr(resolvedSessionKey, "(unset)")), true
-			case "auto":
-				al.toolPolicy.ClearSessionMode(resolvedSessionKey)
-				return fmt.Sprintf("Set tools mode to auto for session %s.", valueOr(resolvedSessionKey, "(unset)")), true
-			case "conversation", "chat", "workspace", "workspace_ops", "ops":
-				mode := normalizeToolMode(rawMode)
-				if err := al.toolPolicy.SetSessionMode(resolvedSessionKey, mode); err != nil {
-					return fmt.Sprintf("Failed to set tools mode: %v", err), true
-				}
-				return fmt.Sprintf("Set tools mode to %s for session %s.", mode, valueOr(resolvedSessionKey, "(unset)")), true
-			default:
-				return "Usage: /tools mode [auto|conversation|workspace_ops|clear]", true
-			}
-		}
-		return "Usage: /tools [status] | /tools mode [auto|conversation|workspace_ops|clear]", true
 
 	case "/persona":
 		if len(args) < 1 {

@@ -176,3 +176,135 @@ func TestPersonaSyncApply_IsIdempotentPerTurn(t *testing.T) {
 		t.Fatalf("expected one identity.agent_name revision for Luna, got %d", count)
 	}
 }
+
+func TestPersonaSyncApply_QuestionDoesNotMutateName(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:        ws,
+		AgentID:          "dotagent",
+		WorkerPoll:       40 * time.Millisecond,
+		PersonaSyncApply: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:question-name"
+	userID := "u-question-name"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "question-name", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	turnID := "turn-question"
+	if _, _, err := svc.RecordUserTurn(ctx, Event{
+		SessionKey: sessionKey,
+		TurnID:     turnID,
+		Seq:        1,
+		Role:       "user",
+		Content:    "What if my name is Bob?",
+	}, userID); err != nil {
+		t.Fatalf("record user turn: %v", err)
+	}
+
+	if _, err := svc.ApplyPersonaDirectivesSync(ctx, sessionKey, turnID, userID); err != nil {
+		t.Fatalf("apply persona sync: %v", err)
+	}
+
+	profile, err := svc.GetPersonaProfile(ctx, userID)
+	if err != nil {
+		t.Fatalf("get persona profile: %v", err)
+	}
+	if strings.EqualFold(profile.User.Name, "Bob") {
+		t.Fatalf("expected question-form text to avoid mutating user.name")
+	}
+}
+
+func TestPersonaSyncApply_RespondInDetailDoesNotSetLanguage(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:        ws,
+		AgentID:          "dotagent",
+		WorkerPoll:       40 * time.Millisecond,
+		PersonaSyncApply: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:style-not-language"
+	userID := "u-style-not-language"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "style-not-language", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	turnID := "turn-style"
+	if _, _, err := svc.RecordUserTurn(ctx, Event{
+		SessionKey: sessionKey,
+		TurnID:     turnID,
+		Seq:        1,
+		Role:       "user",
+		Content:    "Please respond in detailed format.",
+	}, userID); err != nil {
+		t.Fatalf("record user turn: %v", err)
+	}
+
+	if _, err := svc.ApplyPersonaDirectivesSync(ctx, sessionKey, turnID, userID); err != nil {
+		t.Fatalf("apply persona sync: %v", err)
+	}
+
+	profile, err := svc.GetPersonaProfile(ctx, userID)
+	if err != nil {
+		t.Fatalf("get persona profile: %v", err)
+	}
+	if strings.TrimSpace(profile.User.Language) != "" {
+		t.Fatalf("expected non-language directive to avoid mutating user.language, got %q", profile.User.Language)
+	}
+}
+
+func TestPersonaSyncApply_IWantToDoesNotCreateDurableGoal(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:        ws,
+		AgentID:          "dotagent",
+		WorkerPoll:       40 * time.Millisecond,
+		PersonaSyncApply: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:no-goal-from-request"
+	userID := "u-no-goal-from-request"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "no-goal-from-request", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	turnID := "turn-request-goal"
+	if _, _, err := svc.RecordUserTurn(ctx, Event{
+		SessionKey: sessionKey,
+		TurnID:     turnID,
+		Seq:        1,
+		Role:       "user",
+		Content:    "I want to debug this issue right now.",
+	}, userID); err != nil {
+		t.Fatalf("record user turn: %v", err)
+	}
+
+	if _, err := svc.ApplyPersonaDirectivesSync(ctx, sessionKey, turnID, userID); err != nil {
+		t.Fatalf("apply persona sync: %v", err)
+	}
+
+	profile, err := svc.GetPersonaProfile(ctx, userID)
+	if err != nil {
+		t.Fatalf("get persona profile: %v", err)
+	}
+	if len(profile.User.Goals) > 0 {
+		t.Fatalf("expected ephemeral request to avoid mutating user.goals, got %+v", profile.User.Goals)
+	}
+}

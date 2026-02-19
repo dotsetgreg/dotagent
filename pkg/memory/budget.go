@@ -1,7 +1,5 @@
 package memory
 
-import "strings"
-
 // DeriveContextBudget allocates context tokens across system/thread/summary/memory.
 func DeriveContextBudget(total int) ContextBudget {
 	if total <= 0 {
@@ -41,12 +39,8 @@ func DeriveAdaptiveContextBudget(total int, signals BudgetSignals) ContextBudget
 		b.ThreadTokens += shift
 		b.MemoryTokens -= shift
 	}
-	q := strings.ToLower(strings.TrimSpace(signals.Query))
-	if strings.Contains(q, "already") ||
-		strings.Contains(q, "earlier") ||
-		strings.Contains(q, "before") ||
-		strings.Contains(q, "as i said") ||
-		strings.Contains(q, "as i mentioned") {
+	normalizedQuery, _ := normalizeIntentQuery(signals.Query)
+	if containsAnyIntentPhrase(normalizedQuery, []string{"already", "earlier", "before", "as i said", "as i mentioned"}) {
 		shift := minInt(384, b.MemoryTokens/3)
 		b.ThreadTokens += shift
 		b.MemoryTokens -= shift

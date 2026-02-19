@@ -7,7 +7,6 @@ DotAgent is a lean, Discord-first AI agent runtime focused on extensibility thro
 - [Installation](getting-started/installation.md)
 - [Quickstart](getting-started/quickstart.md)
 - [Provider/Auth Guide](guides/provider-auth.md)
-- [Tool Policy Modes](guides/tool-policy.md)
 
 ## Operational Guides
 

@@ -4,23 +4,22 @@
 
 Remove an installed skill
 
-```
+```text
 dotagent skills remove <skill> [flags]
 ```
 
 ### Examples
 
-```
+```text
   dotagent skills remove weather
 ```
 
 ### Options
 
-```
+```text
   -h, --help   help for remove
 ```
 
 ### SEE ALSO
 
-* [dotagent skills](dotagent_skills.md)	 - Install, remove, search, and inspect skills
-
+* [dotagent skills](dotagent_skills.md)   - Install, remove, search, and inspect skills

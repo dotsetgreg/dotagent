@@ -49,16 +49,6 @@
         "enabled": true,
         "max_results": 5
       }
-    },
-    "policy": {
-      "default_mode": "auto",
-      "allow": [],
-      "deny": [],
-      "provider_modes": {
-        "openrouter": "auto",
-        "openai": "auto",
-        "openai-codex": "auto"
-      }
     }
   },
   "memory": {

@@ -279,18 +279,11 @@ func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Eve
 				add(&facts, fact)
 			}
 		}
-		lower := strings.ToLower(content)
-		if strings.Contains(lower, "need to") ||
-			strings.Contains(lower, "todo") ||
-			strings.Contains(lower, "deadline") ||
-			strings.Contains(lower, "remind me") {
+		normalizedContent, _ := normalizeIntentQuery(content)
+		if containsAnyIntentPhrase(normalizedContent, []string{"need to", "todo", "deadline", "remind me"}) {
 			add(&tasks, content)
 		}
-		if strings.Contains(lower, "can't") ||
-			strings.Contains(lower, "cannot") ||
-			strings.Contains(lower, "must") ||
-			strings.Contains(lower, "requirement") ||
-			strings.Contains(lower, "constraint") {
+		if containsAnyIntentPhrase(normalizedContent, []string{"can't", "cannot", "must", "requirement", "constraint"}) {
 			add(&constraints, content)
 		}
 		if strings.Contains(content, "?") && len(openLoops) < 8 {

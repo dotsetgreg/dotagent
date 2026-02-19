@@ -21,15 +21,8 @@ Generated from runtime tool registration and tool descriptions.
 | `web_search` | Search the web for current information. Returns titles, URLs, and snippets from search results. |
 | `write_file` | Write content to a file |
 
-## Tool Policy Modes
-
-| Mode | Behavior |
-| --- | --- |
-| `auto` | Chooses `workspace_ops` for workspace/system intent, otherwise `conversation`. |
-| `conversation` | Restricts to conversational-safe tools (default web tools unless overridden by allow/deny). |
-| `workspace_ops` | Enables local workspace/system tooling (still subject to deny rules and protected state-path checks). |
-
 ## Notes
 
-- `agents.defaults.restrict_to_workspace` controls shell/path guard strictness inside command tools.
-- `tools.policy.*` controls per-turn tool exposure and per-provider defaults.
+- `agents.defaults.restrict_to_workspace=true` enables stricter shell/filesystem guards.
+- In restricted mode, `exec` blocks shell control operators (`&&`, `|`, redirects), path traversal (`../`), and absolute paths outside the current working directory.
+- For repo clone workflows in restricted mode, set `working_dir` to the workspace root and use relative destination paths.

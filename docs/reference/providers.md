@@ -54,4 +54,3 @@ ChatGPT/Codex OAuth provider for Codex backend routing.
 | `providers.openai_codex.oauth_access_token` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_ACCESS_TOKEN` | `-` |
 | `providers.openai_codex.oauth_token_file` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE` | `-` |
 | `providers.openai_codex.proxy` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY` | `-` |
-

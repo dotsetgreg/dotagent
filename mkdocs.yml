@@ -30,7 +30,6 @@ nav:
     - Quickstart: getting-started/quickstart.md
   - Guides:
     - Provider and Auth: guides/provider-auth.md
-    - Tool Policy Modes: guides/tool-policy.md
     - Docker Operations: guides/docker-operations.md
     - Troubleshooting: guides/troubleshooting.md
   - Architecture:

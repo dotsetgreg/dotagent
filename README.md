@@ -137,7 +137,6 @@ Operational safeguards:
 - Sensitive-content filtering before durable memory writes
 - Durable audit log (`memory_audit_log`) for memory upserts/deletes
 - Retention sweeps for archived events, expired/deleted memory, cache, and audit records
-- Turn-level tool governance: conversational turns do not expose local filesystem/shell tools, and runtime state paths (`workspace/state/*`) are blocked from tool-based continuity introspection
 - Runtime process/session tools:
   - `process` for long-running command lifecycle control (`start/list/poll/write/kill/clear`)
   - `session` for cross-session inspection and targeted send/spawn flows
@@ -212,10 +211,6 @@ dotagent cron
 dotagent skills
 dotagent toolpacks
 dotagent version
-# Tool policy controls in chat:
-/tools
-/tools mode conversation
-/tools mode workspace_ops
 # In-chat persona diagnostics:
 /persona show
 /persona revisions

@@ -8,20 +8,20 @@ Add a scheduled job
 
 Add a recurring job with either --every (seconds) or --cron expression.
 
-```
+```text
 dotagent cron add [flags]
 ```
 
 ### Examples
 
-```
+```text
   dotagent cron add --name backup --message "run backup" --every 3600
   dotagent cron add --name digest --message "send daily digest" --cron '0 9 * * *' --deliver --channel discord --to 1234
 ```
 
 ### Options
 
-```
+```text
       --channel string   Channel name for delivery
   -c, --cron string      Cron expression (e.g. '0 9 * * *')
   -d, --deliver          Deliver result back to a channel target
@@ -34,5 +34,4 @@ dotagent cron add [flags]
 
 ### SEE ALSO
 
-* [dotagent cron](dotagent_cron.md)	 - Manage scheduled jobs
-
+* [dotagent cron](dotagent_cron.md)   - Manage scheduled jobs

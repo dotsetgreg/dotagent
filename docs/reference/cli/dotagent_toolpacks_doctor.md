@@ -4,23 +4,22 @@
 
 Run connector health checks
 
-```
+```text
 dotagent toolpacks doctor [id] [flags]
 ```
 
 ### Examples
 
-```
+```text
   dotagent toolpacks doctor github-cli
 ```
 
 ### Options
 
-```
+```text
   -h, --help   help for doctor
 ```
 
 ### SEE ALSO
 
-* [dotagent toolpacks](dotagent_toolpacks.md)	 - Manage executable tool packs
-
+* [dotagent toolpacks](dotagent_toolpacks.md)   - Manage executable tool packs

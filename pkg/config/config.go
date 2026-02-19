@@ -132,16 +132,8 @@ type WebToolsConfig struct {
 	DuckDuckGo DuckDuckGoConfig `json:"duckduckgo"`
 }
 
-type ToolPolicyConfig struct {
-	DefaultMode   string            `json:"default_mode" env:"DOTAGENT_TOOLS_POLICY_DEFAULT_MODE"`
-	Allow         []string          `json:"allow"`
-	Deny          []string          `json:"deny"`
-	ProviderModes map[string]string `json:"provider_modes"`
-}
-
 type ToolsConfig struct {
-	Web    WebToolsConfig   `json:"web"`
-	Policy ToolPolicyConfig `json:"policy"`
+	Web WebToolsConfig `json:"web"`
 }
 
 type MemoryConfig struct {
@@ -197,16 +189,6 @@ func DefaultConfig() *Config {
 				DuckDuckGo: DuckDuckGoConfig{
 					Enabled:    true,
 					MaxResults: 5,
-				},
-			},
-			Policy: ToolPolicyConfig{
-				DefaultMode: "auto",
-				Allow:       []string{},
-				Deny:        []string{},
-				ProviderModes: map[string]string{
-					"openrouter":   "auto",
-					"openai":       "auto",
-					"openai-codex": "auto",
 				},
 			},
 		},

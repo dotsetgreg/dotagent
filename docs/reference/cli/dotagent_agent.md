@@ -8,13 +8,13 @@ Run direct local chat with the agent (CLI mode)
 
 Run an interactive local agent session or send one-shot messages without Discord.
 
-```
+```text
 dotagent agent [flags]
 ```
 
 ### Examples
 
-```
+```text
   dotagent agent
   dotagent agent --session cli:workspace
   dotagent agent --message "summarize my TODOs"
@@ -22,7 +22,7 @@ dotagent agent [flags]
 
 ### Options
 
-```
+```text
   -d, --debug            Enable debug logging
   -h, --help             help for agent
   -m, --message string   One-shot prompt to send to the agent
@@ -31,5 +31,4 @@ dotagent agent [flags]
 
 ### SEE ALSO
 
-* [dotagent](dotagent.md)	 - Personal AI agent with Discord gateway, tools, memory, and provider routing
-
+* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing

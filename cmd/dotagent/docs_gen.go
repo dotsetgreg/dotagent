@@ -102,6 +102,9 @@ func writeGeneratedReferences(rootFactory func() *cobra.Command, outDir string) 
 	if err := cobraDoc.GenMarkdownTreeCustom(cliRoot, cliDir, prepender, linkHandler); err != nil {
 		return nil, fmt.Errorf("generate cli markdown docs: %w", err)
 	}
+	if err := normalizeGeneratedMarkdownDir(cliDir); err != nil {
+		return nil, fmt.Errorf("normalize cli markdown docs: %w", err)
+	}
 
 	manDir := filepath.Join(outDir, "reference", "man")
 	if err := os.MkdirAll(manDir, 0o755); err != nil {
@@ -138,6 +141,9 @@ func writeGeneratedReferences(rootFactory func() *cobra.Command, outDir string) 
 	}
 	if err := writeTextFile(filepath.Join(outDir, "reference", "tools.md"), toolsRef); err != nil {
 		return nil, err
+	}
+	if err := normalizeGeneratedMarkdownDir(filepath.Join(outDir, "reference")); err != nil {
+		return nil, fmt.Errorf("normalize reference markdown docs: %w", err)
 	}
 
 	return []string{
@@ -298,6 +304,79 @@ func listFiles(root string) ([]string, error) {
 	}
 	sort.Strings(files)
 	return files, nil
+}
+
+func normalizeGeneratedMarkdownDir(root string) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || filepath.Ext(path) != ".md" {
+			return nil
+		}
+
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		normalized, err := normalizeGeneratedMarkdownContent(string(raw))
+		if err != nil {
+			return fmt.Errorf("normalize %s: %w", path, err)
+		}
+		if string(raw) == normalized {
+			return nil
+		}
+		return os.WriteFile(path, []byte(normalized), 0o644)
+	})
+}
+
+func normalizeGeneratedMarkdownContent(content string) (string, error) {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\t", "  ")
+	lines := strings.Split(content, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	out := make([]string, 0, len(lines))
+	blankRun := 0
+	inFence := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			if !inFence {
+				if line == "```" {
+					line = "```text"
+				}
+				inFence = true
+			} else {
+				inFence = false
+			}
+			blankRun = 0
+			out = append(out, line)
+			continue
+		}
+
+		if strings.TrimSpace(line) == "" {
+			blankRun++
+			if blankRun > 1 {
+				continue
+			}
+			out = append(out, "")
+			continue
+		}
+		blankRun = 0
+		out = append(out, line)
+	}
+
+	if inFence {
+		return "", fmt.Errorf("unclosed code fence")
+	}
+
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+	return strings.Join(out, "\n") + "\n", nil
 }
 
 type configFieldRow struct {
@@ -598,16 +677,10 @@ func buildToolsReferenceMarkdown() (string, error) {
 		b.WriteString("| `" + escapePipes(name) + "` | " + escapePipes(toolRows[name]) + " |\n")
 	}
 
-	b.WriteString("\n## Tool Policy Modes\n\n")
-	b.WriteString("| Mode | Behavior |\n")
-	b.WriteString("| --- | --- |\n")
-	b.WriteString("| `auto` | Chooses `workspace_ops` for workspace/system intent, otherwise `conversation`. |\n")
-	b.WriteString("| `conversation` | Restricts to conversational-safe tools (default web tools unless overridden by allow/deny). |\n")
-	b.WriteString("| `workspace_ops` | Enables local workspace/system tooling (still subject to deny rules and protected state-path checks). |\n")
-
 	b.WriteString("\n## Notes\n\n")
-	b.WriteString("- `agents.defaults.restrict_to_workspace` controls shell/path guard strictness inside command tools.\n")
-	b.WriteString("- `tools.policy.*` controls per-turn tool exposure and per-provider defaults.\n")
+	b.WriteString("- `agents.defaults.restrict_to_workspace=true` enables stricter shell/filesystem guards.\n")
+	b.WriteString("- In restricted mode, `exec` blocks shell control operators (`&&`, `|`, redirects), path traversal (`../`), and absolute paths outside the current working directory.\n")
+	b.WriteString("- For repo clone workflows in restricted mode, set `working_dir` to the workspace root and use relative destination paths.\n")
 
 	return b.String(), nil
 }

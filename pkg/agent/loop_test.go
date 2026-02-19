@@ -648,6 +648,28 @@ func (m *statefulCaptureProvider) GetDefaultModel() string {
 	return "mock-stateful"
 }
 
+type toolDefinitionCaptureProvider struct {
+	firstCallTools []string
+	calls          int
+}
+
+func (m *toolDefinitionCaptureProvider) Chat(ctx context.Context, messages []providers.Message, tools []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		for _, td := range tools {
+			m.firstCallTools = append(m.firstCallTools, td.Function.Name)
+		}
+	}
+	return &providers.LLMResponse{
+		Content:   "ok",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *toolDefinitionCaptureProvider) GetDefaultModel() string {
+	return "mock-tool-def-capture"
+}
+
 // TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -821,7 +843,7 @@ func TestAgentLoop_DerivesSessionKeyFromChannelContext(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_ToolsModeCommandUsesCanonicalSessionKey(t *testing.T) {
+func TestAgentLoop_AlwaysExposesLocalTools(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{
 		Agents: config.AgentsConfig{
@@ -832,56 +854,26 @@ func TestAgentLoop_ToolsModeCommandUsesCanonicalSessionKey(t *testing.T) {
 				MaxToolIterations: 10,
 			},
 		},
-		Tools: config.ToolsConfig{
-			Policy: config.ToolPolicyConfig{
-				DefaultMode: "conversation",
-			},
-		},
 	}
 	msgBus := bus.NewMessageBus()
-	provider := &mockProvider{}
+	provider := &toolDefinitionCaptureProvider{}
 	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
-	legacySessionKey := "discord:1473162646134980752"
-	channel := "discord"
-	chatID := "1473162646134980752"
-
-	resp, err := al.ProcessDirectWithChannel(context.Background(), "/tools mode workspace_ops", legacySessionKey, channel, chatID)
-	if err != nil {
-		t.Fatalf("tools mode command failed: %v", err)
+	if _, err := al.ProcessDirectWithChannel(context.Background(), "What do you remember about me?", "", "discord", "chat-tools"); err != nil {
+		t.Fatalf("process failed: %v", err)
 	}
-	if !strings.Contains(resp, "Set tools mode to workspace_ops") {
-		t.Fatalf("unexpected mode response: %s", resp)
+	if provider.calls == 0 {
+		t.Fatalf("expected provider to be called")
 	}
 
-	canonicalSessionKey, err := resolveSessionKey(legacySessionKey, al.workspaceID, channel, chatID, "local-user")
-	if err != nil {
-		t.Fatalf("resolve canonical session key: %v", err)
+	seen := map[string]struct{}{}
+	for _, name := range provider.firstCallTools {
+		seen[name] = struct{}{}
 	}
-	if canonicalSessionKey == legacySessionKey {
-		t.Fatalf("expected canonical session key to differ from legacy key")
-	}
-
-	if _, ok := al.toolPolicy.SessionMode(legacySessionKey); ok {
-		t.Fatalf("expected no override stored under legacy session key")
-	}
-	mode, ok := al.toolPolicy.SessionMode(canonicalSessionKey)
-	if !ok {
-		t.Fatalf("expected override stored under canonical session key")
-	}
-	if mode != turnToolModeWorkspaceOps {
-		t.Fatalf("expected workspace_ops override, got %s", mode)
-	}
-
-	statusResp, err := al.ProcessDirectWithChannel(context.Background(), "/tools status", legacySessionKey, channel, chatID)
-	if err != nil {
-		t.Fatalf("tools status command failed: %v", err)
-	}
-	if !strings.Contains(statusResp, "Session: "+canonicalSessionKey) {
-		t.Fatalf("expected status to report canonical session key, got: %s", statusResp)
-	}
-	if !strings.Contains(statusResp, "Mode: workspace_ops") {
-		t.Fatalf("expected workspace_ops mode in status, got: %s", statusResp)
+	for _, required := range []string{"exec", "read_file", "list_dir", "web_fetch"} {
+		if _, ok := seen[required]; !ok {
+			t.Fatalf("expected tool %q to be available, got tools=%v", required, provider.firstCallTools)
+		}
 	}
 }
 
