@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,6 +51,14 @@ func TestSQLiteStore_EventPersistence(t *testing.T) {
 	}
 	if events[0].Content != "hello" || events[1].Content != "world" {
 		t.Fatalf("unexpected event contents: %#v", events)
+	}
+
+	turnEvents, err := store2.ListEventsByTurn(ctx, sessionKey, "t1", 10)
+	if err != nil {
+		t.Fatalf("list events by turn: %v", err)
+	}
+	if len(turnEvents) != 2 {
+		t.Fatalf("expected 2 turn events, got %d", len(turnEvents))
 	}
 }
 
@@ -232,7 +239,7 @@ func TestBuildPromptContext_DegradesGracefullyOnRecallFailure(t *testing.T) {
 	}
 }
 
-func TestBuildPromptContext_FailClosedWhenContinuityUnavailable(t *testing.T) {
+func TestBuildPromptContext_DegradesWhenContinuityUnavailable(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -277,9 +284,25 @@ func TestBuildPromptContext_FailClosedWhenContinuityUnavailable(t *testing.T) {
 	}
 	defer svc2.Close()
 
-	_, err = svc2.BuildPromptContext(ctx, sessionKey, userID, "you already know this, what coffee did I say?", 2048)
-	if !errors.Is(err, ErrContinuityUnavailable) {
-		t.Fatalf("expected ErrContinuityUnavailable, got %v", err)
+	pc, err := svc2.BuildPromptContext(ctx, sessionKey, userID, "you already know this, what coffee did I say?", 2048)
+	if err != nil {
+		t.Fatalf("expected graceful degraded context, got error: %v", err)
+	}
+	if !pc.Continuity.Degraded {
+		t.Fatalf("expected degraded continuity when durable artifacts are unavailable")
+	}
+	if pc.Continuity.HasHistory || pc.Continuity.HasSummary || pc.Continuity.HasRecall {
+		t.Fatalf("expected no continuity artifacts in degraded case: %+v", pc.Continuity)
+	}
+	foundReason := false
+	for _, reason := range pc.Continuity.DegradedBy {
+		if reason == "no_continuity_artifacts" {
+			foundReason = true
+			break
+		}
+	}
+	if !foundReason {
+		t.Fatalf("expected degraded reason to include no_continuity_artifacts, got %v", pc.Continuity.DegradedBy)
 	}
 }
 
@@ -450,6 +473,25 @@ func TestCompactor_WritesStructuredSnapshot(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("append event %d: %v", i, err)
 		}
+	}
+	now := time.Now().UnixMilli()
+	if _, err := store.UpsertMemoryItem(ctx, MemoryItem{
+		ID:            "mem-test-pref",
+		UserID:        "u1",
+		AgentID:       "dotagent",
+		ScopeType:     MemoryScopeUser,
+		ScopeID:       "u1",
+		SessionKey:    sessionKey,
+		Kind:          MemoryUserPreference,
+		Key:           "preference/coffee",
+		Content:       "I really prefer pour-over coffee.",
+		Confidence:    0.92,
+		Weight:        1.0,
+		SourceEventID: "evt-seed-pref",
+		FirstSeenAtMS: now,
+		LastSeenAtMS:  now,
+	}); err != nil {
+		t.Fatalf("seed preference memory item: %v", err)
 	}
 	comp := NewSessionCompactor(store, nil)
 	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(1024)); err != nil {

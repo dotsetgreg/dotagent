@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,11 @@ type droppedCounters struct {
 
 const publishTimeout = 100 * time.Millisecond
 
+var (
+	ErrBusClosed      = errors.New("message bus is closed")
+	ErrPublishDropped = errors.New("message bus publish dropped after timeout")
+)
+
 func NewMessageBus() *MessageBus {
 	return &MessageBus{
 		inbound:  make(chan InboundMessage, 100),
@@ -31,22 +37,25 @@ func NewMessageBus() *MessageBus {
 	}
 }
 
-func (mb *MessageBus) PublishInbound(msg InboundMessage) {
+func (mb *MessageBus) PublishInbound(msg InboundMessage) error {
 	mb.mu.RLock()
 	defer mb.mu.RUnlock()
 	if mb.closed {
-		return
+		return ErrBusClosed
 	}
 
 	select {
 	case mb.inbound <- msg:
+		return nil
 	default:
 		timer := time.NewTimer(publishTimeout)
 		defer timer.Stop()
 		select {
 		case mb.inbound <- msg:
+			return nil
 		case <-timer.C:
 			mb.dropped.inbound.Add(1)
+			return ErrPublishDropped
 		}
 	}
 }
@@ -63,22 +72,25 @@ func (mb *MessageBus) ConsumeInbound(ctx context.Context) (InboundMessage, bool)
 	}
 }
 
-func (mb *MessageBus) PublishOutbound(msg OutboundMessage) {
+func (mb *MessageBus) PublishOutbound(msg OutboundMessage) error {
 	mb.mu.RLock()
 	defer mb.mu.RUnlock()
 	if mb.closed {
-		return
+		return ErrBusClosed
 	}
 
 	select {
 	case mb.outbound <- msg:
+		return nil
 	default:
 		timer := time.NewTimer(publishTimeout)
 		defer timer.Stop()
 		select {
 		case mb.outbound <- msg:
+			return nil
 		case <-timer.C:
 			mb.dropped.outbound.Add(1)
+			return ErrPublishDropped
 		}
 	}
 }

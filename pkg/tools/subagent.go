@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 )
 
@@ -22,27 +24,29 @@ type SubagentTask struct {
 }
 
 type SubagentManager struct {
-	tasks         map[string]*SubagentTask
-	mu            sync.RWMutex
-	provider      providers.LLMProvider
-	defaultModel  string
-	bus           *bus.MessageBus
-	workspace     string
-	tools         *ToolRegistry
-	maxIterations int
-	nextID        int
+	tasks            map[string]*SubagentTask
+	mu               sync.RWMutex
+	provider         providers.LLMProvider
+	defaultModel     string
+	bus              *bus.MessageBus
+	workspace        string
+	workspaceContext string
+	tools            *ToolRegistry
+	maxIterations    int
+	nextID           int
 }
 
 func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace string, bus *bus.MessageBus) *SubagentManager {
 	return &SubagentManager{
-		tasks:         make(map[string]*SubagentTask),
-		provider:      provider,
-		defaultModel:  defaultModel,
-		bus:           bus,
-		workspace:     workspace,
-		tools:         NewToolRegistry(),
-		maxIterations: 10,
-		nextID:        1,
+		tasks:            make(map[string]*SubagentTask),
+		provider:         provider,
+		defaultModel:     defaultModel,
+		bus:              bus,
+		workspace:        workspace,
+		workspaceContext: strings.TrimSpace(workspace),
+		tools:            NewToolRegistry(),
+		maxIterations:    10,
+		nextID:           1,
 	}
 }
 
@@ -61,9 +65,29 @@ func (sm *SubagentManager) RegisterTool(tool Tool) {
 	sm.tools.Register(tool)
 }
 
+// SetWorkspaceContext injects workspace/tools context into subagent prompts.
+func (sm *SubagentManager) SetWorkspaceContext(workspaceContext string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.workspaceContext = strings.TrimSpace(workspaceContext)
+}
+
+// pruneCompleted removes completed/failed/cancelled tasks older than 30 minutes.
+// Must be called while sm.mu write lock is held.
+func (sm *SubagentManager) pruneCompleted() {
+	cutoff := time.Now().Add(-30 * time.Minute).UnixMilli()
+	for id, task := range sm.tasks {
+		if task.Status != "running" && task.Created < cutoff {
+			delete(sm.tasks, id)
+		}
+	}
+}
+
 func (sm *SubagentManager) Spawn(ctx context.Context, task, label, originChannel, originChatID string, callback AsyncCallback) (string, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	sm.pruneCompleted()
 
 	taskID := fmt.Sprintf("subagent-%d", sm.nextID)
 	sm.nextID++
@@ -89,13 +113,14 @@ func (sm *SubagentManager) Spawn(ctx context.Context, task, label, originChannel
 }
 
 func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, callback AsyncCallback) {
+	sm.mu.Lock()
 	task.Status = "running"
 	task.Created = time.Now().UnixMilli()
+	workspaceContext := sm.workspaceContext
+	sm.mu.Unlock()
 
 	// Build system prompt for subagent
-	systemPrompt := `You are a subagent. Complete the given task independently and report the result.
-You have access to tools - use them as needed to complete your task.
-After completing the task, provide a clear summary of what was done.`
+	systemPrompt := buildSubagentSystemPrompt(workspaceContext)
 
 	messages := []providers.Message{
 		{
@@ -177,13 +202,19 @@ After completing the task, provide a clear summary of what was done.`
 	// Send announce message back to main agent
 	if sm.bus != nil {
 		announceContent := fmt.Sprintf("Task '%s' completed.\n\nResult:\n%s", task.Label, task.Result)
-		sm.bus.PublishInbound(bus.InboundMessage{
+		if err := sm.bus.PublishInbound(bus.InboundMessage{
 			Channel:  "system",
 			SenderID: fmt.Sprintf("subagent:%s", task.ID),
 			// Format: "original_channel:original_chat_id" for routing back
 			ChatID:  fmt.Sprintf("%s:%s", task.OriginChannel, task.OriginChatID),
 			Content: announceContent,
-		})
+		}); err != nil {
+			logger.WarnCF("subagent", "Failed to publish subagent completion",
+				map[string]interface{}{
+					"task_id": task.ID,
+					"error":   err.Error(),
+				})
+		}
 	}
 }
 
@@ -278,10 +309,13 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]interface{})
 	t.mu.RUnlock()
 
 	// Build messages for subagent
+	t.manager.mu.RLock()
+	workspaceContext := t.manager.workspaceContext
+	t.manager.mu.RUnlock()
 	messages := []providers.Message{
 		{
 			Role:    "system",
-			Content: "You are a subagent. Complete the given task independently and provide a clear, concise result.",
+			Content: buildSubagentSystemPrompt(workspaceContext),
 		},
 		{
 			Role:    "user",
@@ -333,4 +367,17 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]interface{})
 		IsError: false,
 		Async:   false,
 	}
+}
+
+func buildSubagentSystemPrompt(workspaceContext string) string {
+	base := []string{
+		"You are a subagent. Complete the given task independently and report the result.",
+		"You have access to tools - use them as needed to complete your task.",
+		"After completing the task, provide a clear summary of what was done.",
+	}
+	workspaceContext = strings.TrimSpace(workspaceContext)
+	if workspaceContext != "" {
+		base = append(base, "## Workspace Context\n"+workspaceContext)
+	}
+	return strings.Join(base, "\n\n")
 }

@@ -22,16 +22,9 @@ func NewHeuristicConsolidator(store Store, policy Policy) *HeuristicConsolidator
 }
 
 func (c *HeuristicConsolidator) ConsolidateTurn(ctx context.Context, sessionKey, turnID, userID, agentID string) error {
-	events, err := c.store.ListRecentEvents(ctx, sessionKey, 64, false)
+	turnEvents, err := c.store.ListEventsByTurn(ctx, sessionKey, turnID, 64)
 	if err != nil {
 		return err
-	}
-
-	turnEvents := make([]Event, 0, 8)
-	for _, ev := range events {
-		if ev.TurnID == turnID {
-			turnEvents = append(turnEvents, ev)
-		}
 	}
 	if len(turnEvents) == 0 {
 		return nil

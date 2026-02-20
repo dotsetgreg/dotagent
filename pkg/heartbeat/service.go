@@ -307,11 +307,14 @@ func (hs *HeartbeatService) sendResponse(response string) {
 		return
 	}
 
-	msgBus.PublishOutbound(bus.OutboundMessage{
+	if err := msgBus.PublishOutbound(bus.OutboundMessage{
 		Channel: platform,
 		ChatID:  userID,
 		Content: response,
-	})
+	}); err != nil {
+		hs.logError("Failed to publish heartbeat result: %v", err)
+		return
+	}
 
 	hs.logInfo("Heartbeat result sent to %s", platform)
 }

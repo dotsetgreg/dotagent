@@ -9,7 +9,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -94,12 +93,22 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 	// Subagent uses it to communicate directly with user
 	messageTool := tools.NewMessageTool()
 	messageTool.SetSendCallback(func(channel, chatID, content string) error {
-		msgBus.PublishOutbound(bus.OutboundMessage{
+		if msgBus == nil {
+			return fmt.Errorf("message bus not configured")
+		}
+		err := msgBus.PublishOutbound(bus.OutboundMessage{
 			Channel: channel,
 			ChatID:  chatID,
 			Content: content,
 		})
-		return nil
+		if err != nil {
+			logger.WarnCF("agent", "Message tool publish failed", map[string]interface{}{
+				"channel": channel,
+				"chat_id": chatID,
+				"error":   err.Error(),
+			})
+		}
+		return err
 	})
 	registry.Register(messageTool)
 
@@ -143,6 +152,10 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	// Create context builder and set tools registry
 	contextBuilder := NewContextBuilder(workspace)
 	contextBuilder.SetToolsRegistry(toolsRegistry)
+	subagentWorkspaceContext := strings.TrimSpace(contextBuilder.getIdentity())
+	if subagentWorkspaceContext != "" {
+		subagentManager.SetWorkspaceContext(subagentWorkspaceContext)
+	}
 
 	summarizeFn := func(ctx context.Context, existingSummary, transcript string) (string, error) {
 		prompt := "Update the durable conversation summary.\n" +
@@ -289,11 +302,11 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 			if response != "" {
 				if !roundState.MessageSent() {
-					al.bus.PublishOutbound(bus.OutboundMessage{
+					al.publishOutbound(bus.OutboundMessage{
 						Channel: msg.Channel,
 						ChatID:  msg.ChatID,
 						Content: response,
-					})
+					}, "run_loop_response")
 				}
 			}
 		}
@@ -540,21 +553,19 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	var history []providers.Message
 	var summary string
 	var recall string
+	continuityNote := ""
 	if !opts.NoHistory {
 		promptCtx, err := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
 		if err != nil {
-			if errors.Is(err, memory.ErrContinuityUnavailable) {
-				_ = al.memory.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
-					"session_key": opts.SessionKey,
-					"user_id":     opts.UserID,
-				})
-				return "I can’t safely continue this thread right now because prior context is temporarily unavailable. Please retry in a moment.", nil
-			}
 			logger.WarnCF("agent", "Failed to build memory prompt context", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
 		} else {
 			history = toProviderMessages(promptCtx.History)
 			summary = promptCtx.Summary
 			recall = promptCtx.RecallPrompt
+			hasContinuityArtifacts := promptCtx.Continuity.HasHistory || promptCtx.Continuity.HasSummary || promptCtx.Continuity.HasRecall
+			if promptCtx.Continuity.Degraded && promptCtx.Continuity.HasPriorTurns && !hasContinuityArtifacts {
+				continuityNote = buildDegradedContinuitySystemNote(promptCtx.Continuity.DegradedBy)
+			}
 		}
 	}
 	currentUserPrompt := opts.UserMessage
@@ -571,12 +582,16 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		opts.Channel,
 		opts.ChatID,
 	)
-	if note := buildPersonaDecisionSystemNote(syncPersonaReport); note != "" {
-		messages = injectSystemNote(messages, note)
+	personaNote := buildPersonaDecisionSystemNote(syncPersonaReport)
+	if continuityNote != "" {
+		messages = injectSystemNote(messages, continuityNote)
+	}
+	if personaNote != "" {
+		messages = injectSystemNote(messages, personaNote)
 	}
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt)
+	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt, personaNote, continuityNote)
 	if err != nil {
 		return "", err
 	}
@@ -618,11 +633,11 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 	// 7. Optional: send response via bus
 	if opts.SendResponse {
-		al.bus.PublishOutbound(bus.OutboundMessage{
+		al.publishOutbound(bus.OutboundMessage{
 			Channel: opts.Channel,
 			ChatID:  opts.ChatID,
 			Content: finalContent,
-		})
+		}, "final_response")
 	}
 
 	// 8. Log response
@@ -639,10 +654,11 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 // runLLMIteration executes the LLM call loop with tool handling.
 // Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt string) (string, int, error) {
+func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt, personaNote, continuityNote string) (string, int, error) {
 	iteration := 0
-	var finalContent string
+	finalContent := ""
 	toolCallSignatures := map[string]int{}
+	toolNameCounts := map[string]int{}
 	providerStateID := ""
 	if !opts.NoHistory {
 		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey, al.providerName); err == nil {
@@ -652,132 +668,30 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 	for iteration < al.maxIterations {
 		iteration++
+		logger.DebugCF("agent", "LLM iteration", map[string]interface{}{
+			"iteration": iteration,
+			"max":       al.maxIterations,
+		})
 
-		logger.DebugCF("agent", "LLM iteration",
-			map[string]interface{}{
-				"iteration": iteration,
-				"max":       al.maxIterations,
-			})
-
-		// Build tool definitions
-		providerToolDefs := al.tools.ToProviderDefs()
-
-		// Log LLM request details
-		systemPromptLen := 0
-		if len(messages) > 0 {
-			systemPromptLen = len(messages[0].Content)
-		}
-		logger.DebugCF("agent", "LLM request",
-			map[string]interface{}{
-				"iteration":         iteration,
-				"model":             al.model,
-				"messages_count":    len(messages),
-				"tools_count":       len(providerToolDefs),
-				"max_tokens":        al.completionMax,
-				"temperature":       al.temperature,
-				"system_prompt_len": systemPromptLen,
-			})
-
-		// Log full messages (detailed)
-		logger.DebugCF("agent", "Full LLM request",
-			map[string]interface{}{
-				"iteration":     iteration,
-				"messages_json": formatMessagesForLog(messages),
-				"tools_json":    formatToolsForLog(providerToolDefs),
-			})
-
-		var response *providers.LLMResponse
-		var err error
-
-		// Retry loop for context/token errors
-		maxRetries := 2
-		for retry := 0; retry <= maxRetries; retry++ {
-			callOpts := map[string]interface{}{
-				"max_tokens":  al.completionMax,
-				"temperature": al.temperature,
-			}
-			if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
-				var newState string
-				response, newState, err = stateful.ChatWithState(ctx, providerStateID, messages, providerToolDefs, al.model, callOpts)
-				if err == nil {
-					newState = strings.TrimSpace(newState)
-					if newState != "" && newState != providerStateID {
-						providerStateID = newState
-						_ = al.memory.SetProviderState(ctx, opts.SessionKey, al.providerName, newState)
-					}
-				}
-			} else {
-				response, err = al.provider.Chat(ctx, messages, providerToolDefs, al.model, callOpts)
-			}
-
-			if err == nil {
-				break // Success
-			}
-
-			errMsg := strings.ToLower(err.Error())
-			// Check for context window errors (provider specific, but usually contain "token" or "invalid")
-			isContextError := strings.Contains(errMsg, "token") ||
-				strings.Contains(errMsg, "context") ||
-				strings.Contains(errMsg, "invalidparameter") ||
-				strings.Contains(errMsg, "length")
-
-			if isContextError && retry < maxRetries {
-				logger.WarnCF("agent", "Context window error detected, attempting compression", map[string]interface{}{
-					"error": err.Error(),
-					"retry": retry,
-				})
-
-				// Notify user on first retry only
-				if retry == 0 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
-					al.bus.PublishOutbound(bus.OutboundMessage{
-						Channel: opts.Channel,
-						ChatID:  opts.ChatID,
-						Content: "⚠️ Context window exceeded. Compacting memory and retrying...",
-					})
-				}
-
-				if err := al.memory.ForceCompact(ctx, opts.SessionKey, opts.UserID, al.contextWindow); err != nil {
-					logger.WarnCF("agent", "Memory force compaction failed", map[string]interface{}{"error": err.Error(), "session_key": opts.SessionKey})
-				}
-				rebuilt, bErr := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
-				if bErr != nil {
-					logger.WarnCF("agent", "Failed rebuilding prompt context after compaction", map[string]interface{}{"error": bErr.Error()})
-				} else {
-					messages = al.contextBuilder.BuildMessages(
-						toProviderMessages(rebuilt.History),
-						rebuilt.Summary,
-						rebuilt.RecallPrompt,
-						currentUserPrompt,
-						nil,
-						opts.Channel,
-						opts.ChatID,
-					)
-				}
-
-				continue
-			}
-
-			// Real error or success, break loop
-			break
-		}
-
+		response, rebuiltMessages, err := al.callLLMWithRetry(ctx, messages, opts, currentUserPrompt, personaNote, continuityNote, &providerStateID, iteration)
+		messages = rebuiltMessages
 		if err != nil {
-			logger.ErrorCF("agent", "LLM call failed",
-				map[string]interface{}{
-					"iteration": iteration,
-					"error":     err.Error(),
-				})
+			logger.ErrorCF("agent", "LLM call failed", map[string]interface{}{
+				"iteration": iteration,
+				"error":     err.Error(),
+			})
 			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
+		if response == nil {
+			return "", iteration, fmt.Errorf("LLM provider returned nil response")
+		}
 
-		// Check if no tool calls - we're done
 		if len(response.ToolCalls) == 0 {
 			finalContent = strings.TrimSpace(response.Content)
-			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
-				map[string]interface{}{
-					"iteration":     iteration,
-					"content_chars": len(finalContent),
-				})
+			logger.InfoCF("agent", "LLM response without tool calls (direct answer)", map[string]interface{}{
+				"iteration":     iteration,
+				"content_chars": len(finalContent),
+			})
 			break
 		}
 
@@ -794,6 +708,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
 						"session_key": opts.SessionKey,
 						"user_id":     opts.UserID,
+						"reason":      "signature_repeat",
 					})
 				}
 				finalContent = "I’m stopping tool execution because I detected a repeated tool-call loop. If you still want this action, restate it with a narrower scope."
@@ -801,141 +716,44 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			}
 		}
 
-		// Log tool calls
-		toolNames := make([]string, 0, len(response.ToolCalls))
+		driftLoopDetected := false
+		driftToolName := ""
+		driftCount := 0
 		for _, tc := range response.ToolCalls {
-			toolNames = append(toolNames, tc.Name)
+			name := strings.TrimSpace(tc.Name)
+			if name == "" {
+				name = "(unknown)"
+			}
+			toolNameCounts[name]++
+			if toolNameCounts[name] >= 5 {
+				driftLoopDetected = true
+				driftToolName = name
+				driftCount = toolNameCounts[name]
+				break
+			}
 		}
-		logger.InfoCF("agent", "LLM requested tool calls",
-			map[string]interface{}{
-				"tools":     toolNames,
-				"count":     len(response.ToolCalls),
+		if driftLoopDetected {
+			logger.WarnCF("agent", "Tool drift loop detected; tripping circuit breaker", map[string]interface{}{
+				"tool":      driftToolName,
+				"count":     driftCount,
 				"iteration": iteration,
 			})
-
-		// Build assistant message with tool calls
-		assistantMsg := providers.Message{
-			Role:    "assistant",
-			Content: response.Content,
-		}
-		for _, tc := range response.ToolCalls {
-			argumentsJSON, _ := json.Marshal(tc.Arguments)
-			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
-				ID:   tc.ID,
-				Type: "function",
-				Function: &providers.FunctionCall{
-					Name:      tc.Name,
-					Arguments: string(argumentsJSON),
-				},
-			})
-		}
-		messages = append(messages, assistantMsg)
-
-		if !opts.NoHistory {
-			if err := al.memory.AppendEvent(ctx, memory.Event{
-				ID:         "evt-" + uuid.NewString(),
-				SessionKey: opts.SessionKey,
-				TurnID:     turnID,
-				Seq:        *seq,
-				Role:       "assistant",
-				Content:    response.Content,
-				Metadata: map[string]string{
-					"channel":         opts.Channel,
-					"chat_id":         opts.ChatID,
-					"user_id":         opts.UserID,
-					"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
-				},
-			}); err != nil {
-				logger.ErrorCF("agent", "Failed to append assistant tool-call event", map[string]interface{}{
-					"error":       err.Error(),
-					"session_key": opts.SessionKey,
-					"turn_id":     turnID,
-				})
-			}
-			*seq = *seq + 1
-		}
-
-		// Execute tool calls
-		for _, tc := range response.ToolCalls {
-			// Log tool call with arguments preview
-			argsJSON, _ := json.Marshal(tc.Arguments)
-			argsPreview := utils.Truncate(string(argsJSON), 200)
-			logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview),
-				map[string]interface{}{
-					"tool":      tc.Name,
-					"iteration": iteration,
-				})
-
-			// Create async callback for tools that implement AsyncTool.
-			// Async tools do not send directly to users. They notify the agent via
-			// PublishInbound, and processSystemMessage decides whether to forward output.
-			asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
-				// Log the async completion but don't send directly to user
-				// The agent will handle user notification via processSystemMessage
-				if !result.Silent && result.ForUser != "" {
-					logger.InfoCF("agent", "Async tool completed, agent will handle notification",
-						map[string]interface{}{
-							"tool":        tc.Name,
-							"content_len": len(result.ForUser),
-						})
-				}
-			}
-
-			var toolResult *tools.ToolResult
-			toolResult = al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
-
-			// Send ForUser content to user immediately if not Silent
-			if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
-				al.bus.PublishOutbound(bus.OutboundMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Content: toolResult.ForUser,
-				})
-				logger.DebugCF("agent", "Sent tool result to user",
-					map[string]interface{}{
-						"tool":        tc.Name,
-						"content_len": len(toolResult.ForUser),
-					})
-			}
-
-			// Determine content for LLM based on tool result
-			contentForLLM := toolResult.ForLLM
-			if contentForLLM == "" && toolResult.Err != nil {
-				contentForLLM = toolResult.Err.Error()
-			}
-
-			toolResultMsg := providers.Message{
-				Role:       "tool",
-				Content:    contentForLLM,
-				ToolCallID: tc.ID,
-			}
-			messages = append(messages, toolResultMsg)
-
 			if !opts.NoHistory {
-				if err := al.memory.AppendEvent(ctx, memory.Event{
-					ID:         "evt-" + uuid.NewString(),
-					SessionKey: opts.SessionKey,
-					TurnID:     turnID,
-					Seq:        *seq,
-					Role:       "tool",
-					Content:    contentForLLM,
-					ToolCallID: tc.ID,
-					ToolName:   tc.Name,
-					Metadata: map[string]string{
-						"channel": opts.Channel,
-						"chat_id": opts.ChatID,
-						"user_id": opts.UserID,
-					},
-				}); err != nil {
-					logger.ErrorCF("agent", "Failed to append tool event", map[string]interface{}{
-						"error":       err.Error(),
-						"session_key": opts.SessionKey,
-						"turn_id":     turnID,
-						"tool_name":   tc.Name,
-					})
-				}
-				*seq = *seq + 1
+				_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
+					"session_key": opts.SessionKey,
+					"user_id":     opts.UserID,
+					"reason":      "tool_name_repeat",
+					"tool_name":   driftToolName,
+				})
 			}
+			finalContent = "I’m stopping tool execution because one tool kept being called repeatedly. If you still want this action, restate it with a narrower scope."
+			break
+		}
+
+		var execErr error
+		messages, execErr = al.executeToolCalls(ctx, response, messages, opts, turnID, seq, iteration)
+		if execErr != nil {
+			return "", iteration, execErr
 		}
 	}
 
@@ -943,6 +761,245 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		finalContent = fmt.Sprintf("I paused because I reached the maximum number of consecutive actions (%d) allowed in a single turn. Let me know if you would like me to continue.", al.maxIterations)
 	}
 	return finalContent, iteration, nil
+}
+
+func (al *AgentLoop) callLLMWithRetry(ctx context.Context, messages []providers.Message, opts processOptions, currentUserPrompt, personaNote, continuityNote string, providerStateID *string, iteration int) (*providers.LLMResponse, []providers.Message, error) {
+	providerToolDefs := al.tools.ToProviderDefs()
+	systemPromptLen := 0
+	if len(messages) > 0 {
+		systemPromptLen = len(messages[0].Content)
+	}
+	logger.DebugCF("agent", "LLM request", map[string]interface{}{
+		"iteration":         iteration,
+		"model":             al.model,
+		"messages_count":    len(messages),
+		"tools_count":       len(providerToolDefs),
+		"max_tokens":        al.completionMax,
+		"temperature":       al.temperature,
+		"system_prompt_len": systemPromptLen,
+	})
+	logger.DebugCF("agent", "Full LLM request", map[string]interface{}{
+		"iteration":     iteration,
+		"messages_json": formatMessagesForLog(messages),
+		"tools_json":    formatToolsForLog(providerToolDefs),
+	})
+
+	var (
+		response *providers.LLMResponse
+		err      error
+	)
+
+	maxRetries := 2
+	for retry := 0; retry <= maxRetries; retry++ {
+		callOpts := map[string]interface{}{
+			"max_tokens":  al.completionMax,
+			"temperature": al.temperature,
+		}
+
+		if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
+			stateID := strings.TrimSpace(*providerStateID)
+			var newState string
+			response, newState, err = stateful.ChatWithState(ctx, stateID, messages, providerToolDefs, al.model, callOpts)
+			if err == nil {
+				newState = strings.TrimSpace(newState)
+				if newState != "" && newState != stateID {
+					*providerStateID = newState
+					_ = al.memory.SetProviderState(ctx, opts.SessionKey, al.providerName, newState)
+				}
+			}
+		} else {
+			response, err = al.provider.Chat(ctx, messages, providerToolDefs, al.model, callOpts)
+		}
+
+		if err == nil {
+			return response, messages, nil
+		}
+		if !isContextWindowError(err) || retry >= maxRetries {
+			break
+		}
+
+		logger.WarnCF("agent", "Context window error detected, attempting compression", map[string]interface{}{
+			"error": err.Error(),
+			"retry": retry,
+		})
+		if retry == 0 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
+			al.publishOutbound(bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: "⚠️ Context window exceeded. Compacting memory and retrying...",
+			}, "context_retry_notice")
+		}
+
+		if compactErr := al.memory.ForceCompact(ctx, opts.SessionKey, opts.UserID, al.contextWindow); compactErr != nil {
+			logger.WarnCF("agent", "Memory force compaction failed", map[string]interface{}{
+				"error":       compactErr.Error(),
+				"session_key": opts.SessionKey,
+			})
+		}
+		rebuilt, rebuildErr := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
+		if rebuildErr != nil {
+			logger.WarnCF("agent", "Failed rebuilding prompt context after compaction", map[string]interface{}{
+				"error": rebuildErr.Error(),
+			})
+			continue
+		}
+		messages = al.contextBuilder.BuildMessages(
+			toProviderMessages(rebuilt.History),
+			rebuilt.Summary,
+			rebuilt.RecallPrompt,
+			currentUserPrompt,
+			nil,
+			opts.Channel,
+			opts.ChatID,
+		)
+		if continuityNote != "" {
+			messages = injectSystemNote(messages, continuityNote)
+		}
+		if personaNote != "" {
+			messages = injectSystemNote(messages, personaNote)
+		}
+	}
+	return nil, messages, err
+}
+
+func (al *AgentLoop) executeToolCalls(ctx context.Context, response *providers.LLMResponse, messages []providers.Message, opts processOptions, turnID string, seq *int, iteration int) ([]providers.Message, error) {
+	toolNames := make([]string, 0, len(response.ToolCalls))
+	for _, tc := range response.ToolCalls {
+		toolNames = append(toolNames, tc.Name)
+	}
+	logger.InfoCF("agent", "LLM requested tool calls", map[string]interface{}{
+		"tools":     toolNames,
+		"count":     len(response.ToolCalls),
+		"iteration": iteration,
+	})
+
+	assistantMsg := providers.Message{
+		Role:    "assistant",
+		Content: response.Content,
+	}
+	for _, tc := range response.ToolCalls {
+		argumentsJSON, _ := json.Marshal(tc.Arguments)
+		assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+			ID:   tc.ID,
+			Type: "function",
+			Function: &providers.FunctionCall{
+				Name:      tc.Name,
+				Arguments: string(argumentsJSON),
+			},
+		})
+	}
+	messages = append(messages, assistantMsg)
+
+	if !opts.NoHistory {
+		if err := al.memory.AppendEvent(ctx, memory.Event{
+			ID:         "evt-" + uuid.NewString(),
+			SessionKey: opts.SessionKey,
+			TurnID:     turnID,
+			Seq:        *seq,
+			Role:       "assistant",
+			Content:    response.Content,
+			Metadata: map[string]string{
+				"channel":         opts.Channel,
+				"chat_id":         opts.ChatID,
+				"user_id":         opts.UserID,
+				"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
+			},
+		}); err != nil {
+			logger.ErrorCF("agent", "Failed to append assistant tool-call event", map[string]interface{}{
+				"error":       err.Error(),
+				"session_key": opts.SessionKey,
+				"turn_id":     turnID,
+			})
+		}
+		*seq = *seq + 1
+	}
+
+	for _, toolCall := range response.ToolCalls {
+		tc := toolCall
+		argsJSON, _ := json.Marshal(tc.Arguments)
+		argsPreview := utils.Truncate(string(argsJSON), 200)
+		logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview), map[string]interface{}{
+			"tool":      tc.Name,
+			"iteration": iteration,
+		})
+
+		asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
+			if result != nil && !result.Silent && result.ForUser != "" {
+				logger.InfoCF("agent", "Async tool completed, agent will handle notification", map[string]interface{}{
+					"tool":        tc.Name,
+					"content_len": len(result.ForUser),
+				})
+			}
+		}
+
+		toolResult := al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
+		if toolResult == nil {
+			toolResult = tools.ErrorResult(fmt.Sprintf("tool %s returned no result", tc.Name))
+		}
+
+		if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
+			al.publishOutbound(bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: toolResult.ForUser,
+			}, "tool_result")
+			logger.DebugCF("agent", "Sent tool result to user", map[string]interface{}{
+				"tool":        tc.Name,
+				"content_len": len(toolResult.ForUser),
+			})
+		}
+
+		contentForLLM := toolResult.ForLLM
+		if contentForLLM == "" && toolResult.Err != nil {
+			contentForLLM = toolResult.Err.Error()
+		}
+		messages = append(messages, providers.Message{
+			Role:       "tool",
+			Content:    contentForLLM,
+			ToolCallID: tc.ID,
+		})
+
+		if !opts.NoHistory {
+			if err := al.memory.AppendEvent(ctx, memory.Event{
+				ID:         "evt-" + uuid.NewString(),
+				SessionKey: opts.SessionKey,
+				TurnID:     turnID,
+				Seq:        *seq,
+				Role:       "tool",
+				Content:    contentForLLM,
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+				Metadata: map[string]string{
+					"channel": opts.Channel,
+					"chat_id": opts.ChatID,
+					"user_id": opts.UserID,
+				},
+			}); err != nil {
+				logger.ErrorCF("agent", "Failed to append tool event", map[string]interface{}{
+					"error":       err.Error(),
+					"session_key": opts.SessionKey,
+					"turn_id":     turnID,
+					"tool_name":   tc.Name,
+				})
+			}
+			*seq = *seq + 1
+		}
+	}
+	return messages, nil
+}
+
+func isContextWindowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "context_length_exceeded") ||
+		strings.Contains(errMsg, "maximum context length") ||
+		strings.Contains(errMsg, "too many tokens") ||
+		strings.Contains(errMsg, "token limit") ||
+		strings.Contains(errMsg, "max message tokens") ||
+		strings.Contains(errMsg, "request too large") ||
+		(strings.Contains(errMsg, "context") && strings.Contains(errMsg, "length"))
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.
@@ -1123,6 +1180,23 @@ func toProviderMessages(messages []memory.Message) []providers.Message {
 	return out
 }
 
+func (al *AgentLoop) publishOutbound(msg bus.OutboundMessage, source string) {
+	if al.bus == nil {
+		logger.WarnCF("agent", "Message bus unavailable for outbound publish", map[string]interface{}{
+			"source": source,
+		})
+		return
+	}
+	if err := al.bus.PublishOutbound(msg); err != nil {
+		logger.WarnCF("agent", "Failed to publish outbound message", map[string]interface{}{
+			"source":  source,
+			"channel": msg.Channel,
+			"chat_id": msg.ChatID,
+			"error":   err.Error(),
+		})
+	}
+}
+
 func injectSystemNote(messages []providers.Message, note string) []providers.Message {
 	note = strings.TrimSpace(note)
 	if note == "" || len(messages) == 0 {
@@ -1139,6 +1213,34 @@ func injectSystemNote(messages []providers.Message, note string) []providers.Mes
 		Content: note,
 	})
 	out = append(out, messages[insertAt:]...)
+	return out
+}
+
+func buildDegradedContinuitySystemNote(reasons []string) string {
+	reasons = dedupeAndTrim(reasons)
+	if len(reasons) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf(`## Continuity Notice
+Some prior-thread context is temporarily unavailable (%s).
+Continue using the current turn, available history, and recalled memory. If exact prior details are needed, ask a brief clarifying question before making assumptions.`,
+		strings.Join(reasons, ", ")))
+}
+
+func dedupeAndTrim(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
 	return out
 }
 

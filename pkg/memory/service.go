@@ -6,8 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,14 +52,14 @@ type Service struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	snapshotMu    sync.RWMutex
-	snapshots     map[string][]Event
-	snapshotLimit int
+	snapshotMu          sync.RWMutex
+	snapshots           map[string][]Event
+	snapshotAccess      map[string]int64 // last access timestamp per session
+	snapshotLimit       int
+	snapshotMaxSessions int
 
 	lastRetentionSweep int64
 }
-
-var continuationCueRegex = regexp.MustCompile(`(?i)\b(already|earlier|before|as i (?:said|mentioned)|you (?:already )?(?:know|have)|that context|you remember|previously)\b`)
 
 func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if strings.TrimSpace(cfg.Workspace) == "" {
@@ -119,16 +119,18 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	})
 
 	svc := &Service{
-		cfg:           cfg,
-		store:         store,
-		policy:        policy,
-		retriever:     NewHybridRetriever(store, policy),
-		consolidator:  NewHeuristicConsolidator(store, policy),
-		compactor:     NewSessionCompactor(store, summarize),
-		persona:       NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor, cfg.PersonaFileSync, personaPolicy),
-		stopCh:        make(chan struct{}),
-		snapshots:     map[string][]Event{},
-		snapshotLimit: 128,
+		cfg:                 cfg,
+		store:               store,
+		policy:              policy,
+		retriever:           NewHybridRetriever(store, policy),
+		consolidator:        NewHeuristicConsolidator(store, policy),
+		compactor:           NewSessionCompactor(store, summarize),
+		persona:             NewPersonaManager(store, cfg.Workspace, cfg.PersonaExtractor, cfg.PersonaFileSync, personaPolicy),
+		stopCh:              make(chan struct{}),
+		snapshots:           map[string][]Event{},
+		snapshotAccess:      map[string]int64{},
+		snapshotLimit:       128,
+		snapshotMaxSessions: 256,
 	}
 
 	svc.wg.Add(1)
@@ -204,15 +206,19 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 	}
 	continuity.HasSummary = strings.TrimSpace(summary) != ""
 
-	events, err := s.store.ListRecentEvents(ctx, sessionKey, 96, false)
+	fetchLimit := budget.ThreadTokens / 120 * 2
+	if fetchLimit < 24 {
+		fetchLimit = 24
+	}
+	if fetchLimit > 96 {
+		fetchLimit = 96
+	}
+	events, err := s.store.ListRecentEvents(ctx, sessionKey, fetchLimit, false)
 	if err != nil {
 		degradedReasons = append(degradedReasons, "history")
-		events = s.getSnapshotEvents(sessionKey, 96)
+		events = s.getSnapshotEvents(sessionKey, fetchLimit)
 	} else {
-		events = mergeEventStreams(events, s.getSnapshotEvents(sessionKey, 96), 96)
-	}
-	if len(events) == 0 {
-		events = s.getSnapshotEvents(sessionKey, 96)
+		events = mergeEventStreams(events, s.getSnapshotEvents(sessionKey, fetchLimit), fetchLimit)
 	}
 
 	recallCards := []MemoryCard{}
@@ -263,13 +269,26 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 		}
 	}
 
-	recallPrompt := formatSnapshotAndRecall(snapshot, recallCards, budget.MemoryTokens)
+	remainingMemoryBudget := budget.MemoryTokens
+	if personaPrompt != "" {
+		personaTokens := estimateMessageTokens(personaPrompt)
+		remainingMemoryBudget = budget.MemoryTokens - personaTokens
+		if remainingMemoryBudget < 128 {
+			remainingMemoryBudget = 128
+		}
+	}
+	recallPrompt := formatSnapshotAndRecall(snapshot, recallCards, remainingMemoryBudget)
 	if personaPrompt != "" {
 		if recallPrompt != "" {
 			recallPrompt = personaPrompt + "\n\n" + recallPrompt
 		} else {
 			recallPrompt = personaPrompt
 		}
+	}
+
+	hasContinuityArtifacts := continuity.HasHistory || continuity.HasSummary || continuity.HasRecall
+	if continuity.HasPriorTurns && !hasContinuityArtifacts {
+		degradedReasons = append(degradedReasons, "no_continuity_artifacts")
 	}
 	if len(degradedReasons) > 0 {
 		_ = s.store.AddMetric(ctx, "memory.context.degraded", float64(len(degradedReasons)), map[string]string{
@@ -280,24 +299,6 @@ func (s *Service) BuildPromptContext(ctx context.Context, sessionKey, userID, qu
 	}
 	continuity.Degraded = len(degradedReasons) > 0
 	continuity.DegradedBy = dedupeStrings(degradedReasons)
-
-	hasContinuityArtifacts := continuity.HasHistory || continuity.HasSummary || continuity.HasRecall
-	if continuity.HasPriorTurns && !hasContinuityArtifacts {
-		_ = s.store.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
-			"session_key": sessionKey,
-			"user_id":     userID,
-			"reason":      "no_continuity_artifacts",
-		})
-		return PromptContext{}, ErrContinuityUnavailable
-	}
-	if continuity.HasPriorTurns && continuationCueRegex.MatchString(query) && !hasContinuityArtifacts {
-		_ = s.store.AddMetric(ctx, "memory.context.fail_closed", 1, map[string]string{
-			"session_key": sessionKey,
-			"user_id":     userID,
-			"reason":      "continuation_cue_without_context",
-		})
-		return PromptContext{}, ErrContinuityUnavailable
-	}
 
 	return PromptContext{
 		History:       history,
@@ -596,8 +597,36 @@ func (s *Service) processPendingJobs() {
 		}
 
 		if err := s.handleJob(ctx, job); err != nil {
+			attempt := parseJobAttempt(job.Payload["attempt"])
+			if attempt < 3 {
+				nextAttempt := attempt + 1
+				payload := cloneJobPayload(job.Payload)
+				payload["attempt"] = strconv.Itoa(nextAttempt)
+				retryAt := time.Now().Add(jobRetryBackoff(nextAttempt)).UnixMilli()
+				if requeueErr := s.store.EnqueueJob(ctx, Job{
+					ID:          job.ID,
+					JobType:     job.JobType,
+					SessionKey:  job.SessionKey,
+					Status:      JobPending,
+					Priority:    job.Priority,
+					Payload:     payload,
+					Error:       "",
+					RunAfterMS:  retryAt,
+					CreatedAtMS: job.CreatedAtMS,
+					UpdatedAtMS: time.Now().UnixMilli(),
+				}); requeueErr == nil {
+					_ = s.store.AddMetric(ctx, "memory.job.retried", 1, map[string]string{
+						"type":    job.JobType,
+						"attempt": strconv.Itoa(nextAttempt),
+					})
+					continue
+				}
+			}
 			_ = s.store.FailJob(ctx, job.ID, err.Error())
-			_ = s.store.AddMetric(ctx, "memory.job.failed", 1, map[string]string{"type": job.JobType})
+			_ = s.store.AddMetric(ctx, "memory.job.failed", 1, map[string]string{
+				"type":    job.JobType,
+				"attempt": strconv.Itoa(parseJobAttempt(job.Payload["attempt"])),
+			})
 			continue
 		}
 		_ = s.store.CompleteJob(ctx, job.ID)
@@ -633,9 +662,6 @@ func (s *Service) handleJob(ctx context.Context, job Job) error {
 		}
 		if err := s.consolidator.ConsolidateTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID); err != nil {
 			return err
-		}
-		if s.persona != nil {
-			return s.persona.EmitCandidatesForTurn(ctx, job.SessionKey, turnID, userID, s.cfg.AgentID)
 		}
 		return nil
 	case JobPersonaApply:
@@ -689,11 +715,31 @@ func (s *Service) appendSnapshot(ev Event) {
 	}
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
+
+	now := time.Now().UnixMilli()
+
+	// Evict oldest session if at capacity and this is a new session.
+	if _, exists := s.snapshots[ev.SessionKey]; !exists && len(s.snapshots) >= s.snapshotMaxSessions {
+		oldestKey := ""
+		oldestTime := int64(1<<63 - 1)
+		for k, t := range s.snapshotAccess {
+			if t < oldestTime {
+				oldestTime = t
+				oldestKey = k
+			}
+		}
+		if oldestKey != "" {
+			delete(s.snapshots, oldestKey)
+			delete(s.snapshotAccess, oldestKey)
+		}
+	}
+
 	stream := append(s.snapshots[ev.SessionKey], ev)
 	if len(stream) > s.snapshotLimit {
 		stream = stream[len(stream)-s.snapshotLimit:]
 	}
 	s.snapshots[ev.SessionKey] = stream
+	s.snapshotAccess[ev.SessionKey] = now
 }
 
 func (s *Service) getSnapshotEvents(sessionKey string, limit int) []Event {
@@ -703,12 +749,13 @@ func (s *Service) getSnapshotEvents(sessionKey string, limit int) []Event {
 	if limit <= 0 {
 		limit = 96
 	}
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 	stream := s.snapshots[sessionKey]
 	if len(stream) == 0 {
 		return nil
 	}
+	s.snapshotAccess[sessionKey] = time.Now().UnixMilli()
 	start := 0
 	if len(stream) > limit {
 		start = len(stream) - limit
@@ -716,6 +763,40 @@ func (s *Service) getSnapshotEvents(sessionKey string, limit int) []Event {
 	out := make([]Event, len(stream[start:]))
 	copy(out, stream[start:])
 	return out
+}
+
+func cloneJobPayload(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func parseJobAttempt(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func jobRetryBackoff(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 5 * time.Second
+	case 2:
+		return 30 * time.Second
+	default:
+		return 120 * time.Second
+	}
 }
 
 func mergeEventStreams(primary, secondary []Event, limit int) []Event {

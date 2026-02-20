@@ -18,7 +18,8 @@ import (
 
 // SQLiteStore is the canonical persistent memory storage.
 type SQLiteStore struct {
-	db *sql.DB
+	db         *sql.DB
+	ftsEnabled bool
 }
 
 // NewSQLiteStore creates/opens the memory database at path.
@@ -52,8 +53,15 @@ func (s *SQLiteStore) Close() error {
 }
 
 func (s *SQLiteStore) init() error {
+	journalModeStmt := `PRAGMA journal_mode=WAL;`
+	if raceDetectorEnabled() {
+		// WAL checkpoint paths in modernc/sqlite can crash under race
+		// instrumentation on darwin/arm64. Keep race builds on DELETE mode.
+		journalModeStmt = `PRAGMA journal_mode=DELETE;`
+	}
+
 	stmts := []string{
-		`PRAGMA journal_mode=WAL;`,
+		journalModeStmt,
 		`PRAGMA synchronous=NORMAL;`,
 		`PRAGMA temp_store=MEMORY;`,
 		`PRAGMA busy_timeout=5000;`,
@@ -275,26 +283,25 @@ WHERE rowid NOT IN (
 			last_seen_at_ms INTEGER NOT NULL,
 			PRIMARY KEY(user_id, agent_id, field_path, value_hash)
 		);`,
-		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(item_id UNINDEXED, content, tokenize='unicode61 remove_diacritics 2');`,
-		`DROP TRIGGER IF EXISTS memory_items_ai;`,
-		`DROP TRIGGER IF EXISTS memory_items_au;`,
-		`DROP TRIGGER IF EXISTS memory_items_ad;`,
-		`CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
-			INSERT INTO memory_items_fts(item_id, content) VALUES (new.id, new.content);
-		END;`,
-		`CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE OF content ON memory_items BEGIN
-			DELETE FROM memory_items_fts WHERE item_id = old.id;
-			INSERT INTO memory_items_fts(item_id, content) VALUES(new.id, new.content);
-		END;`,
-		`CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
-			DELETE FROM memory_items_fts WHERE item_id = old.id;
-		END;`,
 	}
 
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("init sqlite schema failed on %q: %w", trimSQL(stmt), err)
 		}
+	}
+	if raceDetectorEnabled() {
+		// Skip FTS5 setup under race builds: modernc/sqlite FTS init is unstable
+		// with race instrumentation on darwin/arm64.
+		s.ftsEnabled = false
+		if err := s.dropFTSTriggers(); err != nil {
+			return err
+		}
+	} else {
+		if err := s.initFTS(); err != nil {
+			return err
+		}
+		s.ftsEnabled = true
 	}
 
 	// Backward-compatible migrations for older databases.
@@ -347,6 +354,45 @@ WHERE TRIM(scope_type) = 'session' AND TRIM(scope_id) = '' AND TRIM(session_key)
 		return fmt.Errorf("purge retrieval cache: %w", err)
 	}
 
+	return nil
+}
+
+func (s *SQLiteStore) initFTS() error {
+	stmts := []string{
+		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(item_id UNINDEXED, content, tokenize='unicode61 remove_diacritics 2');`,
+		`DROP TRIGGER IF EXISTS memory_items_ai;`,
+		`DROP TRIGGER IF EXISTS memory_items_au;`,
+		`DROP TRIGGER IF EXISTS memory_items_ad;`,
+		`CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
+			INSERT INTO memory_items_fts(item_id, content) VALUES (new.id, new.content);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE OF content ON memory_items BEGIN
+			DELETE FROM memory_items_fts WHERE item_id = old.id;
+			INSERT INTO memory_items_fts(item_id, content) VALUES(new.id, new.content);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
+			DELETE FROM memory_items_fts WHERE item_id = old.id;
+		END;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("init sqlite fts failed on %q: %w", trimSQL(stmt), err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) dropFTSTriggers() error {
+	stmts := []string{
+		`DROP TRIGGER IF EXISTS memory_items_ai;`,
+		`DROP TRIGGER IF EXISTS memory_items_au;`,
+		`DROP TRIGGER IF EXISTS memory_items_ad;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("drop sqlite fts trigger failed on %q: %w", trimSQL(stmt), err)
+		}
+	}
 	return nil
 }
 
@@ -987,6 +1033,54 @@ LIMIT ?`, sessionKey, archivedFilter, limit)
 	return out, nil
 }
 
+func (s *SQLiteStore) ListEventsByTurn(ctx context.Context, sessionKey, turnID string, limit int) ([]Event, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil, fmt.Errorf("list events by turn: empty session_key")
+	}
+	if strings.TrimSpace(turnID) == "" {
+		return nil, fmt.Errorf("list events by turn: empty turn_id")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, session_key, turn_id, seq, role, content, tool_call_id, tool_name, metadata_json, created_at_ms, archived
+FROM events
+WHERE session_key = ?
+AND turn_id = ?
+AND archived = 0
+ORDER BY created_at_ms DESC, seq DESC
+LIMIT ?`, sessionKey, turnID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list events by turn: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Event, 0, limit)
+	for rows.Next() {
+		var ev Event
+		var createdMS int64
+		var metaRaw string
+		var archived int
+		if err := rows.Scan(&ev.ID, &ev.SessionKey, &ev.TurnID, &ev.Seq, &ev.Role, &ev.Content, &ev.ToolCallID, &ev.ToolName, &metaRaw, &createdMS, &archived); err != nil {
+			return nil, fmt.Errorf("scan event by turn: %w", err)
+		}
+		ev.Metadata = decodeMap(metaRaw)
+		ev.CreatedAt = time.UnixMilli(createdMS)
+		ev.Archived = archived != 0
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate events by turn: %w", err)
+	}
+
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 func (s *SQLiteStore) ArchiveEventsBefore(ctx context.Context, sessionKey string, keepLatest int) (int, error) {
 	if keepLatest < 0 {
 		keepLatest = 0
@@ -1194,6 +1288,9 @@ func (s *SQLiteStore) SearchMemoryFTS(ctx context.Context, userID, agentID, sess
 	if query == "" {
 		return nil, nil
 	}
+	if !s.ftsEnabled {
+		return s.searchMemoryLexicalFallback(ctx, userID, agentID, sessionKey, query, limit)
+	}
 	now := nowMS()
 	rows, err := s.db.QueryContext(ctx, `
 SELECT m.id, m.user_id, m.agent_id, m.scope_type, m.scope_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.metadata_json
@@ -1207,11 +1304,113 @@ AND (m.expires_at_ms = 0 OR m.expires_at_ms > ?)
 ORDER BY bm25(memory_items_fts), m.last_seen_at_ms DESC
 LIMIT ?`, query, userID, agentID, now, limit)
 	if err != nil {
-		return nil, fmt.Errorf("search memory fts: %w", err)
+		return s.searchMemoryLexicalFallback(ctx, userID, agentID, sessionKey, query, limit)
 	}
 	defer rows.Close()
 
 	return scanMemoryItems(rows)
+}
+
+func (s *SQLiteStore) searchMemoryLexicalFallback(ctx context.Context, userID, agentID, sessionKey, query string, limit int) ([]MemoryItem, error) {
+	candidates, err := s.ListMemoryCandidates(ctx, userID, agentID, sessionKey, maxInt(limit*4, 64))
+	if err != nil {
+		return nil, fmt.Errorf("search memory fallback: %w", err)
+	}
+	terms := lexicalSearchTerms(query)
+	if len(terms) == 0 {
+		return nil, nil
+	}
+
+	type scored struct {
+		item  MemoryItem
+		score int
+	}
+	scoredItems := make([]scored, 0, len(candidates))
+	for _, it := range candidates {
+		content := strings.ToLower(strings.TrimSpace(it.Content))
+		if content == "" {
+			continue
+		}
+		score := 0
+		for _, term := range terms {
+			if strings.Contains(content, term) {
+				score++
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		scoredItems = append(scoredItems, scored{item: it, score: score})
+	}
+	sort.SliceStable(scoredItems, func(i, j int) bool {
+		if scoredItems[i].score == scoredItems[j].score {
+			return scoredItems[i].item.LastSeenAtMS > scoredItems[j].item.LastSeenAtMS
+		}
+		return scoredItems[i].score > scoredItems[j].score
+	})
+
+	out := make([]MemoryItem, 0, minInt(limit, len(scoredItems)))
+	for _, s := range scoredItems {
+		out = append(out, s.item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func lexicalSearchTerms(query string) []string {
+	replacer := strings.NewReplacer(
+		`"`, " ",
+		`'`, " ",
+		`*`, " ",
+		`(`, " ",
+		`)`, " ",
+		`:`, " ",
+		`+`, " ",
+		`-`, " ",
+		`|`, " ",
+		`,`, " ",
+		`.`, " ",
+		`;`, " ",
+		`/`, " ",
+		`\`, " ",
+	)
+	query = strings.ToLower(replacer.Replace(strings.TrimSpace(query)))
+	if query == "" {
+		return nil
+	}
+
+	skip := map[string]struct{}{
+		"and":  {},
+		"or":   {},
+		"not":  {},
+		"near": {},
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 8)
+	for _, token := range strings.Fields(query) {
+		token = strings.TrimSpace(token)
+		if len(token) < 2 {
+			continue
+		}
+		if _, ignore := skip[token]; ignore {
+			continue
+		}
+		if _, dup := seen[token]; dup {
+			continue
+		}
+		seen[token] = struct{}{}
+		out = append(out, token)
+	}
+	return out
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func scanMemoryItems(rows *sql.Rows) ([]MemoryItem, error) {

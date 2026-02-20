@@ -97,7 +97,12 @@ func DisableFileLogging() {
 }
 
 func logMessage(level LogLevel, component string, message string, fields map[string]interface{}) {
-	if level < currentLevel {
+	mu.RLock()
+	lvl := currentLevel
+	logFile := logger.file
+	mu.RUnlock()
+
+	if level < lvl {
 		return
 	}
 
@@ -116,10 +121,10 @@ func logMessage(level LogLevel, component string, message string, fields map[str
 		}
 	}
 
-	if logger.file != nil {
+	if logFile != nil {
 		jsonData, err := json.Marshal(entry)
 		if err == nil {
-			logger.file.WriteString(string(jsonData) + "\n")
+			logFile.WriteString(string(jsonData) + "\n")
 		}
 	}
 

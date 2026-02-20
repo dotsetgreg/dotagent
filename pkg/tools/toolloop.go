@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dotsetgreg/dotagent/pkg/logger"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
@@ -36,6 +37,8 @@ type ToolLoopResult struct {
 func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []providers.Message, channel, chatID string) (*ToolLoopResult, error) {
 	iteration := 0
 	var finalContent string
+	toolCallSignatures := map[string]int{}
+	toolNameCounts := map[string]int{}
 
 	for iteration < config.MaxIterations {
 		iteration++
@@ -80,6 +83,46 @@ func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []provider
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
 				})
+			break
+		}
+		signature := toolCallSignature(response.ToolCalls)
+		if signature != "" {
+			toolCallSignatures[signature]++
+			if toolCallSignatures[signature] >= 3 {
+				logger.WarnCF("toolloop", "Tool-call loop detected; tripping circuit breaker",
+					map[string]any{
+						"signature": signature,
+						"count":     toolCallSignatures[signature],
+						"iteration": iteration,
+					})
+				finalContent = "I’m stopping tool execution because I detected a repeated tool-call loop. If you still want this action, restate it with a narrower scope."
+				break
+			}
+		}
+		driftLoopDetected := false
+		driftToolName := ""
+		driftCount := 0
+		for _, tc := range response.ToolCalls {
+			name := strings.TrimSpace(tc.Name)
+			if name == "" {
+				name = "(unknown)"
+			}
+			toolNameCounts[name]++
+			if toolNameCounts[name] >= 5 {
+				driftLoopDetected = true
+				driftToolName = name
+				driftCount = toolNameCounts[name]
+				break
+			}
+		}
+		if driftLoopDetected {
+			logger.WarnCF("toolloop", "Tool drift loop detected; tripping circuit breaker",
+				map[string]any{
+					"tool":      driftToolName,
+					"count":     driftCount,
+					"iteration": iteration,
+				})
+			finalContent = "I’m stopping tool execution because one tool kept being called repeatedly. If you still want this action, restate it with a narrower scope."
 			break
 		}
 
@@ -146,9 +189,24 @@ func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []provider
 			messages = append(messages, toolResultMsg)
 		}
 	}
+	if finalContent == "" && iteration >= config.MaxIterations {
+		finalContent = fmt.Sprintf("I paused because I reached the maximum number of consecutive actions (%d) allowed in a single turn. Let me know if you would like me to continue.", config.MaxIterations)
+	}
 
 	return &ToolLoopResult{
 		Content:    finalContent,
 		Iterations: iteration,
 	}, nil
+}
+
+func toolCallSignature(calls []providers.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(calls))
+	for _, tc := range calls {
+		argsJSON, _ := json.Marshal(tc.Arguments)
+		parts = append(parts, tc.Name+":"+string(argsJSON))
+	}
+	return strings.Join(parts, "|")
 }

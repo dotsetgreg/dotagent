@@ -36,6 +36,9 @@ func mustNewAgentLoop(tb testing.TB, cfg *config.Config, msgBus *bus.MessageBus,
 	if err != nil {
 		tb.Fatalf("NewAgentLoop failed: %v", err)
 	}
+	tb.Cleanup(func() {
+		al.Stop()
+	})
 	return al
 }
 

@@ -18,6 +18,7 @@ type Store interface {
 	AppendEvent(ctx context.Context, ev Event) error
 	AppendUserEventAndMemories(ctx context.Context, ev Event, userID, agentID string, ops []ConsolidationOp) (memoryCount int, err error)
 	ListRecentEvents(ctx context.Context, sessionKey string, limit int, includeArchived bool) ([]Event, error)
+	ListEventsByTurn(ctx context.Context, sessionKey, turnID string, limit int) ([]Event, error)
 	ArchiveEventsBefore(ctx context.Context, sessionKey string, keepLatest int) (archivedCount int, err error)
 	ArchiveEventsExceptTurns(ctx context.Context, sessionKey string, keepTurnIDs []string) (archivedCount int, err error)
 	StartCompaction(ctx context.Context, sessionKey string, sourceCount, retainedCount int, checkpoint map[string]string) (string, error)

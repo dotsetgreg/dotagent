@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -31,7 +32,7 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 
 	est := estimateEventTokens(events)
 	threshold := int(float64(budget.ThreadTokens) * 0.85)
-	if est <= threshold {
+	if int(float64(est)*1.10) <= threshold {
 		return nil
 	}
 
@@ -114,7 +115,12 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
 		return err
 	}
-	if err := c.store.UpsertSessionSnapshot(ctx, buildSessionSnapshot(sessionKey, compactionID, summary, toArchive)); err != nil {
+	snapshot, snapErr := buildSessionSnapshot(ctx, c.store, sessionKey, userID, agentID, compactionID, summary, toArchive)
+	if snapErr != nil {
+		_ = c.store.FailCompaction(ctx, compactionID, snapErr.Error())
+		return snapErr
+	}
+	if err := c.store.UpsertSessionSnapshot(ctx, snapshot); err != nil {
 		_ = c.store.FailCompaction(ctx, compactionID, err.Error())
 		return err
 	}
@@ -151,14 +157,16 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 }
 
 func estimateEventTokens(events []Event) int {
-	chars := 0
+	total := 0
 	for _, ev := range events {
-		chars += len([]rune(ev.Content))
+		words := len(strings.Fields(ev.Content))
+		tokens := words * 4 / 3
+		if tokens < 8 {
+			tokens = 8
+		}
+		total += tokens
 	}
-	if chars == 0 {
-		return 0
-	}
-	return chars * 2 / 5
+	return total
 }
 
 func buildCompactionTranscript(events []Event) string {
@@ -243,7 +251,7 @@ func selectTurnsToKeep(events []Event, keepLatest int) (map[string]struct{}, int
 	return keep, keptEvents
 }
 
-func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Event) SessionSnapshot {
+func buildSessionSnapshot(ctx context.Context, store Store, sessionKey, userID, agentID, compactionID, summary string, events []Event) (SessionSnapshot, error) {
 	facts := []string{}
 	prefs := []string{}
 	tasks := []string{}
@@ -264,6 +272,38 @@ func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Eve
 		*dst = append(*dst, value)
 	}
 
+	items, err := store.ListMemoryCandidates(ctx, userID, agentID, sessionKey, 256)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	items = filterItemsByScope(items, sessionKey, userID, true, true, false)
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].LastSeenAtMS > items[j].LastSeenAtMS
+	})
+
+	for _, item := range items {
+		content := strings.TrimSpace(item.Content)
+		if content == "" {
+			continue
+		}
+		switch item.Kind {
+		case MemoryUserPreference:
+			add(&prefs, content)
+		case MemoryTaskState:
+			add(&tasks, content)
+		case MemorySemanticFact, MemoryProcedural:
+			add(&facts, content)
+		}
+		normalizedContent, _ := normalizeIntentQuery(content)
+		if containsAnyIntentPhrase(normalizedContent, []string{"can't", "cannot", "must", "requirement", "constraint"}) {
+			add(&constraints, content)
+		}
+		if strings.Contains(content, "?") && len(openLoops) < 8 {
+			add(&openLoops, content)
+		}
+	}
+
+	// Preserve unresolved question continuity from compacted user turns.
 	for _, ev := range events {
 		if ev.Role != "user" {
 			continue
@@ -271,20 +311,6 @@ func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Eve
 		content := strings.TrimSpace(ev.Content)
 		if content == "" {
 			continue
-		}
-		for _, fact := range ExtractFactSignals(content) {
-			if isPreferencePhrase(fact) {
-				add(&prefs, fact)
-			} else {
-				add(&facts, fact)
-			}
-		}
-		normalizedContent, _ := normalizeIntentQuery(content)
-		if containsAnyIntentPhrase(normalizedContent, []string{"need to", "todo", "deadline", "remind me"}) {
-			add(&tasks, content)
-		}
-		if containsAnyIntentPhrase(normalizedContent, []string{"can't", "cannot", "must", "requirement", "constraint"}) {
-			add(&constraints, content)
 		}
 		if strings.Contains(content, "?") && len(openLoops) < 8 {
 			add(&openLoops, content)
@@ -301,5 +327,5 @@ func buildSessionSnapshot(sessionKey, compactionID, summary string, events []Eve
 		Constraints:  constraints,
 		Summary:      strings.TrimSpace(summary),
 		CompactionID: compactionID,
-	}
+	}, nil
 }

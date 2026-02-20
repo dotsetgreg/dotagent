@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
+	"github.com/dotsetgreg/dotagent/pkg/logger"
 )
 
 type Channel interface {
@@ -88,7 +89,14 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		Metadata:   metadata,
 	}
 
-	c.bus.PublishInbound(msg)
+	if err := c.bus.PublishInbound(msg); err != nil {
+		logger.WarnCF("channel", "Failed to publish inbound message",
+			map[string]interface{}{
+				"channel": c.name,
+				"chat_id": chatID,
+				"error":   err.Error(),
+			})
+	}
 }
 
 func (c *BaseChannel) setRunning(running bool) {
