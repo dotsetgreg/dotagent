@@ -3,7 +3,7 @@ package memory
 // DeriveContextBudget allocates context tokens across system/thread/summary/memory.
 func DeriveContextBudget(total int) ContextBudget {
 	if total <= 0 {
-		total = 8192
+		total = 16384
 	}
 	system := total * 25 / 100
 	thread := total * 45 / 100

@@ -229,7 +229,7 @@ TURN TRANSCRIPT:
 
 	completionMax := cfg.Agents.Defaults.MaxTokens
 	if completionMax <= 0 {
-		completionMax = 8192
+		completionMax = 16384
 	}
 	temperature := cfg.Agents.Defaults.Temperature
 	if temperature < 0 {

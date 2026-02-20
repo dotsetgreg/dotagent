@@ -159,9 +159,9 @@ func DefaultConfig() *Config {
 				RestrictToWorkspace: true,
 				Provider:            "openrouter",
 				Model:               "openai/gpt-5.2",
-				MaxTokens:           8192,
+				MaxTokens:           16384,
 				Temperature:         0.7,
-				MaxToolIterations:   20,
+				MaxToolIterations:   50,
 			},
 		},
 		Channels: ChannelsConfig{

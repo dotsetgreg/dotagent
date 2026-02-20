@@ -69,7 +69,7 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 		cfg.AgentID = "dotagent"
 	}
 	if cfg.MaxContextTokens <= 0 {
-		cfg.MaxContextTokens = 8192
+		cfg.MaxContextTokens = 16384
 	}
 	if cfg.MaxRecallItems <= 0 {
 		cfg.MaxRecallItems = 8
