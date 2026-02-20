@@ -828,6 +828,28 @@ func (al *AgentLoop) callLLMWithRetry(ctx context.Context, messages []providers.
 		if err == nil {
 			return response, messages, nil
 		}
+		if isTransientLLMError(err) && retry < maxRetries {
+			backoff := transientLLMRetryBackoff(retry + 1)
+			logger.WarnCF("agent", "Transient LLM error detected, retrying", map[string]interface{}{
+				"error":      err.Error(),
+				"retry":      retry,
+				"backoff_ms": backoff.Milliseconds(),
+			})
+			if retry == 0 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
+				al.publishOutbound(bus.OutboundMessage{
+					Channel: opts.Channel,
+					ChatID:  opts.ChatID,
+					Content: "⚠️ Provider timeout/error detected. Retrying...",
+				}, "provider_retry_notice")
+			}
+			select {
+			case <-ctx.Done():
+				return nil, messages, ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
 		if !isContextWindowError(err) || retry >= maxRetries {
 			break
 		}
@@ -1014,6 +1036,39 @@ func isContextWindowError(err error) bool {
 		strings.Contains(errMsg, "max message tokens") ||
 		strings.Contains(errMsg, "request too large") ||
 		(strings.Contains(errMsg, "context") && strings.Contains(errMsg, "length"))
+}
+
+func isTransientLLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "context canceled") {
+		return false
+	}
+	return strings.Contains(errMsg, "context deadline exceeded") ||
+		strings.Contains(errMsg, "client.timeout") ||
+		strings.Contains(errMsg, "timeout while reading body") ||
+		strings.Contains(errMsg, "timeout awaiting response headers") ||
+		strings.Contains(errMsg, "tls handshake timeout") ||
+		strings.Contains(errMsg, "connection reset by peer") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "i/o timeout") ||
+		strings.Contains(errMsg, "status=502") ||
+		strings.Contains(errMsg, "status=503") ||
+		strings.Contains(errMsg, "status=504") ||
+		strings.Contains(errMsg, "status=429")
+}
+
+func transientLLMRetryBackoff(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 1500 * time.Millisecond
+	case 2:
+		return 3500 * time.Millisecond
+	default:
+		return 8 * time.Second
+	}
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.

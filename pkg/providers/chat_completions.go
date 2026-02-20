@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const defaultHTTPTimeout = 120 * time.Second
+const defaultHTTPTimeout = 300 * time.Second
 
 type chatCompletionsProvider struct {
 	providerName string

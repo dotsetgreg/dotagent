@@ -805,6 +805,40 @@ func TestAgentLoop_ContextRetryPreservesCurrentUserMessage(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_TransientProviderTimeoutRetry(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &failFirstMockProvider{
+		failures:    1,
+		failError:   fmt.Errorf("read openrouter response: context deadline exceeded (Client.Timeout or context cancellation while reading body)"),
+		successResp: "timeout-retry-success",
+	}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	resp, err := al.ProcessDirectWithChannel(context.Background(), "retry transient timeout", "timeout-session", "cli", "direct")
+	if err != nil {
+		t.Fatalf("expected transient timeout to recover via retry, got: %v", err)
+	}
+	if resp != "timeout-retry-success" {
+		t.Fatalf("unexpected response: %q", resp)
+	}
+	if provider.currentCall != 2 {
+		t.Fatalf("expected 2 provider calls, got %d", provider.currentCall)
+	}
+}
+
 func TestAgentLoop_DerivesSessionKeyFromChannelContext(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{
