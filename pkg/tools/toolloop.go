@@ -39,6 +39,11 @@ func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []provider
 	var finalContent string
 	toolCallSignatures := map[string]int{}
 	toolNameCounts := map[string]int{}
+	toolDistinctSignatures := map[string]map[string]struct{}{}
+	const (
+		toolDriftCountThreshold     = 8
+		toolDriftDistinctSigCeiling = 2
+	)
 
 	for iteration < config.MaxIterations {
 		iteration++
@@ -102,25 +107,34 @@ func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []provider
 		driftLoopDetected := false
 		driftToolName := ""
 		driftCount := 0
+		driftDistinct := 0
 		for _, tc := range response.ToolCalls {
 			name := strings.TrimSpace(tc.Name)
 			if name == "" {
 				name = "(unknown)"
 			}
 			toolNameCounts[name]++
-			if toolNameCounts[name] >= 5 {
+			argsJSON, _ := json.Marshal(tc.Arguments)
+			if _, ok := toolDistinctSignatures[name]; !ok {
+				toolDistinctSignatures[name] = map[string]struct{}{}
+			}
+			toolDistinctSignatures[name][string(argsJSON)] = struct{}{}
+			distinct := len(toolDistinctSignatures[name])
+			if toolNameCounts[name] >= toolDriftCountThreshold && distinct <= toolDriftDistinctSigCeiling {
 				driftLoopDetected = true
 				driftToolName = name
 				driftCount = toolNameCounts[name]
+				driftDistinct = distinct
 				break
 			}
 		}
 		if driftLoopDetected {
 			logger.WarnCF("toolloop", "Tool drift loop detected; tripping circuit breaker",
 				map[string]any{
-					"tool":      driftToolName,
-					"count":     driftCount,
-					"iteration": iteration,
+					"tool":                driftToolName,
+					"count":               driftCount,
+					"distinct_signatures": driftDistinct,
+					"iteration":           iteration,
 				})
 			finalContent = "I’m stopping tool execution because one tool kept being called repeatedly. If you still want this action, restate it with a narrower scope."
 			break

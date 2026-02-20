@@ -659,7 +659,12 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 	finalContent := ""
 	toolCallSignatures := map[string]int{}
 	toolNameCounts := map[string]int{}
+	toolDistinctSignatures := map[string]map[string]struct{}{}
 	providerStateID := ""
+	const (
+		toolDriftCountThreshold     = 8
+		toolDriftDistinctSigCeiling = 2
+	)
 	if !opts.NoHistory {
 		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey, al.providerName); err == nil {
 			providerStateID = strings.TrimSpace(sid)
@@ -719,30 +724,39 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		driftLoopDetected := false
 		driftToolName := ""
 		driftCount := 0
+		driftDistinct := 0
 		for _, tc := range response.ToolCalls {
 			name := strings.TrimSpace(tc.Name)
 			if name == "" {
 				name = "(unknown)"
 			}
 			toolNameCounts[name]++
-			if toolNameCounts[name] >= 5 {
+			argsJSON, _ := json.Marshal(tc.Arguments)
+			if _, ok := toolDistinctSignatures[name]; !ok {
+				toolDistinctSignatures[name] = map[string]struct{}{}
+			}
+			toolDistinctSignatures[name][string(argsJSON)] = struct{}{}
+			distinct := len(toolDistinctSignatures[name])
+			if toolNameCounts[name] >= toolDriftCountThreshold && distinct <= toolDriftDistinctSigCeiling {
 				driftLoopDetected = true
 				driftToolName = name
 				driftCount = toolNameCounts[name]
+				driftDistinct = distinct
 				break
 			}
 		}
 		if driftLoopDetected {
 			logger.WarnCF("agent", "Tool drift loop detected; tripping circuit breaker", map[string]interface{}{
-				"tool":      driftToolName,
-				"count":     driftCount,
-				"iteration": iteration,
+				"tool":                driftToolName,
+				"count":               driftCount,
+				"distinct_signatures": driftDistinct,
+				"iteration":           iteration,
 			})
 			if !opts.NoHistory {
 				_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
 					"session_key": opts.SessionKey,
 					"user_id":     opts.UserID,
-					"reason":      "tool_name_repeat",
+					"reason":      "tool_name_low_variance_repeat",
 					"tool_name":   driftToolName,
 				})
 			}

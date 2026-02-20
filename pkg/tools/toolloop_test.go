@@ -82,10 +82,50 @@ func TestRunToolLoop_CircuitBreakerSignatureRepeat(t *testing.T) {
 }
 
 func TestRunToolLoop_CircuitBreakerToolDrift(t *testing.T) {
-	responses := make([]*providers.LLMResponse, 0, 5)
-	for i := 1; i <= 5; i++ {
+	responses := make([]*providers.LLMResponse, 0, 8)
+	for i := 1; i <= 8; i++ {
+		mode := "a"
+		if i%2 == 0 {
+			mode = "b"
+		}
 		responses = append(responses, &providers.LLMResponse{
-			ToolCalls: []providers.ToolCall{{ID: fmt.Sprintf("%d", i), Name: "looptool", Arguments: map[string]interface{}{"n": i}}},
+			ToolCalls: []providers.ToolCall{
+				{ID: fmt.Sprintf("loop-%d", i), Name: "looptool", Arguments: map[string]interface{}{"mode": mode}},
+				{ID: fmt.Sprintf("noise-%d", i), Name: "noisetool", Arguments: map[string]interface{}{"n": i}},
+			},
+		})
+	}
+	provider := &scriptedLoopProvider{responses: responses}
+
+	registry := NewToolRegistry()
+	registry.Register(loopTestTool{name: "looptool"})
+	registry.Register(loopTestTool{name: "noisetool"})
+
+	result, err := RunToolLoop(context.Background(), ToolLoopConfig{
+		Provider:      provider,
+		Model:         "test-model",
+		Tools:         registry,
+		MaxIterations: 12,
+	}, nil, "cli", "direct")
+	if err != nil {
+		t.Fatalf("RunToolLoop returned error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("RunToolLoop returned nil result")
+	}
+	if !strings.Contains(result.Content, "one tool kept being called repeatedly") {
+		t.Fatalf("expected drift circuit-breaker message, got: %q", result.Content)
+	}
+	if result.Iterations != 8 {
+		t.Fatalf("expected 8 iterations before drift breaker, got %d", result.Iterations)
+	}
+}
+
+func TestRunToolLoop_DoesNotTripDriftBreakerOnDiverseToolArgs(t *testing.T) {
+	responses := make([]*providers.LLMResponse, 0, 8)
+	for i := 1; i <= 8; i++ {
+		responses = append(responses, &providers.LLMResponse{
+			ToolCalls: []providers.ToolCall{{ID: fmt.Sprintf("%d", i), Name: "looptool", Arguments: map[string]interface{}{"file": fmt.Sprintf("f-%d.txt", i)}}},
 		})
 	}
 	provider := &scriptedLoopProvider{responses: responses}
@@ -105,11 +145,11 @@ func TestRunToolLoop_CircuitBreakerToolDrift(t *testing.T) {
 	if result == nil {
 		t.Fatal("RunToolLoop returned nil result")
 	}
-	if !strings.Contains(result.Content, "one tool kept being called repeatedly") {
-		t.Fatalf("expected drift circuit-breaker message, got: %q", result.Content)
+	if strings.Contains(result.Content, "one tool kept being called repeatedly") {
+		t.Fatalf("did not expect drift breaker for diverse tool args, got: %q", result.Content)
 	}
-	if result.Iterations != 5 {
-		t.Fatalf("expected 5 iterations before drift breaker, got %d", result.Iterations)
+	if !strings.Contains(result.Content, "maximum number of consecutive actions (8)") {
+		t.Fatalf("expected max-iterations message, got: %q", result.Content)
 	}
 }
 
