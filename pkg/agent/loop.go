@@ -939,6 +939,9 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		}
 	}
 
+	if finalContent == "" && iteration >= al.maxIterations {
+		finalContent = fmt.Sprintf("I paused because I reached the maximum number of consecutive actions (%d) allowed in a single turn. Let me know if you would like me to continue.", al.maxIterations)
+	}
 	return finalContent, iteration, nil
 }
 
