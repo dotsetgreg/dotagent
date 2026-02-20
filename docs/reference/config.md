@@ -4,8 +4,8 @@ Generated from `pkg/config/config.go` and `config.DefaultConfig()`.
 
 | Key | Type | Env Var | Default |
 | --- | --- | --- | --- |
-| `agents.defaults.max_tokens` | `int` | `DOTAGENT_AGENTS_DEFAULTS_MAX_TOKENS` | `8192` |
-| `agents.defaults.max_tool_iterations` | `int` | `DOTAGENT_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS` | `20` |
+| `agents.defaults.max_tokens` | `int` | `DOTAGENT_AGENTS_DEFAULTS_MAX_TOKENS` | `16384` |
+| `agents.defaults.max_tool_iterations` | `int` | `DOTAGENT_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS` | `50` |
 | `agents.defaults.model` | `string` | `DOTAGENT_AGENTS_DEFAULTS_MODEL` | `"openai/gpt-5.2"` |
 | `agents.defaults.provider` | `string` | `DOTAGENT_AGENTS_DEFAULTS_PROVIDER` | `"openrouter"` |
 | `agents.defaults.restrict_to_workspace` | `bool` | `DOTAGENT_AGENTS_DEFAULTS_RESTRICT_TO_WORKSPACE` | `true` |
