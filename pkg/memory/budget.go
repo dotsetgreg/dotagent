@@ -65,6 +65,82 @@ func DeriveAdaptiveContextBudget(total int, signals BudgetSignals) ContextBudget
 	return b
 }
 
+// ScaleContextBudget applies a global safety factor to a budget while preserving
+// minimum section sizes and overall proportions.
+func ScaleContextBudget(b ContextBudget, factor float64) ContextBudget {
+	if factor <= 0 || factor >= 1 {
+		return b
+	}
+	total := int(float64(b.TotalTokens) * factor)
+	if total < 1024 {
+		total = 1024
+	}
+
+	scalePart := func(v, min int) int {
+		if v <= 0 {
+			return min
+		}
+		scaled := int(float64(v) * factor)
+		if scaled < min {
+			return min
+		}
+		return scaled
+	}
+
+	system := scalePart(b.SystemTokens, 192)
+	thread := scalePart(b.ThreadTokens, 320)
+	memory := scalePart(b.MemoryTokens, 256)
+	summary := scalePart(b.SummaryTokens, 96)
+
+	parts := []*int{&thread, &system, &memory, &summary}
+	sum := system + thread + memory + summary
+	for sum > total {
+		reduced := false
+		for _, part := range parts {
+			switch part {
+			case &thread:
+				if *part > 320 {
+					*part -= minInt(64, *part-320)
+					reduced = true
+				}
+			case &system:
+				if *part > 192 {
+					*part -= minInt(48, *part-192)
+					reduced = true
+				}
+			case &memory:
+				if *part > 256 {
+					*part -= minInt(48, *part-256)
+					reduced = true
+				}
+			case &summary:
+				if *part > 96 {
+					*part -= minInt(32, *part-96)
+					reduced = true
+				}
+			}
+			if reduced {
+				break
+			}
+		}
+		if !reduced {
+			break
+		}
+		sum = system + thread + memory + summary
+	}
+	if sum < total {
+		thread += total - sum
+	}
+
+	return ContextBudget{
+		TotalTokens:   total,
+		SystemTokens:  system,
+		ThreadTokens:  thread,
+		MemoryTokens:  memory,
+		SummaryTokens: summary,
+	}
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a

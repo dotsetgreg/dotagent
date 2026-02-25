@@ -185,6 +185,12 @@ func markMessageSentInContext(ctx context.Context) {
 	}
 }
 
+// MarkRoundMessageSent marks the current execution round as having already sent
+// user-visible output.
+func MarkRoundMessageSent(ctx context.Context) {
+	markMessageSentInContext(ctx)
+}
+
 func ToolToSchema(tool Tool) map[string]interface{} {
 	return map[string]interface{}{
 		"type": "function",

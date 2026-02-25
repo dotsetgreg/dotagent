@@ -248,6 +248,12 @@ func (t *CronTool) enableJob(args map[string]interface{}, enable bool) *ToolResu
 	if job == nil {
 		return ErrorResult(fmt.Sprintf("Job %s not found", jobID))
 	}
+	if enable && !job.Enabled {
+		if job.State.LastError != "" {
+			return ErrorResult(fmt.Sprintf("Job %s cannot be enabled: %s", jobID, job.State.LastError))
+		}
+		return ErrorResult(fmt.Sprintf("Job %s cannot be enabled because no future run can be scheduled", jobID))
+	}
 
 	status := "enabled"
 	if !enable {

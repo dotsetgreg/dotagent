@@ -11,6 +11,7 @@ import (
 type MessageBus struct {
 	inbound  chan InboundMessage
 	outbound chan OutboundMessage
+	events   chan EventMessage
 	handlers map[string]MessageHandler
 	closed   bool
 	dropped  droppedCounters
@@ -20,6 +21,7 @@ type MessageBus struct {
 type droppedCounters struct {
 	inbound  atomic.Uint64
 	outbound atomic.Uint64
+	events   atomic.Uint64
 }
 
 const publishTimeout = 100 * time.Millisecond
@@ -33,6 +35,7 @@ func NewMessageBus() *MessageBus {
 	return &MessageBus{
 		inbound:  make(chan InboundMessage, 100),
 		outbound: make(chan OutboundMessage, 100),
+		events:   make(chan EventMessage, 128),
 		handlers: make(map[string]MessageHandler),
 	}
 }
@@ -129,6 +132,7 @@ func (mb *MessageBus) Close() {
 	mb.closed = true
 	close(mb.inbound)
 	close(mb.outbound)
+	close(mb.events)
 }
 
 func (mb *MessageBus) DroppedInbound() uint64 {
@@ -137,4 +141,43 @@ func (mb *MessageBus) DroppedInbound() uint64 {
 
 func (mb *MessageBus) DroppedOutbound() uint64 {
 	return mb.dropped.outbound.Load()
+}
+
+func (mb *MessageBus) PublishEvent(event EventMessage) error {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
+	if mb.closed {
+		return ErrBusClosed
+	}
+
+	select {
+	case mb.events <- event:
+		return nil
+	default:
+		timer := time.NewTimer(publishTimeout)
+		defer timer.Stop()
+		select {
+		case mb.events <- event:
+			return nil
+		case <-timer.C:
+			mb.dropped.events.Add(1)
+			return ErrPublishDropped
+		}
+	}
+}
+
+func (mb *MessageBus) SubscribeEvents(ctx context.Context) (EventMessage, bool) {
+	select {
+	case msg, ok := <-mb.events:
+		if !ok {
+			return EventMessage{}, false
+		}
+		return msg, true
+	case <-ctx.Done():
+		return EventMessage{}, false
+	}
+}
+
+func (mb *MessageBus) DroppedEvents() uint64 {
+	return mb.dropped.events.Load()
 }

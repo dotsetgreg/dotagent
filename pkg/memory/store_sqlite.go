@@ -22,6 +22,8 @@ type SQLiteStore struct {
 	ftsEnabled bool
 }
 
+type embeddingVectorizeFunc func(content string) (model string, vector []float32, err error)
+
 // NewSQLiteStore creates/opens the memory database at path.
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -142,6 +144,7 @@ func (s *SQLiteStore) init() error {
 			last_seen_at_ms INTEGER NOT NULL,
 			expires_at_ms INTEGER NOT NULL DEFAULT 0,
 			deleted_at_ms INTEGER NOT NULL DEFAULT 0,
+			evergreen INTEGER NOT NULL DEFAULT 0,
 			metadata_json TEXT NOT NULL DEFAULT '{}'
 		);`,
 		`CREATE TABLE IF NOT EXISTS memory_observations (
@@ -175,6 +178,23 @@ func (s *SQLiteStore) init() error {
 			norm REAL NOT NULL DEFAULT 0,
 			updated_at_ms INTEGER NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS memory_embedding_cache (
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			provider_key TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			vector_json TEXT NOT NULL,
+			norm REAL NOT NULL DEFAULT 0,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(provider, model, provider_key, content_hash)
+		);`,
+		`CREATE INDEX IF NOT EXISTS memory_embedding_cache_updated_idx ON memory_embedding_cache(updated_at_ms DESC);`,
+		`CREATE TABLE IF NOT EXISTS session_index_state (
+			session_key TEXT PRIMARY KEY,
+			last_indexed_at_ms INTEGER NOT NULL DEFAULT 0,
+			updated_at_ms INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE INDEX IF NOT EXISTS session_index_state_updated_idx ON session_index_state(updated_at_ms DESC);`,
 		`CREATE TABLE IF NOT EXISTS retrieval_cache (
 			cache_key TEXT PRIMARY KEY,
 			result_json TEXT NOT NULL,
@@ -309,6 +329,9 @@ WHERE rowid NOT IN (
 		return err
 	}
 	if err := ensureColumnExists(s.db, "memory_items", "scope_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumnExists(s.db, "memory_items", "evergreen", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(`
@@ -1198,13 +1221,14 @@ func (s *SQLiteStore) UpsertMemoryItem(ctx context.Context, item MemoryItem) (Me
 	}
 
 	row := tx.QueryRowContext(ctx, `
-SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
+SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, evergreen, metadata_json
 FROM memory_items
 WHERE id = ?`, id)
 
 	var out MemoryItem
 	var kind string
 	var scopeType string
+	var evergreen int
 	var metadataRaw string
 	if err := row.Scan(
 		&out.ID,
@@ -1223,12 +1247,14 @@ WHERE id = ?`, id)
 		&out.LastSeenAtMS,
 		&out.ExpiresAtMS,
 		&out.DeletedAtMS,
+		&evergreen,
 		&metadataRaw,
 	); err != nil {
 		return MemoryItem{}, fmt.Errorf("read upserted memory item: %w", err)
 	}
 	out.ScopeType = MemoryScopeType(scopeType)
 	out.Kind = MemoryItemKind(kind)
+	out.Evergreen = evergreen == 1
 	out.Metadata = decodeMap(metadataRaw)
 	normalizeMemoryScope(&out)
 	if err := invalidateRetrievalCacheTx(ctx, tx); err != nil {
@@ -1264,13 +1290,14 @@ func (s *SQLiteStore) ListMemoryCandidates(ctx context.Context, userID, agentID,
 	}
 	now := nowMS()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json
+SELECT id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, evergreen, metadata_json
 FROM memory_items
-WHERE user_id = ? AND agent_id = ?
+WHERE agent_id = ?
+AND (user_id = ? OR (scope_type = 'global' AND user_id = ''))
 AND deleted_at_ms = 0
 AND (expires_at_ms = 0 OR expires_at_ms > ?)
 ORDER BY last_seen_at_ms DESC
-LIMIT ?`, userID, agentID, now, limit)
+LIMIT ?`, agentID, userID, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list memory candidates: %w", err)
 	}
@@ -1293,16 +1320,16 @@ func (s *SQLiteStore) SearchMemoryFTS(ctx context.Context, userID, agentID, sess
 	}
 	now := nowMS()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT m.id, m.user_id, m.agent_id, m.scope_type, m.scope_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.metadata_json
+SELECT m.id, m.user_id, m.agent_id, m.scope_type, m.scope_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.evergreen, m.metadata_json
 FROM memory_items_fts f
 JOIN memory_items m ON m.id = f.item_id
 WHERE f.content MATCH ?
-AND m.user_id = ?
 AND m.agent_id = ?
+AND (m.user_id = ? OR (m.scope_type = 'global' AND m.user_id = ''))
 AND m.deleted_at_ms = 0
 AND (m.expires_at_ms = 0 OR m.expires_at_ms > ?)
 ORDER BY bm25(memory_items_fts), m.last_seen_at_ms DESC
-LIMIT ?`, query, userID, agentID, now, limit)
+LIMIT ?`, query, agentID, userID, now, limit)
 	if err != nil {
 		return s.searchMemoryLexicalFallback(ctx, userID, agentID, sessionKey, query, limit)
 	}
@@ -1359,49 +1386,57 @@ func (s *SQLiteStore) searchMemoryLexicalFallback(ctx context.Context, userID, a
 	return out, nil
 }
 
+func (s *SQLiteStore) ListMemoryKeysByPrefix(ctx context.Context, agentID, prefix string) ([]string, error) {
+	agentID = strings.TrimSpace(agentID)
+	prefix = strings.TrimSpace(prefix)
+	if agentID == "" || prefix == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT item_key
+FROM memory_items
+WHERE agent_id = ?
+AND item_key LIKE ?
+AND deleted_at_ms = 0`, agentID, prefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("list memory keys by prefix: %w", err)
+	}
+	defer rows.Close()
+
+	keys := make([]string, 0, 128)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan memory key by prefix: %w", err)
+		}
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate memory key by prefix rows: %w", err)
+	}
+	return keys, nil
+}
+
 func lexicalSearchTerms(query string) []string {
-	replacer := strings.NewReplacer(
-		`"`, " ",
-		`'`, " ",
-		`*`, " ",
-		`(`, " ",
-		`)`, " ",
-		`:`, " ",
-		`+`, " ",
-		`-`, " ",
-		`|`, " ",
-		`,`, " ",
-		`.`, " ",
-		`;`, " ",
-		`/`, " ",
-		`\`, " ",
-	)
-	query = strings.ToLower(replacer.Replace(strings.TrimSpace(query)))
-	if query == "" {
+	terms := expandQueryTerms(query)
+	if len(terms) == 0 {
 		return nil
 	}
-
-	skip := map[string]struct{}{
-		"and":  {},
-		"or":   {},
-		"not":  {},
-		"near": {},
-	}
-	seen := map[string]struct{}{}
-	out := make([]string, 0, 8)
-	for _, token := range strings.Fields(query) {
-		token = strings.TrimSpace(token)
-		if len(token) < 2 {
+	out := make([]string, 0, len(terms))
+	for _, term := range terms {
+		term = strings.TrimSpace(strings.ToLower(term))
+		if len(term) < 2 {
 			continue
 		}
-		if _, ignore := skip[token]; ignore {
+		if isStopwordToken(term) {
 			continue
 		}
-		if _, dup := seen[token]; dup {
-			continue
+		out = append(out, term)
+		if len(out) >= 24 {
+			break
 		}
-		seen[token] = struct{}{}
-		out = append(out, token)
 	}
 	return out
 }
@@ -1419,12 +1454,14 @@ func scanMemoryItems(rows *sql.Rows) ([]MemoryItem, error) {
 		var it MemoryItem
 		var kind string
 		var scopeType string
+		var evergreen int
 		var metaRaw string
-		if err := rows.Scan(&it.ID, &it.UserID, &it.AgentID, &scopeType, &it.ScopeID, &it.SessionKey, &kind, &it.Key, &it.Content, &it.Confidence, &it.Weight, &it.SourceEventID, &it.FirstSeenAtMS, &it.LastSeenAtMS, &it.ExpiresAtMS, &it.DeletedAtMS, &metaRaw); err != nil {
+		if err := rows.Scan(&it.ID, &it.UserID, &it.AgentID, &scopeType, &it.ScopeID, &it.SessionKey, &kind, &it.Key, &it.Content, &it.Confidence, &it.Weight, &it.SourceEventID, &it.FirstSeenAtMS, &it.LastSeenAtMS, &it.ExpiresAtMS, &it.DeletedAtMS, &evergreen, &metaRaw); err != nil {
 			return nil, fmt.Errorf("scan memory item: %w", err)
 		}
 		it.ScopeType = MemoryScopeType(scopeType)
 		it.Kind = MemoryItemKind(kind)
+		it.Evergreen = evergreen == 1
 		it.Metadata = decodeMap(metaRaw)
 		normalizeMemoryScope(&it)
 		out = append(out, it)
@@ -1582,6 +1619,280 @@ func (s *SQLiteStore) GetEmbeddings(ctx context.Context, itemIDs []string) (map[
 	return out, nil
 }
 
+func (s *SQLiteStore) GetEmbeddingRecords(ctx context.Context, itemIDs []string) (map[string]EmbeddingRecord, error) {
+	if len(itemIDs) == 0 {
+		return map[string]EmbeddingRecord{}, nil
+	}
+	ids := uniqueStrings(itemIDs)
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]interface{}, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := fmt.Sprintf(`SELECT item_id, model, vector_json FROM memory_embeddings WHERE item_id IN (%s)`, placeholders)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get embedding records: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]EmbeddingRecord, len(ids))
+	for rows.Next() {
+		var id string
+		var model string
+		var raw string
+		if err := rows.Scan(&id, &model, &raw); err != nil {
+			return nil, fmt.Errorf("scan embedding record: %w", err)
+		}
+		out[id] = EmbeddingRecord{
+			Model:  strings.TrimSpace(model),
+			Vector: decodeVector(raw),
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embedding records: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) GetEmbeddingCacheBatch(ctx context.Context, provider, model, providerKey string, contentHashes []string) (map[string][]float32, error) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	providerKey = strings.TrimSpace(providerKey)
+	if provider == "" || model == "" || providerKey == "" || len(contentHashes) == 0 {
+		return map[string][]float32{}, nil
+	}
+	hashes := uniqueStrings(contentHashes)
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(hashes)), ",")
+	args := make([]interface{}, 0, 3+len(hashes))
+	args = append(args, provider, model, providerKey)
+	for _, hash := range hashes {
+		args = append(args, hash)
+	}
+	query := fmt.Sprintf(`
+SELECT content_hash, vector_json
+FROM memory_embedding_cache
+WHERE provider = ? AND model = ? AND provider_key = ?
+AND content_hash IN (%s)`, placeholders)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get embedding cache batch: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]float32, len(hashes))
+	for rows.Next() {
+		var hash string
+		var raw string
+		if err := rows.Scan(&hash, &raw); err != nil {
+			return nil, fmt.Errorf("scan embedding cache row: %w", err)
+		}
+		out[hash] = decodeVector(raw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embedding cache rows: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) PutEmbeddingCacheBatch(ctx context.Context, provider, model, providerKey string, vectors map[string][]float32) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	providerKey = strings.TrimSpace(providerKey)
+	if provider == "" || model == "" || providerKey == "" || len(vectors) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("put embedding cache batch begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := nowMS()
+	for contentHash, vec := range vectors {
+		contentHash = strings.TrimSpace(contentHash)
+		if contentHash == "" || len(vec) == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_embedding_cache(provider, model, provider_key, content_hash, vector_json, norm, updated_at_ms)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(provider, model, provider_key, content_hash) DO UPDATE SET
+	vector_json = excluded.vector_json,
+	norm = excluded.norm,
+	updated_at_ms = excluded.updated_at_ms`,
+			provider, model, providerKey, contentHash, encodeVector(vec), vectorNorm(vec), now); err != nil {
+			return fmt.Errorf("put embedding cache row: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("put embedding cache batch commit: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetSessionIndexCursor(ctx context.Context, sessionKey string) (int64, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return 0, nil
+	}
+	var cursor int64
+	if err := s.db.QueryRowContext(ctx, `SELECT last_indexed_at_ms FROM session_index_state WHERE session_key = ?`, sessionKey).Scan(&cursor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get session index cursor: %w", err)
+	}
+	return cursor, nil
+}
+
+func (s *SQLiteStore) SetSessionIndexCursor(ctx context.Context, sessionKey string, lastIndexedMS int64) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil
+	}
+	now := nowMS()
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO session_index_state(session_key, last_indexed_at_ms, updated_at_ms)
+VALUES(?, ?, ?)
+ON CONFLICT(session_key) DO UPDATE SET
+	last_indexed_at_ms = CASE
+		WHEN excluded.last_indexed_at_ms > session_index_state.last_indexed_at_ms
+			THEN excluded.last_indexed_at_ms
+			ELSE session_index_state.last_indexed_at_ms
+		END,
+	updated_at_ms = excluded.updated_at_ms`, sessionKey, lastIndexedMS, now)
+	if err != nil {
+		return fmt.Errorf("set session index cursor: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListSessionEmbeddingDeltas(ctx context.Context, sessionKey, agentID, model string, sinceMS int64, limit int) ([]MemoryItem, error) {
+	if limit <= 0 {
+		limit = 128
+	}
+	sessionKey = strings.TrimSpace(sessionKey)
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return nil, fmt.Errorf("list embedding deltas: agent_id is required")
+	}
+	now := nowMS()
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.id, m.user_id, m.agent_id, m.scope_type, m.scope_id, m.session_key, m.kind, m.item_key, m.content, m.confidence, m.weight, m.source_event_id, m.first_seen_at_ms, m.last_seen_at_ms, m.expires_at_ms, m.deleted_at_ms, m.evergreen, m.metadata_json
+FROM memory_items m
+LEFT JOIN memory_embeddings e ON e.item_id = m.id
+WHERE m.agent_id = ?
+AND m.session_key = ?
+AND m.deleted_at_ms = 0
+AND (m.expires_at_ms = 0 OR m.expires_at_ms > ?)
+AND m.last_seen_at_ms > ?
+AND (e.item_id IS NULL OR e.model <> ? OR e.updated_at_ms < m.last_seen_at_ms)
+ORDER BY m.last_seen_at_ms ASC
+LIMIT ?`, agentID, sessionKey, now, sinceMS, model, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list embedding deltas: %w", err)
+	}
+	defer rows.Close()
+	return scanMemoryItems(rows)
+}
+
+func (s *SQLiteStore) ReindexEmbeddingsAtomic(ctx context.Context, agentID string, vectorize embeddingVectorizeFunc) (EmbeddingReindexReport, error) {
+	report := EmbeddingReindexReport{}
+	start := time.Now()
+	if vectorize == nil {
+		return report, fmt.Errorf("reindex embeddings: vectorize function is required")
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return report, fmt.Errorf("reindex embeddings: agent_id is required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return report, fmt.Errorf("reindex embeddings begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmts := []string{
+		`DROP TABLE IF EXISTS memory_embeddings_reindex_tmp;`,
+		`DROP TABLE IF EXISTS memory_embeddings_reindex_old;`,
+		`CREATE TABLE memory_embeddings_reindex_tmp (
+			item_id TEXT PRIMARY KEY,
+			model TEXT NOT NULL,
+			vector_json TEXT NOT NULL,
+			norm REAL NOT NULL DEFAULT 0,
+			updated_at_ms INTEGER NOT NULL
+		);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return report, fmt.Errorf("reindex embeddings prepare temp index: %w", err)
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, content
+FROM memory_items
+WHERE agent_id = ?
+AND deleted_at_ms = 0
+AND (expires_at_ms = 0 OR expires_at_ms > ?)
+ORDER BY last_seen_at_ms ASC`, agentID, nowMS())
+	if err != nil {
+		return report, fmt.Errorf("reindex embeddings query items: %w", err)
+	}
+	defer rows.Close()
+
+	total := 0
+	now := nowMS()
+	for rows.Next() {
+		total++
+		var itemID string
+		var content string
+		if err := rows.Scan(&itemID, &content); err != nil {
+			return report, fmt.Errorf("reindex embeddings scan item: %w", err)
+		}
+		model, vector, vecErr := vectorize(content)
+		if vecErr != nil {
+			report.FailedItems++
+			continue
+		}
+		if strings.TrimSpace(model) == "" {
+			model = currentEmbeddingModel()
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO memory_embeddings_reindex_tmp(item_id, model, vector_json, norm, updated_at_ms)
+VALUES(?, ?, ?, ?, ?)`, itemID, model, encodeVector(vector), vectorNorm(vector), now); err != nil {
+			return report, fmt.Errorf("reindex embeddings insert temp vector: %w", err)
+		}
+		report.IndexedItems++
+	}
+	if err := rows.Err(); err != nil {
+		return report, fmt.Errorf("reindex embeddings iterate items: %w", err)
+	}
+	if total > 0 && report.IndexedItems == 0 {
+		return report, fmt.Errorf("reindex embeddings aborted: no vectors produced")
+	}
+
+	swapStmts := []string{
+		`ALTER TABLE memory_embeddings RENAME TO memory_embeddings_reindex_old;`,
+		`ALTER TABLE memory_embeddings_reindex_tmp RENAME TO memory_embeddings;`,
+		`DROP TABLE memory_embeddings_reindex_old;`,
+	}
+	for _, stmt := range swapStmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return report, fmt.Errorf("reindex embeddings swap index: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return report, fmt.Errorf("reindex embeddings commit: %w", err)
+	}
+	report.DurationMS = time.Since(start).Milliseconds()
+	return report, nil
+}
+
 func uniqueStrings(values []string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(values))
@@ -1620,6 +1931,7 @@ func buildMemoryItemFromOp(op ConsolidationOp, ev Event, userID, agentID string,
 		FirstSeenAtMS: ev.CreatedAt.UnixMilli(),
 		LastSeenAtMS:  ev.CreatedAt.UnixMilli(),
 		ExpiresAtMS:   0,
+		Evergreen:     strings.EqualFold(strings.TrimSpace(op.Metadata["evergreen"]), "true"),
 		Metadata:      op.Metadata,
 	}
 	if item.FirstSeenAtMS == 0 {
@@ -2407,15 +2719,16 @@ func upsertMemoryItemTx(ctx context.Context, tx *sql.Tx, item MemoryItem) (strin
 	var existingWeight float64
 	var existingSource string
 	var existingSession string
+	var existingEvergreen int
 	var existingMetaMap map[string]string
 	var existingMeta string
 	row := tx.QueryRowContext(ctx, `
-SELECT id, content, confidence, weight, source_event_id, session_key, metadata_json
+SELECT id, content, confidence, weight, source_event_id, session_key, evergreen, metadata_json
 FROM memory_items
 WHERE user_id = ? AND agent_id = ? AND scope_type = ? AND scope_id = ? AND kind = ? AND item_key = ?`,
 		item.UserID, item.AgentID, string(item.ScopeType), item.ScopeID, string(item.Kind), item.Key,
 	)
-	switch err := row.Scan(&existingID, &existingContent, &existingConfidence, &existingWeight, &existingSource, &existingSession, &existingMeta); {
+	switch err := row.Scan(&existingID, &existingContent, &existingConfidence, &existingWeight, &existingSource, &existingSession, &existingEvergreen, &existingMeta); {
 	case err == nil:
 		confidence := existingConfidence
 		if item.Confidence > confidence {
@@ -2449,10 +2762,14 @@ WHERE user_id = ? AND agent_id = ? AND scope_type = ? AND scope_id = ? AND kind 
 		if changed {
 			metaMap["content_changed_at_ms"] = fmt.Sprintf("%d", nowMS())
 		}
+		evergreen := 0
+		if existingEvergreen == 1 || item.Evergreen {
+			evergreen = 1
+		}
 		meta := encodeMap(metaMap)
 		if _, err := tx.ExecContext(ctx, `
 UPDATE memory_items
-SET content = ?, session_key = ?, confidence = ?, weight = ?, source_event_id = ?, last_seen_at_ms = ?, expires_at_ms = ?, deleted_at_ms = 0, metadata_json = ?
+SET content = ?, session_key = ?, confidence = ?, weight = ?, source_event_id = ?, last_seen_at_ms = ?, expires_at_ms = ?, deleted_at_ms = 0, evergreen = ?, metadata_json = ?
 WHERE id = ?`,
 			content,
 			session,
@@ -2461,6 +2778,7 @@ WHERE id = ?`,
 			source,
 			item.LastSeenAtMS,
 			item.ExpiresAtMS,
+			evergreen,
 			meta,
 			existingID,
 		); err != nil {
@@ -2480,8 +2798,8 @@ WHERE id = ?`,
 		return existingID, nil
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO memory_items(id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, metadata_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+INSERT INTO memory_items(id, user_id, agent_id, scope_type, scope_id, session_key, kind, item_key, content, confidence, weight, source_event_id, first_seen_at_ms, last_seen_at_ms, expires_at_ms, deleted_at_ms, evergreen, metadata_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 			item.ID,
 			item.UserID,
 			item.AgentID,
@@ -2497,6 +2815,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
 			item.FirstSeenAtMS,
 			item.LastSeenAtMS,
 			item.ExpiresAtMS,
+			boolToInt(item.Evergreen),
 			encodeMap(item.Metadata),
 		); err != nil {
 			return "", fmt.Errorf("insert memory_items id=%s key=%s scope=%s/%s: %w", item.ID, item.Key, item.ScopeType, item.ScopeID, err)
@@ -2526,6 +2845,13 @@ func clampConfidence(v float64) float64 {
 		return 1
 	}
 	return v
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func normalizeMemoryScope(item *MemoryItem) {

@@ -10,6 +10,7 @@ build/
 *.out
 /dotagent
 /dotagent-test
+.gocache
 
 # DotAgent specific
 

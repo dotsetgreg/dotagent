@@ -59,13 +59,18 @@ type AgentsConfig struct {
 }
 
 type AgentDefaults struct {
-	Workspace           string  `json:"workspace" env:"DOTAGENT_AGENTS_DEFAULTS_WORKSPACE"`
-	RestrictToWorkspace bool    `json:"restrict_to_workspace" env:"DOTAGENT_AGENTS_DEFAULTS_RESTRICT_TO_WORKSPACE"`
-	Provider            string  `json:"provider" env:"DOTAGENT_AGENTS_DEFAULTS_PROVIDER"`
-	Model               string  `json:"model" env:"DOTAGENT_AGENTS_DEFAULTS_MODEL"`
-	MaxTokens           int     `json:"max_tokens" env:"DOTAGENT_AGENTS_DEFAULTS_MAX_TOKENS"`
-	Temperature         float64 `json:"temperature" env:"DOTAGENT_AGENTS_DEFAULTS_TEMPERATURE"`
-	MaxToolIterations   int     `json:"max_tool_iterations" env:"DOTAGENT_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+	Workspace                 string  `json:"workspace" env:"DOTAGENT_AGENTS_DEFAULTS_WORKSPACE"`
+	RestrictToWorkspace       bool    `json:"restrict_to_workspace" env:"DOTAGENT_AGENTS_DEFAULTS_RESTRICT_TO_WORKSPACE"`
+	Provider                  string  `json:"provider" env:"DOTAGENT_AGENTS_DEFAULTS_PROVIDER"`
+	Model                     string  `json:"model" env:"DOTAGENT_AGENTS_DEFAULTS_MODEL"`
+	MaxTokens                 int     `json:"max_tokens" env:"DOTAGENT_AGENTS_DEFAULTS_MAX_TOKENS"`
+	Temperature               float64 `json:"temperature" env:"DOTAGENT_AGENTS_DEFAULTS_TEMPERATURE"`
+	MaxToolIterations         int     `json:"max_tool_iterations" env:"DOTAGENT_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+	MaxConcurrentRuns         int     `json:"max_concurrent_runs" env:"DOTAGENT_AGENTS_DEFAULTS_MAX_CONCURRENT_RUNS"`
+	SessionFileLockEnabled    bool    `json:"session_file_lock_enabled" env:"DOTAGENT_AGENTS_DEFAULTS_SESSION_FILE_LOCK_ENABLED"`
+	SessionLockTimeoutMS      int     `json:"session_lock_timeout_ms" env:"DOTAGENT_AGENTS_DEFAULTS_SESSION_LOCK_TIMEOUT_MS"`
+	SessionLockStaleSeconds   int     `json:"session_lock_stale_seconds" env:"DOTAGENT_AGENTS_DEFAULTS_SESSION_LOCK_STALE_SECONDS"`
+	SessionLockMaxHoldSeconds int     `json:"session_lock_max_hold_seconds" env:"DOTAGENT_AGENTS_DEFAULTS_SESSION_LOCK_MAX_HOLD_SECONDS"`
 }
 
 type ChannelsConfig struct {
@@ -137,31 +142,65 @@ type ToolsConfig struct {
 }
 
 type MemoryConfig struct {
-	MaxRecallItems        int     `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
-	CandidateLimit        int     `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
-	RetrievalCacheSeconds int     `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
-	WorkerPollMS          int     `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
-	WorkerLeaseSeconds    int     `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
-	EmbeddingModel        string  `json:"embedding_model" env:"DOTAGENT_MEMORY_EMBEDDING_MODEL"`
-	EventRetentionDays    int     `json:"event_retention_days" env:"DOTAGENT_MEMORY_EVENT_RETENTION_DAYS"`
-	AuditRetentionDays    int     `json:"audit_retention_days" env:"DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS"`
-	PersonaSyncApply      bool    `json:"persona_sync_apply" env:"DOTAGENT_MEMORY_PERSONA_SYNC_APPLY"`
-	PersonaFileSyncMode   string  `json:"persona_file_sync_mode" env:"DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE"`
-	PersonaPolicyMode     string  `json:"persona_policy_mode" env:"DOTAGENT_MEMORY_PERSONA_POLICY_MODE"`
-	PersonaMinConfidence  float64 `json:"persona_min_confidence" env:"DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE"`
+	MaxRecallItems                      int      `json:"max_recall_items" env:"DOTAGENT_MEMORY_MAX_RECALL_ITEMS"`
+	CandidateLimit                      int      `json:"candidate_limit" env:"DOTAGENT_MEMORY_CANDIDATE_LIMIT"`
+	RetrievalCacheSeconds               int      `json:"retrieval_cache_seconds" env:"DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS"`
+	WorkerPollMS                        int      `json:"worker_poll_ms" env:"DOTAGENT_MEMORY_WORKER_POLL_MS"`
+	WorkerLeaseSeconds                  int      `json:"worker_lease_seconds" env:"DOTAGENT_MEMORY_WORKER_LEASE_SECONDS"`
+	EmbeddingModel                      string   `json:"embedding_model" env:"DOTAGENT_MEMORY_EMBEDDING_MODEL"`
+	EmbeddingFallbackModels             []string `json:"embedding_fallback_models" env:"DOTAGENT_MEMORY_EMBEDDING_FALLBACK_MODELS"`
+	EmbeddingOllamaAPIBase              string   `json:"embedding_ollama_api_base" env:"DOTAGENT_MEMORY_EMBEDDING_OLLAMA_API_BASE"`
+	EmbeddingBatchSize                  int      `json:"embedding_batch_size" env:"DOTAGENT_MEMORY_EMBEDDING_BATCH_SIZE"`
+	EmbeddingConcurrency                int      `json:"embedding_concurrency" env:"DOTAGENT_MEMORY_EMBEDDING_CONCURRENCY"`
+	ToolLoopDetectionEnabled            bool     `json:"tool_loop_detection_enabled" env:"DOTAGENT_MEMORY_TOOL_LOOP_DETECTION_ENABLED"`
+	ToolLoopWarningsEnabled             bool     `json:"tool_loop_warnings_enabled" env:"DOTAGENT_MEMORY_TOOL_LOOP_WARNINGS_ENABLED"`
+	ToolLoopSignatureWarnThreshold      int      `json:"tool_loop_signature_warn_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_SIGNATURE_WARN_THRESHOLD"`
+	ToolLoopSignatureCriticalThreshold  int      `json:"tool_loop_signature_critical_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_SIGNATURE_CRITICAL_THRESHOLD"`
+	ToolLoopDriftWarnThreshold          int      `json:"tool_loop_drift_warn_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_DRIFT_WARN_THRESHOLD"`
+	ToolLoopDriftCriticalThreshold      int      `json:"tool_loop_drift_critical_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_DRIFT_CRITICAL_THRESHOLD"`
+	ToolLoopPollingWarnThreshold        int      `json:"tool_loop_polling_warn_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_POLLING_WARN_THRESHOLD"`
+	ToolLoopPollingCriticalThreshold    int      `json:"tool_loop_polling_critical_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_POLLING_CRITICAL_THRESHOLD"`
+	ToolLoopNoProgressWarnThreshold     int      `json:"tool_loop_no_progress_warn_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_NO_PROGRESS_WARN_THRESHOLD"`
+	ToolLoopNoProgressCriticalThreshold int      `json:"tool_loop_no_progress_critical_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_NO_PROGRESS_CRITICAL_THRESHOLD"`
+	ToolLoopPingPongWarnThreshold       int      `json:"tool_loop_ping_pong_warn_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_PING_PONG_WARN_THRESHOLD"`
+	ToolLoopPingPongCriticalThreshold   int      `json:"tool_loop_ping_pong_critical_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_PING_PONG_CRITICAL_THRESHOLD"`
+	ToolLoopGlobalCircuitThreshold      int      `json:"tool_loop_global_circuit_threshold" env:"DOTAGENT_MEMORY_TOOL_LOOP_GLOBAL_CIRCUIT_THRESHOLD"`
+	ContextPruningMode                  string   `json:"context_pruning_mode" env:"DOTAGENT_MEMORY_CONTEXT_PRUNING_MODE"`
+	ContextPruningKeepLastToolResults   int      `json:"context_pruning_keep_last_tool_results" env:"DOTAGENT_MEMORY_CONTEXT_PRUNING_KEEP_LAST_TOOL_RESULTS"`
+	EventRetentionDays                  int      `json:"event_retention_days" env:"DOTAGENT_MEMORY_EVENT_RETENTION_DAYS"`
+	AuditRetentionDays                  int      `json:"audit_retention_days" env:"DOTAGENT_MEMORY_AUDIT_RETENTION_DAYS"`
+	PersonaSyncApply                    bool     `json:"persona_sync_apply" env:"DOTAGENT_MEMORY_PERSONA_SYNC_APPLY"`
+	PersonaFileSyncMode                 string   `json:"persona_file_sync_mode" env:"DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE"`
+	PersonaPolicyMode                   string   `json:"persona_policy_mode" env:"DOTAGENT_MEMORY_PERSONA_POLICY_MODE"`
+	PersonaMinConfidence                float64  `json:"persona_min_confidence" env:"DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE"`
+	CompactionSummaryTimeoutSeconds     int      `json:"compaction_summary_timeout_seconds" env:"DOTAGENT_MEMORY_COMPACTION_SUMMARY_TIMEOUT_SECONDS"`
+	CompactionChunkChars                int      `json:"compaction_chunk_chars" env:"DOTAGENT_MEMORY_COMPACTION_CHUNK_CHARS"`
+	CompactionMaxTranscriptChars        int      `json:"compaction_max_transcript_chars" env:"DOTAGENT_MEMORY_COMPACTION_MAX_TRANSCRIPT_CHARS"`
+	CompactionPartialSkipChars          int      `json:"compaction_partial_skip_chars" env:"DOTAGENT_MEMORY_COMPACTION_PARTIAL_SKIP_CHARS"`
+	FileMemoryEnabled                   bool     `json:"file_memory_enabled" env:"DOTAGENT_MEMORY_FILE_MEMORY_ENABLED"`
+	FileMemoryDir                       string   `json:"file_memory_dir" env:"DOTAGENT_MEMORY_FILE_MEMORY_DIR"`
+	FileMemoryPollSeconds               int      `json:"file_memory_poll_seconds" env:"DOTAGENT_MEMORY_FILE_MEMORY_POLL_SECONDS"`
+	FileMemoryWatchEnabled              bool     `json:"file_memory_watch_enabled" env:"DOTAGENT_MEMORY_FILE_MEMORY_WATCH_ENABLED"`
+	FileMemoryWatchDebounceMS           int      `json:"file_memory_watch_debounce_ms" env:"DOTAGENT_MEMORY_FILE_MEMORY_WATCH_DEBOUNCE_MS"`
+	FileMemoryMaxFileBytes              int      `json:"file_memory_max_file_bytes" env:"DOTAGENT_MEMORY_FILE_MEMORY_MAX_FILE_BYTES"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
-				Workspace:           "~/.dotagent/workspace",
-				RestrictToWorkspace: true,
-				Provider:            "openrouter",
-				Model:               "openai/gpt-5.2",
-				MaxTokens:           16384,
-				Temperature:         0.7,
-				MaxToolIterations:   50,
+				Workspace:                 "~/.dotagent/workspace",
+				RestrictToWorkspace:       true,
+				Provider:                  "openrouter",
+				Model:                     "openai/gpt-5.2",
+				MaxTokens:                 16384,
+				Temperature:               0.7,
+				MaxToolIterations:         50,
+				MaxConcurrentRuns:         4,
+				SessionFileLockEnabled:    true,
+				SessionLockTimeoutMS:      15000,
+				SessionLockStaleSeconds:   1800,
+				SessionLockMaxHoldSeconds: 420,
 			},
 		},
 		Channels: ChannelsConfig{
@@ -193,18 +232,47 @@ func DefaultConfig() *Config {
 			},
 		},
 		Memory: MemoryConfig{
-			MaxRecallItems:        8,
-			CandidateLimit:        80,
-			RetrievalCacheSeconds: 20,
-			WorkerPollMS:          700,
-			WorkerLeaseSeconds:    60,
-			EmbeddingModel:        "dotagent-chargram-384-v1",
-			EventRetentionDays:    90,
-			AuditRetentionDays:    365,
-			PersonaSyncApply:      true,
-			PersonaFileSyncMode:   "export_only",
-			PersonaPolicyMode:     "balanced",
-			PersonaMinConfidence:  0.52,
+			MaxRecallItems:                      8,
+			CandidateLimit:                      80,
+			RetrievalCacheSeconds:               20,
+			WorkerPollMS:                        700,
+			WorkerLeaseSeconds:                  60,
+			EmbeddingModel:                      "dotagent-chargram-384-v1",
+			EmbeddingFallbackModels:             []string{"dotagent-chargram-384-v1", "dotagent-hash-256-v1"},
+			EmbeddingOllamaAPIBase:              "http://127.0.0.1:11434",
+			EmbeddingBatchSize:                  96,
+			EmbeddingConcurrency:                2,
+			ToolLoopDetectionEnabled:            true,
+			ToolLoopWarningsEnabled:             true,
+			ToolLoopSignatureWarnThreshold:      2,
+			ToolLoopSignatureCriticalThreshold:  3,
+			ToolLoopDriftWarnThreshold:          6,
+			ToolLoopDriftCriticalThreshold:      8,
+			ToolLoopPollingWarnThreshold:        4,
+			ToolLoopPollingCriticalThreshold:    5,
+			ToolLoopNoProgressWarnThreshold:     4,
+			ToolLoopNoProgressCriticalThreshold: 6,
+			ToolLoopPingPongWarnThreshold:       4,
+			ToolLoopPingPongCriticalThreshold:   6,
+			ToolLoopGlobalCircuitThreshold:      12,
+			ContextPruningMode:                  "off",
+			ContextPruningKeepLastToolResults:   5,
+			EventRetentionDays:                  90,
+			AuditRetentionDays:                  365,
+			PersonaSyncApply:                    true,
+			PersonaFileSyncMode:                 "export_only",
+			PersonaPolicyMode:                   "balanced",
+			PersonaMinConfidence:                0.52,
+			CompactionSummaryTimeoutSeconds:     60,
+			CompactionChunkChars:                9000,
+			CompactionMaxTranscriptChars:        48000,
+			CompactionPartialSkipChars:          2600,
+			FileMemoryEnabled:                   true,
+			FileMemoryDir:                       "",
+			FileMemoryPollSeconds:               15,
+			FileMemoryWatchEnabled:              true,
+			FileMemoryWatchDebounceMS:           1200,
+			FileMemoryMaxFileBytes:              262144,
 		},
 		Heartbeat: HeartbeatConfig{
 			Enabled:  true,

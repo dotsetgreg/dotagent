@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,23 +31,29 @@ import (
 )
 
 type AgentLoop struct {
-	bus            *bus.MessageBus
-	provider       providers.LLMProvider
-	providerName   string
-	workspace      string
-	workspaceID    string
-	model          string
-	temperature    float64
-	completionMax  int
-	contextWindow  int // Maximum context window size in tokens
-	maxIterations  int
-	memory         *memory.Service
-	state          *state.Manager
-	contextBuilder *ContextBuilder
-	tools          *tools.ToolRegistry
-	toolpacks      *toolpacks.Manager
-	running        atomic.Bool
-	channelManager *channels.Manager
+	bus                    *bus.MessageBus
+	provider               providers.LLMProvider
+	providerName           string
+	workspace              string
+	workspaceID            string
+	model                  string
+	temperature            float64
+	completionMax          int
+	contextWindow          int // Maximum context window size in tokens
+	contextPruningMode     string
+	contextPruningKeepLast int
+	loopDetectionCfg       tools.ToolLoopDetectionConfig
+	maxIterations          int
+	maxConcurrent          int
+	memory                 *memory.Service
+	state                  *state.Manager
+	contextBuilder         *ContextBuilder
+	tools                  *tools.ToolRegistry
+	toolpacks              *toolpacks.Manager
+	scheduler              *sessionScheduler
+	sessionLocks           *sessionLockManager
+	running                atomic.Bool
+	channelManager         *channels.Manager
 }
 
 // processOptions configures how a message is processed
@@ -59,6 +66,7 @@ type processOptions struct {
 	DefaultResponse string // Response when LLM returns empty
 	EnableSummary   bool   // Whether to trigger summarization
 	SendResponse    bool   // Whether to send response via bus
+	StreamResponse  bool   // Whether to stream partial LLM output via bus
 	NoHistory       bool   // If true, don't load session history (for heartbeat)
 }
 
@@ -217,24 +225,91 @@ TURN TRANSCRIPT:
 		return parsePersonaCandidatesResponse(resp.Content), nil
 	}
 
+	resolvedContextWindow := resolveRuntimeContextWindow(provider, cfg.Agents.Defaults.Model, cfg.Agents.Defaults.MaxTokens)
+	compactionHooks := memory.CompactionHooks{
+		Before: func(_ context.Context, payload memory.CompactionHookPayload) {
+			if msgBus == nil {
+				return
+			}
+			_ = msgBus.PublishEvent(bus.EventMessage{
+				Type:       "before_compaction",
+				SessionKey: payload.SessionKey,
+				Metadata: map[string]string{
+					"user_id":        payload.UserID,
+					"agent_id":       payload.AgentID,
+					"compaction_id":  payload.CompactionID,
+					"status":         payload.Status,
+					"stage":          payload.Stage,
+					"source_count":   strconv.Itoa(payload.SourceCount),
+					"retained_count": strconv.Itoa(payload.RetainedCount),
+				},
+			})
+		},
+		After: func(_ context.Context, payload memory.CompactionHookPayload) {
+			if msgBus == nil {
+				return
+			}
+			_ = msgBus.PublishEvent(bus.EventMessage{
+				Type:       "after_compaction",
+				SessionKey: payload.SessionKey,
+				Metadata: map[string]string{
+					"user_id":        payload.UserID,
+					"agent_id":       payload.AgentID,
+					"compaction_id":  payload.CompactionID,
+					"status":         payload.Status,
+					"stage":          payload.Stage,
+					"source_count":   strconv.Itoa(payload.SourceCount),
+					"retained_count": strconv.Itoa(payload.RetainedCount),
+					"archived_count": strconv.Itoa(payload.ArchivedCount),
+					"summary_length": strconv.Itoa(payload.SummaryLength),
+					"recovery_mode":  payload.RecoveryMode,
+					"error":          payload.Error,
+				},
+			})
+		},
+	}
+
 	memSvc, err := memory.NewService(memory.Config{
-		Workspace:            workspace,
-		AgentID:              "dotagent",
-		EmbeddingModel:       cfg.Memory.EmbeddingModel,
-		MaxContextTokens:     cfg.Agents.Defaults.MaxTokens,
-		MaxRecallItems:       cfg.Memory.MaxRecallItems,
-		CandidateLimit:       cfg.Memory.CandidateLimit,
-		RetrievalCache:       time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
-		WorkerLease:          time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
-		WorkerPoll:           time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
-		EventRetention:       time.Duration(cfg.Memory.EventRetentionDays) * 24 * time.Hour,
-		AuditRetention:       time.Duration(cfg.Memory.AuditRetentionDays) * 24 * time.Hour,
-		PersonaCardTokens:    480,
-		PersonaExtractor:     personaExtractFn,
-		PersonaSyncApply:     cfg.Memory.PersonaSyncApply,
-		PersonaFileSync:      memory.NormalizePersonaFileSyncMode(cfg.Memory.PersonaFileSyncMode),
-		PersonaPolicyMode:    cfg.Memory.PersonaPolicyMode,
-		PersonaMinConfidence: cfg.Memory.PersonaMinConfidence,
+		Workspace:               workspace,
+		AgentID:                 "dotagent",
+		ContextModel:            cfg.Agents.Defaults.Model,
+		EmbeddingModel:          cfg.Memory.EmbeddingModel,
+		EmbeddingFallbackModels: append([]string(nil), cfg.Memory.EmbeddingFallbackModels...),
+		EmbeddingOpenAIToken: firstNonEmpty(
+			strings.TrimSpace(cfg.Providers.OpenAI.APIKey),
+			strings.TrimSpace(cfg.Providers.OpenAI.OAuthAccessToken),
+		),
+		EmbeddingOpenAIAPIBase:       strings.TrimSpace(cfg.Providers.OpenAI.APIBase),
+		EmbeddingOpenRouterKey:       strings.TrimSpace(cfg.Providers.OpenRouter.APIKey),
+		EmbeddingOpenRouterBase:      strings.TrimSpace(cfg.Providers.OpenRouter.APIBase),
+		EmbeddingOllamaAPIBase:       strings.TrimSpace(cfg.Memory.EmbeddingOllamaAPIBase),
+		EmbeddingBatchSize:           cfg.Memory.EmbeddingBatchSize,
+		EmbeddingConcurrency:         cfg.Memory.EmbeddingConcurrency,
+		MaxContextTokens:             resolvedContextWindow,
+		MaxRecallItems:               cfg.Memory.MaxRecallItems,
+		CandidateLimit:               cfg.Memory.CandidateLimit,
+		RetrievalCache:               time.Duration(cfg.Memory.RetrievalCacheSeconds) * time.Second,
+		WorkerLease:                  time.Duration(cfg.Memory.WorkerLeaseSeconds) * time.Second,
+		WorkerPoll:                   time.Duration(cfg.Memory.WorkerPollMS) * time.Millisecond,
+		EventRetention:               time.Duration(cfg.Memory.EventRetentionDays) * 24 * time.Hour,
+		AuditRetention:               time.Duration(cfg.Memory.AuditRetentionDays) * 24 * time.Hour,
+		PersonaCardTokens:            480,
+		PersonaExtractor:             personaExtractFn,
+		PersonaSyncApply:             cfg.Memory.PersonaSyncApply,
+		PersonaFileSync:              memory.NormalizePersonaFileSyncMode(cfg.Memory.PersonaFileSyncMode),
+		PersonaPolicyMode:            cfg.Memory.PersonaPolicyMode,
+		PersonaMinConfidence:         cfg.Memory.PersonaMinConfidence,
+		CompactionSummaryTimeout:     time.Duration(cfg.Memory.CompactionSummaryTimeoutSeconds) * time.Second,
+		CompactionChunkChars:         cfg.Memory.CompactionChunkChars,
+		CompactionMaxTranscriptChars: cfg.Memory.CompactionMaxTranscriptChars,
+		CompactionPartialSkipChars:   cfg.Memory.CompactionPartialSkipChars,
+		CompactionHooks:              compactionHooks,
+		FileMemoryEnabled:            cfg.Memory.FileMemoryEnabled,
+		FileMemoryDir:                strings.TrimSpace(cfg.Memory.FileMemoryDir),
+		FileMemoryPoll:               time.Duration(cfg.Memory.FileMemoryPollSeconds) * time.Second,
+		FileMemoryWatchEnabled:       cfg.Memory.FileMemoryWatchEnabled,
+		FileMemoryWatchDebounce:      time.Duration(cfg.Memory.FileMemoryWatchDebounceMS) * time.Millisecond,
+		FileMemoryMaxFileBytes:       cfg.Memory.FileMemoryMaxFileBytes,
 	}, summarizeFn)
 	if err != nil {
 		return nil, fmt.Errorf("initialize memory service: %w", err)
@@ -250,21 +325,46 @@ TURN TRANSCRIPT:
 	}
 
 	agentLoop := &AgentLoop{
-		bus:            msgBus,
-		provider:       provider,
-		providerName:   providers.ActiveProviderName(cfg),
-		workspace:      workspace,
-		workspaceID:    workspaceNamespace(workspace),
-		model:          cfg.Agents.Defaults.Model,
-		temperature:    temperature,
-		completionMax:  completionMax,
-		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
+		bus:                    msgBus,
+		provider:               provider,
+		providerName:           providers.ActiveProviderName(cfg),
+		workspace:              workspace,
+		workspaceID:            workspaceNamespace(workspace),
+		model:                  cfg.Agents.Defaults.Model,
+		temperature:            temperature,
+		completionMax:          completionMax,
+		contextWindow:          resolvedContextWindow,
+		contextPruningMode:     strings.TrimSpace(cfg.Memory.ContextPruningMode),
+		contextPruningKeepLast: cfg.Memory.ContextPruningKeepLastToolResults,
+		loopDetectionCfg: tools.ToolLoopDetectionConfig{
+			Enabled:                     cfg.Memory.ToolLoopDetectionEnabled,
+			WarningsEnabled:             cfg.Memory.ToolLoopWarningsEnabled,
+			SignatureWarnThreshold:      cfg.Memory.ToolLoopSignatureWarnThreshold,
+			SignatureCriticalThreshold:  cfg.Memory.ToolLoopSignatureCriticalThreshold,
+			DriftWarnThreshold:          cfg.Memory.ToolLoopDriftWarnThreshold,
+			DriftCriticalThreshold:      cfg.Memory.ToolLoopDriftCriticalThreshold,
+			PollingWarnThreshold:        cfg.Memory.ToolLoopPollingWarnThreshold,
+			PollingCriticalThreshold:    cfg.Memory.ToolLoopPollingCriticalThreshold,
+			NoProgressWarnThreshold:     cfg.Memory.ToolLoopNoProgressWarnThreshold,
+			NoProgressCriticalThreshold: cfg.Memory.ToolLoopNoProgressCriticalThreshold,
+			PingPongWarnThreshold:       cfg.Memory.ToolLoopPingPongWarnThreshold,
+			PingPongCriticalThreshold:   cfg.Memory.ToolLoopPingPongCriticalThreshold,
+			GlobalCircuitThreshold:      cfg.Memory.ToolLoopGlobalCircuitThreshold,
+		},
 		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
+		maxConcurrent:  cfg.Agents.Defaults.MaxConcurrentRuns,
 		memory:         memSvc,
 		state:          stateManager,
 		contextBuilder: contextBuilder,
 		tools:          toolsRegistry,
 		toolpacks:      packManager,
+		sessionLocks: newSessionLockManager(sessionLockOptions{
+			WorkspaceRoot:   workspace,
+			FileLockEnabled: cfg.Agents.Defaults.SessionFileLockEnabled,
+			LockTimeout:     time.Duration(cfg.Agents.Defaults.SessionLockTimeoutMS) * time.Millisecond,
+			StaleAfter:      time.Duration(cfg.Agents.Defaults.SessionLockStaleSeconds) * time.Second,
+			MaxHoldDuration: time.Duration(cfg.Agents.Defaults.SessionLockMaxHoldSeconds) * time.Second,
+		}),
 	}
 
 	sessionTool := tools.NewSessionTool(
@@ -275,12 +375,30 @@ TURN TRANSCRIPT:
 		agentLoop.ProcessDirectWithChannel,
 	)
 	toolsRegistry.Register(sessionTool)
+	if agentLoop.maxIterations <= 0 {
+		agentLoop.maxIterations = 50
+	}
+	if agentLoop.maxConcurrent <= 0 {
+		agentLoop.maxConcurrent = 4
+	}
 
 	return agentLoop, nil
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
+	scheduler := newSessionScheduler(al.maxConcurrent)
+	al.scheduler = scheduler
+	defer func() {
+		scheduler.Stop()
+		if !scheduler.Wait(5 * time.Second) {
+			logger.WarnCF("agent", "Timed out waiting for in-flight session tasks during shutdown", map[string]interface{}{
+				"timeout_ms": 5000,
+			})
+		}
+		al.scheduler = nil
+		al.closeResources()
+	}()
 
 	for al.running.Load() {
 		select {
@@ -291,24 +409,25 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 			if !ok {
 				continue
 			}
+			incoming := msg
+			laneKey := al.resolveLaneKey(incoming)
+			_ = scheduler.Submit(laneKey, func() {
+				roundState := tools.NewExecutionRoundState()
+				roundCtx := tools.WithExecutionRoundState(ctx, roundState)
 
-			roundState := tools.NewExecutionRoundState()
-			roundCtx := tools.WithExecutionRoundState(ctx, roundState)
+				response, err := al.processMessage(roundCtx, incoming)
+				if err != nil {
+					response = fmt.Sprintf("Error processing message: %v", err)
+				}
 
-			response, err := al.processMessage(roundCtx, msg)
-			if err != nil {
-				response = fmt.Sprintf("Error processing message: %v", err)
-			}
-
-			if response != "" {
-				if !roundState.MessageSent() {
+				if response != "" && !roundState.MessageSent() {
 					al.publishOutbound(bus.OutboundMessage{
-						Channel: msg.Channel,
-						ChatID:  msg.ChatID,
+						Channel: incoming.Channel,
+						ChatID:  incoming.ChatID,
 						Content: response,
 					}, "run_loop_response")
 				}
-			}
+			})
 		}
 	}
 
@@ -317,6 +436,14 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 func (al *AgentLoop) Stop() {
 	al.running.Store(false)
+	if al.scheduler != nil {
+		al.scheduler.Stop()
+		return
+	}
+	al.closeResources()
+}
+
+func (al *AgentLoop) closeResources() {
 	if al.tools != nil {
 		if err := al.tools.Close(); err != nil {
 			logger.WarnCF("agent", "Tool teardown reported errors", map[string]interface{}{"error": err.Error()})
@@ -325,6 +452,20 @@ func (al *AgentLoop) Stop() {
 	if al.memory != nil {
 		_ = al.memory.Close()
 	}
+	if al.sessionLocks != nil {
+		al.sessionLocks.Close()
+	}
+}
+
+func (al *AgentLoop) resolveLaneKey(msg bus.InboundMessage) string {
+	actorID := valueOr(msg.SenderID, "local-user")
+	if laneKey, err := resolveSessionKey(msg.SessionKey, al.workspaceID, msg.Channel, msg.ChatID, actorID); err == nil {
+		return laneKey
+	}
+	if strings.TrimSpace(msg.SessionKey) != "" {
+		return strings.TrimSpace(msg.SessionKey)
+	}
+	return fmt.Sprintf("%s|%s|%s", valueOr(msg.Channel, "unknown"), valueOr(msg.ChatID, "unknown"), actorID)
 }
 
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {
@@ -375,6 +516,7 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 		DefaultResponse: "I've completed processing but have no response to give.",
 		EnableSummary:   false,
 		SendResponse:    false,
+		StreamResponse:  false,
 		NoHistory:       true, // Don't load session history for heartbeat
 	})
 }
@@ -415,6 +557,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		DefaultResponse: "I've completed processing but have no response to give.",
 		EnableSummary:   true,
 		SendResponse:    false,
+		StreamResponse:  true,
 	})
 }
 
@@ -498,6 +641,13 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	} else if strings.TrimSpace(opts.SessionKey) == "" {
 		opts.SessionKey = "ephemeral:no_history"
 	}
+	if al.sessionLocks != nil {
+		unlock, lockErr := al.sessionLocks.Acquire(ctx, opts.SessionKey)
+		if lockErr != nil {
+			return "", fmt.Errorf("acquire session lock: %w", lockErr)
+		}
+		defer unlock()
+	}
 
 	// 1. Ensure memory session exists
 	if !opts.NoHistory {
@@ -536,15 +686,27 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		seq++
 
 		if recordedUserTurn {
-			report, applyErr := al.memory.ApplyPersonaDirectivesSync(ctx, opts.SessionKey, turnID, opts.UserID)
-			if applyErr != nil {
-				logger.WarnCF("agent", "Synchronous persona apply failed", map[string]interface{}{
-					"error":       applyErr.Error(),
+			if shouldApplyPersonaSyncFastPath(opts.UserMessage) {
+				report, applyErr := al.memory.ApplyPersonaDirectivesSync(ctx, opts.SessionKey, turnID, opts.UserID)
+				if applyErr != nil {
+					logger.WarnCF("agent", "Synchronous persona apply failed", map[string]interface{}{
+						"error":       applyErr.Error(),
+						"session_key": opts.SessionKey,
+						"turn_id":     turnID,
+					})
+				} else {
+					syncPersonaReport = report
+				}
+			} else {
+				_ = al.memory.AddMetric(ctx, "memory.persona.apply_sync.skipped", 1, map[string]string{
+					"session_key": opts.SessionKey,
+					"user_id":     opts.UserID,
+					"reason":      "no_directive_signal",
+				})
+				logger.DebugCF("agent", "Skipping synchronous persona apply for non-directive turn", map[string]interface{}{
 					"session_key": opts.SessionKey,
 					"turn_id":     turnID,
 				})
-			} else {
-				syncPersonaReport = report
 			}
 		}
 	}
@@ -553,7 +715,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	var history []providers.Message
 	var summary string
 	var recall string
-	continuityNote := ""
+	continuityNotes := []string{}
 	if !opts.NoHistory {
 		promptCtx, err := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
 		if err != nil {
@@ -564,7 +726,10 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 			recall = promptCtx.RecallPrompt
 			hasContinuityArtifacts := promptCtx.Continuity.HasHistory || promptCtx.Continuity.HasSummary || promptCtx.Continuity.HasRecall
 			if promptCtx.Continuity.Degraded && promptCtx.Continuity.HasPriorTurns && !hasContinuityArtifacts {
-				continuityNote = buildDegradedContinuitySystemNote(promptCtx.Continuity.DegradedBy)
+				continuityNotes = append(continuityNotes, buildDegradedContinuitySystemNote(promptCtx.Continuity.DegradedBy))
+			}
+			if note := buildCompactionContinuationSystemNote(promptCtx.Continuity.ContinuationNotes); note != "" {
+				continuityNotes = append(continuityNotes, note)
 			}
 		}
 	}
@@ -583,18 +748,252 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		opts.ChatID,
 	)
 	personaNote := buildPersonaDecisionSystemNote(syncPersonaReport)
-	if continuityNote != "" {
-		messages = injectSystemNote(messages, continuityNote)
+	for _, note := range continuityNotes {
+		if note == "" {
+			continue
+		}
+		messages = injectSystemNote(messages, note)
 	}
 	if personaNote != "" {
 		messages = injectSystemNote(messages, personaNote)
 	}
 
-	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts, turnID, &seq, currentUserPrompt, personaNote, continuityNote)
+	// 4. Run shared LLM+tool iteration loop
+	providerStateID := ""
+	if !opts.NoHistory {
+		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey, al.providerName); err == nil {
+			providerStateID = strings.TrimSpace(sid)
+		}
+	}
+	retryCfg := providers.DefaultRetryConfig()
+	retryCfg.MaxAttempts = 3
+	retryCfg.MinDelay = 1500 * time.Millisecond
+	retryCfg.MaxDelay = 8 * time.Second
+	streamID := turnID
+	streamForwarder := newLLMStreamForwarder(func(chunk string) {
+		if chunk == "" || constants.IsInternalChannel(opts.Channel) {
+			return
+		}
+		al.publishOutbound(bus.OutboundMessage{
+			Channel:  opts.Channel,
+			ChatID:   opts.ChatID,
+			Content:  chunk,
+			Stream:   true,
+			StreamID: streamID,
+		}, "stream_delta")
+	})
+	if !opts.StreamResponse || opts.NoHistory || constants.IsInternalChannel(opts.Channel) || strings.TrimSpace(opts.ChatID) == "" {
+		streamForwarder = nil
+	}
+	overflowNoticeSent := false
+	loopResult, err := tools.RunToolLoop(ctx, tools.ToolLoopConfig{
+		Provider:               al.provider,
+		Model:                  al.model,
+		Tools:                  al.tools,
+		MaxIterations:          al.maxIterations,
+		LLMOptions:             map[string]any{"max_tokens": al.completionMax, "temperature": al.temperature},
+		ContextWindowTokens:    al.contextWindow,
+		Retry:                  retryCfg,
+		MaxOverflowCompactions: 3,
+		ContextPruningMode:     al.contextPruningMode,
+		ContextPruningKeepLast: al.contextPruningKeepLast,
+		LoopDetection:          al.loopDetectionCfg,
+		CallLLM: func(callCtx context.Context, loopMessages []providers.Message, toolDefs []providers.ToolDefinition, model string, callOpts map[string]interface{}) (*providers.LLMResponse, error) {
+			effectiveOpts := cloneLLMCallOptions(callOpts)
+			if streamForwarder != nil {
+				effectiveOpts["stream"] = true
+				effectiveOpts["stream_callback"] = func(delta string) {
+					streamForwarder.Push(delta)
+				}
+			}
+			if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
+				stateID := strings.TrimSpace(providerStateID)
+				response, newState, callErr := stateful.ChatWithState(callCtx, stateID, loopMessages, toolDefs, model, effectiveOpts)
+				if callErr == nil {
+					newState = strings.TrimSpace(newState)
+					if newState != "" && newState != stateID {
+						providerStateID = newState
+						_ = al.memory.SetProviderState(callCtx, opts.SessionKey, al.providerName, newState)
+					}
+				}
+				return response, callErr
+			}
+			return al.provider.Chat(callCtx, loopMessages, toolDefs, model, effectiveOpts)
+		},
+		RebuildContext: func(rebuildCtx context.Context) ([]providers.Message, error) {
+			if compactErr := al.memory.ForceCompact(rebuildCtx, opts.SessionKey, opts.UserID, al.contextWindow); compactErr != nil {
+				logger.WarnCF("agent", "Memory force compaction failed", map[string]interface{}{
+					"error":       compactErr.Error(),
+					"session_key": opts.SessionKey,
+				})
+			}
+			rebuilt, rebuildErr := al.memory.BuildPromptContext(rebuildCtx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
+			if rebuildErr != nil {
+				return nil, rebuildErr
+			}
+			rebuiltMessages := al.contextBuilder.BuildMessages(
+				toProviderMessages(rebuilt.History),
+				rebuilt.Summary,
+				rebuilt.RecallPrompt,
+				currentUserPrompt,
+				nil,
+				opts.Channel,
+				opts.ChatID,
+			)
+			for _, note := range continuityNotes {
+				if note == "" {
+					continue
+				}
+				rebuiltMessages = injectSystemNote(rebuiltMessages, note)
+			}
+			if personaNote != "" {
+				rebuiltMessages = injectSystemNote(rebuiltMessages, personaNote)
+			}
+			return rebuiltMessages, nil
+		},
+		Callbacks: tools.LoopCallbacks{
+			OnTransientRetry: func(_ context.Context, info providers.RetryInfo) {
+				logger.WarnCF("agent", "Transient LLM error detected, retrying", map[string]interface{}{
+					"error":      info.Err.Error(),
+					"retry":      info.Attempt,
+					"backoff_ms": info.Delay.Milliseconds(),
+				})
+				if info.Attempt == 1 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
+					al.publishOutbound(bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: "⚠️ Provider timeout/error detected. Retrying...",
+					}, "provider_retry_notice")
+				}
+			},
+			OnOverflowStage: func(_ context.Context, stage string, attempt int, maxAttempts int, stageErr error) {
+				logger.WarnCF("agent", "Context overflow recovery stage", map[string]interface{}{
+					"stage":          stage,
+					"attempt":        attempt,
+					"max_attempts":   maxAttempts,
+					"error":          stageErr.Error(),
+					"session_key":    opts.SessionKey,
+					"channel":        opts.Channel,
+					"chat_id":        opts.ChatID,
+					"context_tokens": al.contextWindow,
+				})
+				if stage == "compact" && !overflowNoticeSent && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
+					overflowNoticeSent = true
+					al.publishOutbound(bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: "⚠️ Context window exceeded. Compacting memory and retrying...",
+					}, "context_retry_notice")
+				}
+			},
+			OnAssistantTurn: func(writeCtx context.Context, response *providers.LLMResponse, promptEstimateTokens int, _ int) error {
+				if opts.NoHistory {
+					return nil
+				}
+				if response != nil && response.Usage != nil && response.Usage.PromptTokens > 0 {
+					al.memory.ObservePromptUsage(writeCtx, al.model, promptEstimateTokens, response.Usage.PromptTokens)
+				}
+				if err := al.memory.AppendEvent(writeCtx, memory.Event{
+					ID:         "evt-" + uuid.NewString(),
+					SessionKey: opts.SessionKey,
+					TurnID:     turnID,
+					Seq:        seq,
+					Role:       "assistant",
+					Content:    response.Content,
+					Metadata: map[string]string{
+						"channel":         opts.Channel,
+						"chat_id":         opts.ChatID,
+						"user_id":         opts.UserID,
+						"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
+					},
+				}); err != nil {
+					logger.ErrorCF("agent", "Failed to append assistant tool-call event", map[string]interface{}{
+						"error":       err.Error(),
+						"session_key": opts.SessionKey,
+						"turn_id":     turnID,
+					})
+				}
+				seq++
+				return nil
+			},
+			OnToolResult: func(writeCtx context.Context, call providers.ToolCall, _ *tools.ToolResult, contentForLLM string, _ int) error {
+				if opts.NoHistory {
+					return nil
+				}
+				if err := al.memory.AppendEvent(writeCtx, memory.Event{
+					ID:         "evt-" + uuid.NewString(),
+					SessionKey: opts.SessionKey,
+					TurnID:     turnID,
+					Seq:        seq,
+					Role:       "tool",
+					Content:    contentForLLM,
+					ToolCallID: call.ID,
+					ToolName:   call.Name,
+					Metadata: map[string]string{
+						"channel": opts.Channel,
+						"chat_id": opts.ChatID,
+						"user_id": opts.UserID,
+					},
+				}); err != nil {
+					logger.ErrorCF("agent", "Failed to append tool event", map[string]interface{}{
+						"error":       err.Error(),
+						"session_key": opts.SessionKey,
+						"turn_id":     turnID,
+						"tool_name":   call.Name,
+					})
+				}
+				seq++
+				return nil
+			},
+			OnToolUserMessage: func(_ context.Context, call providers.ToolCall, result *tools.ToolResult, _ int) {
+				if result == nil || result.Silent || result.ForUser == "" || !opts.SendResponse {
+					return
+				}
+				al.publishOutbound(bus.OutboundMessage{
+					Channel: opts.Channel,
+					ChatID:  opts.ChatID,
+					Content: result.ForUser,
+				}, "tool_result")
+				logger.DebugCF("agent", "Sent tool result to user", map[string]interface{}{
+					"tool":        call.Name,
+					"content_len": len(result.ForUser),
+				})
+			},
+			OnLoopBreak: func(metricCtx context.Context, reason string, _ int) {
+				if opts.NoHistory {
+					return
+				}
+				_ = al.memory.AddMetric(metricCtx, "tool.loop.breaker", 1, map[string]string{
+					"session_key": opts.SessionKey,
+					"user_id":     opts.UserID,
+					"reason":      reason,
+				})
+			},
+			OnLoopWarning: func(metricCtx context.Context, reason string, level string, count int, message string, _ int) {
+				if opts.NoHistory {
+					return
+				}
+				_ = al.memory.AddMetric(metricCtx, "tool.loop.warning", 1, map[string]string{
+					"session_key": opts.SessionKey,
+					"user_id":     opts.UserID,
+					"reason":      reason,
+					"level":       level,
+				})
+				logger.WarnCF("agent", "Tool loop warning", map[string]interface{}{
+					"session_key": opts.SessionKey,
+					"reason":      reason,
+					"level":       level,
+					"count":       count,
+					"message":     message,
+				})
+			},
+		},
+	}, messages, opts.Channel, opts.ChatID)
 	if err != nil {
 		return "", err
 	}
+	finalContent := loopResult.Content
+	iteration := loopResult.Iterations
 
 	// If last tool had ForUser content and we already sent it, we might not need to send final response
 	// This is controlled by the tool's Silent flag and ForUser content
@@ -602,6 +1001,9 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	// 5. Handle empty response
 	if finalContent == "" {
 		finalContent = opts.DefaultResponse
+	}
+	if streamForwarder != nil && streamForwarder.FlushFinal(finalContent) {
+		tools.MarkRoundMessageSent(ctx)
 	}
 
 	// 6. Save final assistant event and schedule memory maintenance
@@ -633,11 +1035,22 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 
 	// 7. Optional: send response via bus
 	if opts.SendResponse {
-		al.publishOutbound(bus.OutboundMessage{
-			Channel: opts.Channel,
-			ChatID:  opts.ChatID,
-			Content: finalContent,
-		}, "final_response")
+		if streamForwarder != nil && streamForwarder.HasSent() {
+			al.publishOutbound(bus.OutboundMessage{
+				Channel:     opts.Channel,
+				ChatID:      opts.ChatID,
+				Content:     finalContent,
+				Stream:      true,
+				StreamID:    streamID,
+				StreamFinal: true,
+			}, "stream_final")
+		} else {
+			al.publishOutbound(bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: finalContent,
+			}, "final_response")
+		}
 	}
 
 	// 8. Log response
@@ -650,425 +1063,6 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		})
 
 	return finalContent, nil
-}
-
-// runLLMIteration executes the LLM call loop with tool handling.
-// Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions, turnID string, seq *int, currentUserPrompt, personaNote, continuityNote string) (string, int, error) {
-	iteration := 0
-	finalContent := ""
-	toolCallSignatures := map[string]int{}
-	toolNameCounts := map[string]int{}
-	toolDistinctSignatures := map[string]map[string]struct{}{}
-	providerStateID := ""
-	const (
-		toolDriftCountThreshold     = 8
-		toolDriftDistinctSigCeiling = 2
-	)
-	if !opts.NoHistory {
-		if sid, err := al.memory.GetProviderState(ctx, opts.SessionKey, al.providerName); err == nil {
-			providerStateID = strings.TrimSpace(sid)
-		}
-	}
-
-	for iteration < al.maxIterations {
-		iteration++
-		logger.DebugCF("agent", "LLM iteration", map[string]interface{}{
-			"iteration": iteration,
-			"max":       al.maxIterations,
-		})
-
-		response, rebuiltMessages, err := al.callLLMWithRetry(ctx, messages, opts, currentUserPrompt, personaNote, continuityNote, &providerStateID, iteration)
-		messages = rebuiltMessages
-		if err != nil {
-			logger.ErrorCF("agent", "LLM call failed", map[string]interface{}{
-				"iteration": iteration,
-				"error":     err.Error(),
-			})
-			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
-		}
-		if response == nil {
-			return "", iteration, fmt.Errorf("LLM provider returned nil response")
-		}
-
-		if len(response.ToolCalls) == 0 {
-			finalContent = strings.TrimSpace(response.Content)
-			logger.InfoCF("agent", "LLM response without tool calls (direct answer)", map[string]interface{}{
-				"iteration":     iteration,
-				"content_chars": len(finalContent),
-			})
-			break
-		}
-
-		signature := toolCallSignature(response.ToolCalls)
-		if signature != "" {
-			toolCallSignatures[signature]++
-			if toolCallSignatures[signature] >= 3 {
-				logger.WarnCF("agent", "Tool-call loop detected; tripping circuit breaker", map[string]interface{}{
-					"signature": signature,
-					"count":     toolCallSignatures[signature],
-					"iteration": iteration,
-				})
-				if !opts.NoHistory {
-					_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
-						"session_key": opts.SessionKey,
-						"user_id":     opts.UserID,
-						"reason":      "signature_repeat",
-					})
-				}
-				finalContent = "I’m stopping tool execution because I detected a repeated tool-call loop. If you still want this action, restate it with a narrower scope."
-				break
-			}
-		}
-
-		driftLoopDetected := false
-		driftToolName := ""
-		driftCount := 0
-		driftDistinct := 0
-		for _, tc := range response.ToolCalls {
-			name := strings.TrimSpace(tc.Name)
-			if name == "" {
-				name = "(unknown)"
-			}
-			toolNameCounts[name]++
-			argsJSON, _ := json.Marshal(tc.Arguments)
-			if _, ok := toolDistinctSignatures[name]; !ok {
-				toolDistinctSignatures[name] = map[string]struct{}{}
-			}
-			toolDistinctSignatures[name][string(argsJSON)] = struct{}{}
-			distinct := len(toolDistinctSignatures[name])
-			if toolNameCounts[name] >= toolDriftCountThreshold && distinct <= toolDriftDistinctSigCeiling {
-				driftLoopDetected = true
-				driftToolName = name
-				driftCount = toolNameCounts[name]
-				driftDistinct = distinct
-				break
-			}
-		}
-		if driftLoopDetected {
-			logger.WarnCF("agent", "Tool drift loop detected; tripping circuit breaker", map[string]interface{}{
-				"tool":                driftToolName,
-				"count":               driftCount,
-				"distinct_signatures": driftDistinct,
-				"iteration":           iteration,
-			})
-			if !opts.NoHistory {
-				_ = al.memory.AddMetric(ctx, "tool.loop.breaker", 1, map[string]string{
-					"session_key": opts.SessionKey,
-					"user_id":     opts.UserID,
-					"reason":      "tool_name_low_variance_repeat",
-					"tool_name":   driftToolName,
-				})
-			}
-			finalContent = "I’m stopping tool execution because one tool kept being called repeatedly. If you still want this action, restate it with a narrower scope."
-			break
-		}
-
-		var execErr error
-		messages, execErr = al.executeToolCalls(ctx, response, messages, opts, turnID, seq, iteration)
-		if execErr != nil {
-			return "", iteration, execErr
-		}
-	}
-
-	if finalContent == "" && iteration >= al.maxIterations {
-		finalContent = fmt.Sprintf("I paused because I reached the maximum number of consecutive actions (%d) allowed in a single turn. Let me know if you would like me to continue.", al.maxIterations)
-	}
-	return finalContent, iteration, nil
-}
-
-func (al *AgentLoop) callLLMWithRetry(ctx context.Context, messages []providers.Message, opts processOptions, currentUserPrompt, personaNote, continuityNote string, providerStateID *string, iteration int) (*providers.LLMResponse, []providers.Message, error) {
-	providerToolDefs := al.tools.ToProviderDefs()
-	systemPromptLen := 0
-	if len(messages) > 0 {
-		systemPromptLen = len(messages[0].Content)
-	}
-	logger.DebugCF("agent", "LLM request", map[string]interface{}{
-		"iteration":         iteration,
-		"model":             al.model,
-		"messages_count":    len(messages),
-		"tools_count":       len(providerToolDefs),
-		"max_tokens":        al.completionMax,
-		"temperature":       al.temperature,
-		"system_prompt_len": systemPromptLen,
-	})
-	logger.DebugCF("agent", "Full LLM request", map[string]interface{}{
-		"iteration":     iteration,
-		"messages_json": formatMessagesForLog(messages),
-		"tools_json":    formatToolsForLog(providerToolDefs),
-	})
-
-	var (
-		response *providers.LLMResponse
-		err      error
-	)
-
-	maxRetries := 2
-	for retry := 0; retry <= maxRetries; retry++ {
-		callOpts := map[string]interface{}{
-			"max_tokens":  al.completionMax,
-			"temperature": al.temperature,
-		}
-
-		if stateful, ok := al.provider.(providers.StatefulLLMProvider); ok && !opts.NoHistory {
-			stateID := strings.TrimSpace(*providerStateID)
-			var newState string
-			response, newState, err = stateful.ChatWithState(ctx, stateID, messages, providerToolDefs, al.model, callOpts)
-			if err == nil {
-				newState = strings.TrimSpace(newState)
-				if newState != "" && newState != stateID {
-					*providerStateID = newState
-					_ = al.memory.SetProviderState(ctx, opts.SessionKey, al.providerName, newState)
-				}
-			}
-		} else {
-			response, err = al.provider.Chat(ctx, messages, providerToolDefs, al.model, callOpts)
-		}
-
-		if err == nil {
-			return response, messages, nil
-		}
-		if isTransientLLMError(err) && retry < maxRetries {
-			backoff := transientLLMRetryBackoff(retry + 1)
-			logger.WarnCF("agent", "Transient LLM error detected, retrying", map[string]interface{}{
-				"error":      err.Error(),
-				"retry":      retry,
-				"backoff_ms": backoff.Milliseconds(),
-			})
-			if retry == 0 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
-				al.publishOutbound(bus.OutboundMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Content: "⚠️ Provider timeout/error detected. Retrying...",
-				}, "provider_retry_notice")
-			}
-			select {
-			case <-ctx.Done():
-				return nil, messages, ctx.Err()
-			case <-time.After(backoff):
-			}
-			continue
-		}
-
-		if !isContextWindowError(err) || retry >= maxRetries {
-			break
-		}
-
-		logger.WarnCF("agent", "Context window error detected, attempting compression", map[string]interface{}{
-			"error": err.Error(),
-			"retry": retry,
-		})
-		if retry == 0 && !constants.IsInternalChannel(opts.Channel) && opts.SendResponse {
-			al.publishOutbound(bus.OutboundMessage{
-				Channel: opts.Channel,
-				ChatID:  opts.ChatID,
-				Content: "⚠️ Context window exceeded. Compacting memory and retrying...",
-			}, "context_retry_notice")
-		}
-
-		if compactErr := al.memory.ForceCompact(ctx, opts.SessionKey, opts.UserID, al.contextWindow); compactErr != nil {
-			logger.WarnCF("agent", "Memory force compaction failed", map[string]interface{}{
-				"error":       compactErr.Error(),
-				"session_key": opts.SessionKey,
-			})
-		}
-		rebuilt, rebuildErr := al.memory.BuildPromptContext(ctx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
-		if rebuildErr != nil {
-			logger.WarnCF("agent", "Failed rebuilding prompt context after compaction", map[string]interface{}{
-				"error": rebuildErr.Error(),
-			})
-			continue
-		}
-		messages = al.contextBuilder.BuildMessages(
-			toProviderMessages(rebuilt.History),
-			rebuilt.Summary,
-			rebuilt.RecallPrompt,
-			currentUserPrompt,
-			nil,
-			opts.Channel,
-			opts.ChatID,
-		)
-		if continuityNote != "" {
-			messages = injectSystemNote(messages, continuityNote)
-		}
-		if personaNote != "" {
-			messages = injectSystemNote(messages, personaNote)
-		}
-	}
-	return nil, messages, err
-}
-
-func (al *AgentLoop) executeToolCalls(ctx context.Context, response *providers.LLMResponse, messages []providers.Message, opts processOptions, turnID string, seq *int, iteration int) ([]providers.Message, error) {
-	toolNames := make([]string, 0, len(response.ToolCalls))
-	for _, tc := range response.ToolCalls {
-		toolNames = append(toolNames, tc.Name)
-	}
-	logger.InfoCF("agent", "LLM requested tool calls", map[string]interface{}{
-		"tools":     toolNames,
-		"count":     len(response.ToolCalls),
-		"iteration": iteration,
-	})
-
-	assistantMsg := providers.Message{
-		Role:    "assistant",
-		Content: response.Content,
-	}
-	for _, tc := range response.ToolCalls {
-		argumentsJSON, _ := json.Marshal(tc.Arguments)
-		assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
-			ID:   tc.ID,
-			Type: "function",
-			Function: &providers.FunctionCall{
-				Name:      tc.Name,
-				Arguments: string(argumentsJSON),
-			},
-		})
-	}
-	messages = append(messages, assistantMsg)
-
-	if !opts.NoHistory {
-		if err := al.memory.AppendEvent(ctx, memory.Event{
-			ID:         "evt-" + uuid.NewString(),
-			SessionKey: opts.SessionKey,
-			TurnID:     turnID,
-			Seq:        *seq,
-			Role:       "assistant",
-			Content:    response.Content,
-			Metadata: map[string]string{
-				"channel":         opts.Channel,
-				"chat_id":         opts.ChatID,
-				"user_id":         opts.UserID,
-				"tool_call_count": fmt.Sprintf("%d", len(response.ToolCalls)),
-			},
-		}); err != nil {
-			logger.ErrorCF("agent", "Failed to append assistant tool-call event", map[string]interface{}{
-				"error":       err.Error(),
-				"session_key": opts.SessionKey,
-				"turn_id":     turnID,
-			})
-		}
-		*seq = *seq + 1
-	}
-
-	for _, toolCall := range response.ToolCalls {
-		tc := toolCall
-		argsJSON, _ := json.Marshal(tc.Arguments)
-		argsPreview := utils.Truncate(string(argsJSON), 200)
-		logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview), map[string]interface{}{
-			"tool":      tc.Name,
-			"iteration": iteration,
-		})
-
-		asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
-			if result != nil && !result.Silent && result.ForUser != "" {
-				logger.InfoCF("agent", "Async tool completed, agent will handle notification", map[string]interface{}{
-					"tool":        tc.Name,
-					"content_len": len(result.ForUser),
-				})
-			}
-		}
-
-		toolResult := al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
-		if toolResult == nil {
-			toolResult = tools.ErrorResult(fmt.Sprintf("tool %s returned no result", tc.Name))
-		}
-
-		if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
-			al.publishOutbound(bus.OutboundMessage{
-				Channel: opts.Channel,
-				ChatID:  opts.ChatID,
-				Content: toolResult.ForUser,
-			}, "tool_result")
-			logger.DebugCF("agent", "Sent tool result to user", map[string]interface{}{
-				"tool":        tc.Name,
-				"content_len": len(toolResult.ForUser),
-			})
-		}
-
-		contentForLLM := toolResult.ForLLM
-		if contentForLLM == "" && toolResult.Err != nil {
-			contentForLLM = toolResult.Err.Error()
-		}
-		messages = append(messages, providers.Message{
-			Role:       "tool",
-			Content:    contentForLLM,
-			ToolCallID: tc.ID,
-		})
-
-		if !opts.NoHistory {
-			if err := al.memory.AppendEvent(ctx, memory.Event{
-				ID:         "evt-" + uuid.NewString(),
-				SessionKey: opts.SessionKey,
-				TurnID:     turnID,
-				Seq:        *seq,
-				Role:       "tool",
-				Content:    contentForLLM,
-				ToolCallID: tc.ID,
-				ToolName:   tc.Name,
-				Metadata: map[string]string{
-					"channel": opts.Channel,
-					"chat_id": opts.ChatID,
-					"user_id": opts.UserID,
-				},
-			}); err != nil {
-				logger.ErrorCF("agent", "Failed to append tool event", map[string]interface{}{
-					"error":       err.Error(),
-					"session_key": opts.SessionKey,
-					"turn_id":     turnID,
-					"tool_name":   tc.Name,
-				})
-			}
-			*seq = *seq + 1
-		}
-	}
-	return messages, nil
-}
-
-func isContextWindowError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errMsg := strings.ToLower(err.Error())
-	return strings.Contains(errMsg, "context_length_exceeded") ||
-		strings.Contains(errMsg, "maximum context length") ||
-		strings.Contains(errMsg, "too many tokens") ||
-		strings.Contains(errMsg, "token limit") ||
-		strings.Contains(errMsg, "max message tokens") ||
-		strings.Contains(errMsg, "request too large") ||
-		(strings.Contains(errMsg, "context") && strings.Contains(errMsg, "length"))
-}
-
-func isTransientLLMError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errMsg := strings.ToLower(err.Error())
-	if strings.Contains(errMsg, "context canceled") {
-		return false
-	}
-	return strings.Contains(errMsg, "context deadline exceeded") ||
-		strings.Contains(errMsg, "client.timeout") ||
-		strings.Contains(errMsg, "timeout while reading body") ||
-		strings.Contains(errMsg, "timeout awaiting response headers") ||
-		strings.Contains(errMsg, "tls handshake timeout") ||
-		strings.Contains(errMsg, "connection reset by peer") ||
-		strings.Contains(errMsg, "broken pipe") ||
-		strings.Contains(errMsg, "i/o timeout") ||
-		strings.Contains(errMsg, "status=502") ||
-		strings.Contains(errMsg, "status=503") ||
-		strings.Contains(errMsg, "status=504") ||
-		strings.Contains(errMsg, "status=429")
-}
-
-func transientLLMRetryBackoff(attempt int) time.Duration {
-	switch attempt {
-	case 1:
-		return 1500 * time.Millisecond
-	case 2:
-		return 3500 * time.Millisecond
-	default:
-		return 8 * time.Second
-	}
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.
@@ -1147,18 +1141,6 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	}
 	result += "]"
 	return result
-}
-
-func toolCallSignature(calls []providers.ToolCall) string {
-	if len(calls) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(calls))
-	for _, tc := range calls {
-		argsJSON, _ := json.Marshal(tc.Arguments)
-		parts = append(parts, tc.Name+":"+string(argsJSON))
-	}
-	return strings.Join(parts, "|")
 }
 
 func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate {
@@ -1296,6 +1278,24 @@ Continue using the current turn, available history, and recalled memory. If exac
 		strings.Join(reasons, ", ")))
 }
 
+func buildCompactionContinuationSystemNote(notes []string) string {
+	notes = dedupeAndTrim(notes)
+	if len(notes) == 0 {
+		return ""
+	}
+	lines := []string{
+		"## Continuation Constraints",
+		"Maintain task continuity across prior compactions. Preserve these handoff notes unless superseded by newer evidence:",
+	}
+	for i, note := range notes {
+		if i >= 4 {
+			break
+		}
+		lines = append(lines, "- "+note)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func dedupeAndTrim(values []string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(values))
@@ -1345,6 +1345,146 @@ func valueOr(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func resolveRuntimeContextWindow(provider providers.LLMProvider, model string, configured int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	resolved, source := providers.ResolveContextWindow(ctx, provider, model, configured)
+	if resolved < 32768 {
+		logger.WarnCF("agent", "Context window is below recommended threshold", map[string]interface{}{
+			"model":           model,
+			"resolved":        resolved,
+			"source":          source,
+			"recommended_min": 32768,
+		})
+	} else {
+		logger.InfoCF("agent", "Resolved context window", map[string]interface{}{
+			"model":  model,
+			"tokens": resolved,
+			"source": source,
+		})
+	}
+	return resolved
+}
+
+func cloneLLMCallOptions(opts map[string]interface{}) map[string]interface{} {
+	if len(opts) == 0 {
+		return map[string]interface{}{}
+	}
+	out := make(map[string]interface{}, len(opts)+2)
+	for k, v := range opts {
+		out[k] = v
+	}
+	return out
+}
+
+type llmStreamForwarder struct {
+	publishFn func(string)
+
+	pending   strings.Builder
+	emitted   strings.Builder
+	lastFlush time.Time
+	sentAny   bool
+}
+
+func newLLMStreamForwarder(publishFn func(string)) *llmStreamForwarder {
+	if publishFn == nil {
+		return nil
+	}
+	return &llmStreamForwarder{publishFn: publishFn}
+}
+
+func (f *llmStreamForwarder) Push(delta string) {
+	if f == nil {
+		return
+	}
+	delta = strings.TrimRight(delta, "\r")
+	if delta == "" {
+		return
+	}
+	f.pending.WriteString(delta)
+	flushBySize := f.pending.Len() >= 72
+	flushByTime := !f.lastFlush.IsZero() && time.Since(f.lastFlush) >= 1200*time.Millisecond
+	flushByBoundary := strings.Contains(delta, "\n")
+	if flushBySize || flushByTime || flushByBoundary {
+		f.flushPending()
+	}
+}
+
+func (f *llmStreamForwarder) FlushFinal(final string) bool {
+	if f == nil {
+		return false
+	}
+	f.flushPending()
+	if strings.TrimSpace(final) == "" {
+		return f.sentAny
+	}
+
+	emitted := f.emitted.String()
+	if emitted == final {
+		return f.sentAny
+	}
+	prefix := commonPrefixLen(emitted, final)
+	suffix := final[prefix:]
+	if strings.TrimSpace(suffix) == "" {
+		return f.sentAny
+	}
+	f.publish(suffix)
+	f.emitted.WriteString(final[prefix:])
+	return true
+}
+
+func (f *llmStreamForwarder) HasSent() bool {
+	if f == nil {
+		return false
+	}
+	return f.sentAny
+}
+
+func (f *llmStreamForwarder) flushPending() {
+	if f == nil || f.pending.Len() == 0 {
+		return
+	}
+	chunk := f.pending.String()
+	f.pending.Reset()
+	if strings.TrimSpace(chunk) == "" {
+		return
+	}
+	f.publish(chunk)
+	f.emitted.WriteString(chunk)
+}
+
+func (f *llmStreamForwarder) publish(chunk string) {
+	if f == nil || f.publishFn == nil {
+		return
+	}
+	f.publishFn(chunk)
+	f.sentAny = true
+	f.lastFlush = time.Now()
+}
+
+func commonPrefixLen(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
 }
 
 func (al *AgentLoop) resolveCommandSessionKey(msg bus.InboundMessage, userID string) string {

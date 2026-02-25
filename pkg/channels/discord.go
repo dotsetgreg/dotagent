@@ -17,6 +17,8 @@ import (
 const (
 	sendTimeout           = 10 * time.Second
 	typingRefreshInterval = 8 * time.Second
+	streamPreviewLimit    = 1600
+	streamEditMinInterval = 900 * time.Millisecond
 )
 
 type DiscordChannel struct {
@@ -25,11 +27,20 @@ type DiscordChannel struct {
 	config   config.DiscordConfig
 	typing   map[string]*typingSession
 	typingMu sync.Mutex
+	stream   map[string]*streamDraft
+	streamMu sync.Mutex
 }
 
 type typingSession struct {
 	pending int
 	cancel  context.CancelFunc
+}
+
+type streamDraft struct {
+	messageID   string
+	content     string
+	lastPreview string
+	lastEditAt  time.Time
 }
 
 func NewDiscordChannel(cfg config.DiscordConfig, bus *bus.MessageBus) (*DiscordChannel, error) {
@@ -45,6 +56,7 @@ func NewDiscordChannel(cfg config.DiscordConfig, bus *bus.MessageBus) (*DiscordC
 		session:     session,
 		config:      cfg,
 		typing:      make(map[string]*typingSession),
+		stream:      make(map[string]*streamDraft),
 	}, nil
 }
 
@@ -75,6 +87,7 @@ func (c *DiscordChannel) Stop(ctx context.Context) error {
 	logger.InfoC("discord", "Stopping Discord bot")
 	c.setRunning(false)
 	c.stopAllTyping()
+	c.clearAllStreamDrafts()
 
 	if err := c.session.Close(); err != nil {
 		return fmt.Errorf("failed to close discord session: %w", err)
@@ -91,6 +104,9 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) erro
 	channelID := msg.ChatID
 	if channelID == "" {
 		return fmt.Errorf("channel ID is empty")
+	}
+	if msg.Stream {
+		return c.sendStream(ctx, channelID, msg)
 	}
 	defer c.endTyping(channelID)
 
@@ -236,26 +252,229 @@ func findLastSpace(s string, searchWindow int) int {
 	return -1
 }
 
-func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content string) error {
-	// Use the incoming context for timeout control.
+func streamDraftKey(channelID, streamID string) string {
+	channelID = strings.TrimSpace(channelID)
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return channelID
+	}
+	return channelID + "|" + streamID
+}
+
+func (c *DiscordChannel) clearAllStreamDrafts() {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	c.stream = make(map[string]*streamDraft)
+}
+
+func (c *DiscordChannel) sendStream(ctx context.Context, channelID string, msg bus.OutboundMessage) error {
+	streamID := strings.TrimSpace(msg.StreamID)
+	if streamID == "" {
+		if strings.TrimSpace(msg.Content) == "" {
+			return nil
+		}
+		chunks := splitMessage(msg.Content, 1500)
+		for _, chunk := range chunks {
+			if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	key := streamDraftKey(channelID, streamID)
+	if msg.StreamFinal {
+		return c.finalizeStreamDraft(ctx, key, channelID, msg.Content)
+	}
+
+	if strings.TrimSpace(msg.Content) == "" {
+		return nil
+	}
+
+	c.streamMu.Lock()
+	draft := c.stream[key]
+	if draft == nil {
+		draft = &streamDraft{}
+		c.stream[key] = draft
+	}
+	draft.content += msg.Content
+	fullContent := draft.content
+	currentMessageID := draft.messageID
+	lastPreview := draft.lastPreview
+	lastEditAt := draft.lastEditAt
+	c.streamMu.Unlock()
+
+	preview := buildDiscordStreamPreview(fullContent, streamPreviewLimit)
+	if preview == "" || preview == lastPreview {
+		return nil
+	}
+	if !lastEditAt.IsZero() && time.Since(lastEditAt) < streamEditMinInterval {
+		return nil
+	}
+
+	messageID, err := c.sendOrEditStreamMessage(ctx, channelID, currentMessageID, preview)
+	if err != nil {
+		return err
+	}
+
+	c.streamMu.Lock()
+	if curr := c.stream[key]; curr != nil {
+		curr.messageID = messageID
+		curr.lastPreview = preview
+		curr.lastEditAt = time.Now()
+	}
+	c.streamMu.Unlock()
+	return nil
+}
+
+func (c *DiscordChannel) finalizeStreamDraft(ctx context.Context, key, channelID, finalContent string) error {
+	c.streamMu.Lock()
+	draft := c.stream[key]
+	delete(c.stream, key)
+	c.streamMu.Unlock()
+
+	if draft == nil {
+		draft = &streamDraft{}
+	}
+	finalContent = strings.TrimSpace(finalContent)
+	if finalContent == "" {
+		finalContent = strings.TrimSpace(draft.content)
+	}
+	if finalContent == "" {
+		return nil
+	}
+
+	chunks := splitMessage(finalContent, 1500)
+	if len(chunks) == 0 {
+		return nil
+	}
+	if draft.messageID != "" {
+		if err := c.editMessage(ctx, channelID, draft.messageID, chunks[0]); err == nil {
+			for _, chunk := range chunks[1:] {
+				if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	for _, chunk := range chunks {
+		if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *DiscordChannel) sendOrEditStreamMessage(ctx context.Context, channelID, messageID, content string) (string, error) {
+	if strings.TrimSpace(messageID) == "" {
+		sent, err := c.sendMessage(ctx, channelID, content)
+		if err != nil {
+			return "", err
+		}
+		return sent.ID, nil
+	}
+	if err := c.editMessage(ctx, channelID, messageID, content); err != nil {
+		sent, sendErr := c.sendMessage(ctx, channelID, content)
+		if sendErr != nil {
+			return "", err
+		}
+		return sent.ID, nil
+	}
+	return messageID, nil
+}
+
+func buildDiscordStreamPreview(content string, limit int) string {
+	content = strings.TrimRight(content, "\r")
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+	if limit <= 0 {
+		limit = streamPreviewLimit
+	}
+
+	trimmed := content
+	runes := []rune(trimmed)
+	if len(runes) > limit {
+		marker := "[stream preview truncated]\n"
+		markerLen := len([]rune(marker))
+		keep := limit - markerLen
+		if keep < 32 {
+			marker = "[truncated]\n"
+			markerLen = len([]rune(marker))
+			keep = limit - markerLen
+			if keep < 16 {
+				marker = ""
+				keep = limit
+			}
+		}
+		if keep < 0 {
+			keep = 0
+		}
+		trimmed = marker + string(runes[len(runes)-keep:])
+	}
+	return ensureClosedMarkdownFence(trimmed)
+}
+
+func ensureClosedMarkdownFence(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return content
+	}
+	if strings.Count(content, "```")%2 == 1 {
+		content += "\n```"
+	}
+	return content
+}
+
+func (c *DiscordChannel) sendMessage(ctx context.Context, channelID, content string) (*discordgo.Message, error) {
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+
+	type result struct {
+		msg *discordgo.Message
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		msg, err := c.session.ChannelMessageSend(channelID, content)
+		done <- result{msg: msg, err: err}
+	}()
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			return nil, fmt.Errorf("failed to send discord message: %w", out.err)
+		}
+		return out.msg, nil
+	case <-sendCtx.Done():
+		return nil, fmt.Errorf("send message timeout: %w", sendCtx.Err())
+	}
+}
+
+func (c *DiscordChannel) editMessage(ctx context.Context, channelID, messageID, content string) error {
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.session.ChannelMessageSend(channelID, content)
+		_, err := c.session.ChannelMessageEdit(channelID, messageID, content)
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			return fmt.Errorf("failed to send discord message: %w", err)
+			return fmt.Errorf("failed to edit discord message: %w", err)
 		}
 		return nil
 	case <-sendCtx.Done():
-		return fmt.Errorf("send message timeout: %w", sendCtx.Err())
+		return fmt.Errorf("edit message timeout: %w", sendCtx.Err())
 	}
+}
+
+func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content string) error {
+	_, err := c.sendMessage(ctx, channelID, content)
+	return err
 }
 
 func (c *DiscordChannel) sendTyping(channelID string) {

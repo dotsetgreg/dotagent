@@ -969,6 +969,47 @@ func TestAgentLoop_AppliesPersonaSyncBeforeResponseGeneration(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_SkipsPersonaSyncForNonDirectiveTurns(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Memory: config.MemoryConfig{
+			PersonaSyncApply:     true,
+			PersonaFileSyncMode:  "export_only",
+			PersonaPolicyMode:    "balanced",
+			PersonaMinConfidence: 0.52,
+		},
+	}
+	msgBus := bus.NewMessageBus()
+	provider := &historyCaptureProvider{}
+	al := mustNewAgentLoop(t, cfg, msgBus, provider)
+
+	_, err := al.runAgentLoop(context.Background(), processOptions{
+		SessionKey:      "persona-skip-session",
+		Channel:         "discord",
+		ChatID:          "chat-skip",
+		UserID:          "u-persona-skip",
+		UserMessage:     "How do I split this function into smaller units?",
+		DefaultResponse: "ok",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if len(provider.calls) != 1 {
+		t.Fatalf("expected exactly one provider call (main response only), got %d", len(provider.calls))
+	}
+}
+
 func TestAgentLoop_PersonaCommandShow(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.Config{

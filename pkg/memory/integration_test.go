@@ -217,3 +217,87 @@ func containsRecall(cards []MemoryCard, needle string) bool {
 	}
 	return false
 }
+
+func TestReleaseGate_ContinuityCarryoverForcedCompactions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping release-gate continuity test in short mode")
+	}
+	ctx := context.Background()
+	ws := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:        ws,
+		AgentID:          "dotagent",
+		ContextModel:     "openai/gpt-5.2",
+		MaxContextTokens: 2048,
+		WorkerPoll:       80 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	session := "discord:gate-continuity"
+	userID := "u-gate-continuity"
+	if err := svc.EnsureSession(ctx, session, "discord", "gate-continuity", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	facts := []struct {
+		statement string
+		query     string
+		needle    string
+	}{
+		{"My timezone is America/New_York.", "what timezone am i in?", "america/new_york"},
+		{"I prefer pour-over coffee.", "what coffee method do i prefer?", "pour-over"},
+		{"I use Neovim for coding.", "what editor do i use?", "neovim"},
+		{"I live in Washington, DC.", "where do i live?", "washington, dc"},
+		{"I am finishing a migration checklist.", "what task am i finishing?", "migration checklist"},
+		{"My preferred language is English.", "what language do i prefer?", "english"},
+	}
+
+	for i := 0; i < 120; i++ {
+		f := facts[i%len(facts)]
+		turn := fmt.Sprintf("turn-gate-%03d", i)
+		_, _, recErr := svc.RecordUserTurn(ctx, Event{
+			SessionKey: session,
+			TurnID:     turn,
+			Seq:        1,
+			Role:       "user",
+			Content:    f.statement,
+		}, userID)
+		if recErr != nil {
+			t.Fatalf("record user turn %d: %v", i, recErr)
+		}
+		if err := svc.AppendEvent(ctx, Event{
+			SessionKey: session,
+			TurnID:     turn,
+			Seq:        2,
+			Role:       "assistant",
+			Content:    "Noted.",
+		}); err != nil {
+			t.Fatalf("append assistant event %d: %v", i, err)
+		}
+		svc.ScheduleTurnMaintenance(ctx, session, turn, userID)
+		if i > 0 && i%24 == 0 {
+			if err := svc.ForceCompact(ctx, session, userID, 2048); err != nil {
+				t.Fatalf("force compact cycle %d: %v", i/24, err)
+			}
+		}
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	hits := 0
+	for _, f := range facts {
+		pc, err := svc.BuildPromptContext(ctx, session, userID, f.query, 2048)
+		if err != nil {
+			t.Fatalf("build prompt context query %q: %v", f.query, err)
+		}
+		if containsRecall(pc.RecallCards, f.needle) {
+			hits++
+		}
+	}
+	carryover := float64(hits) / float64(len(facts))
+	if carryover < 0.95 {
+		t.Fatalf("continuity carryover gate failed: carryover=%.2f hits=%d/%d", carryover, hits, len(facts))
+	}
+}

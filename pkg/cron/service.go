@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +68,8 @@ type CronService struct {
 	gronx     *gronx.Gronx
 }
 
+const maxEveryIntervalMS = int64(365 * 24 * 60 * 60 * 1000)
+
 func NewCronService(storePath string, onJob JobHandler) *CronService {
 	cs := &CronService{
 		storePath: storePath,
@@ -76,6 +79,50 @@ func NewCronService(storePath string, onJob JobHandler) *CronService {
 	// Initialize and load store on creation
 	cs.loadStore()
 	return cs
+}
+
+func normalizeSchedule(schedule CronSchedule) CronSchedule {
+	schedule.Kind = strings.ToLower(strings.TrimSpace(schedule.Kind))
+	schedule.Expr = strings.TrimSpace(schedule.Expr)
+	schedule.TZ = strings.TrimSpace(schedule.TZ)
+	return schedule
+}
+
+func (cs *CronService) validateSchedule(schedule CronSchedule, nowMS int64, requireFutureAt bool) error {
+	switch schedule.Kind {
+	case "at":
+		if schedule.AtMS == nil {
+			return fmt.Errorf("at schedule requires atMs")
+		}
+		if requireFutureAt && *schedule.AtMS <= nowMS {
+			return fmt.Errorf("at schedule must be in the future")
+		}
+	case "every":
+		if schedule.EveryMS == nil {
+			return fmt.Errorf("every schedule requires everyMs")
+		}
+		if *schedule.EveryMS <= 0 {
+			return fmt.Errorf("everyMs must be greater than zero")
+		}
+		if *schedule.EveryMS > maxEveryIntervalMS {
+			return fmt.Errorf("everyMs must be <= %d", maxEveryIntervalMS)
+		}
+	case "cron":
+		if schedule.Expr == "" {
+			return fmt.Errorf("cron schedule requires expr")
+		}
+		if !gronx.IsValid(schedule.Expr) {
+			return fmt.Errorf("invalid cron expression: %q", schedule.Expr)
+		}
+		if schedule.TZ != "" {
+			if _, err := time.LoadLocation(schedule.TZ); err != nil {
+				return fmt.Errorf("invalid timezone %q: %w", schedule.TZ, err)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported schedule kind %q", schedule.Kind)
+	}
+	return nil
 }
 
 func (cs *CronService) Start() error {
@@ -265,6 +312,14 @@ func (cs *CronService) computeNextRun(schedule *CronSchedule, nowMS int64) *int6
 
 		// Use gronx to calculate next run time
 		now := time.UnixMilli(nowMS)
+		if schedule.TZ != "" {
+			if loc, err := time.LoadLocation(schedule.TZ); err == nil {
+				now = now.In(loc)
+			} else {
+				log.Printf("[cron] invalid timezone %q for expr '%s': %v", schedule.TZ, schedule.Expr, err)
+				return nil
+			}
+		}
 		nextTime, err := gronx.NextTickAfter(schedule.Expr, now, false)
 		if err != nil {
 			log.Printf("[cron] failed to compute next run for expr '%s': %v", schedule.Expr, err)
@@ -289,15 +344,21 @@ func (cs *CronService) recomputeNextRuns() {
 }
 
 func (cs *CronService) getNextWakeMS() *int64 {
-	var nextWake *int64
+	var nextWake int64
+	hasWake := false
 	for _, job := range cs.store.Jobs {
 		if job.Enabled && job.State.NextRunAtMS != nil {
-			if nextWake == nil || *job.State.NextRunAtMS < *nextWake {
-				nextWake = job.State.NextRunAtMS
+			if !hasWake || *job.State.NextRunAtMS < nextWake {
+				nextWake = *job.State.NextRunAtMS
+				hasWake = true
 			}
 		}
 	}
-	return nextWake
+	if !hasWake {
+		return nil
+	}
+	next := nextWake
+	return &next
 }
 
 func (cs *CronService) Load() error {
@@ -348,6 +409,10 @@ func (cs *CronService) AddJob(name string, schedule CronSchedule, message string
 	defer cs.mu.Unlock()
 
 	now := time.Now().UnixMilli()
+	schedule = normalizeSchedule(schedule)
+	if err := cs.validateSchedule(schedule, now, true); err != nil {
+		return nil, err
+	}
 
 	// One-time tasks (at) should be deleted after execution
 	deleteAfterRun := (schedule.Kind == "at")
@@ -377,17 +442,42 @@ func (cs *CronService) AddJob(name string, schedule CronSchedule, message string
 		return nil, err
 	}
 
-	return &job, nil
+	jobCopy := cloneJob(job)
+	return &jobCopy, nil
 }
 
 func (cs *CronService) UpdateJob(job *CronJob) error {
+	if job == nil {
+		return fmt.Errorf("job is nil")
+	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
+	nextJob := cloneJob(*job)
+	nextJob.Schedule = normalizeSchedule(nextJob.Schedule)
+	if err := cs.validateSchedule(nextJob.Schedule, time.Now().UnixMilli(), false); err != nil {
+		return err
+	}
+	if strings.TrimSpace(nextJob.Payload.Kind) == "" {
+		nextJob.Payload.Kind = "agent_turn"
+	}
+
 	for i := range cs.store.Jobs {
-		if cs.store.Jobs[i].ID == job.ID {
-			cs.store.Jobs[i] = *job
-			cs.store.Jobs[i].UpdatedAtMS = time.Now().UnixMilli()
+		if cs.store.Jobs[i].ID == nextJob.ID {
+			now := time.Now().UnixMilli()
+			nextJob.CreatedAtMS = cs.store.Jobs[i].CreatedAtMS
+			nextJob.UpdatedAtMS = now
+			if nextJob.Enabled {
+				nextJob.State.NextRunAtMS = cs.computeNextRun(&nextJob.Schedule, now)
+				if nextJob.State.NextRunAtMS == nil {
+					nextJob.Enabled = false
+					nextJob.State.LastStatus = "error"
+					nextJob.State.LastError = "schedule does not have a future run"
+				}
+			} else {
+				nextJob.State.NextRunAtMS = nil
+			}
+			cs.store.Jobs[i] = nextJob
 			return cs.saveStoreUnsafe()
 		}
 	}
@@ -433,6 +523,11 @@ func (cs *CronService) EnableJob(jobID string, enabled bool) *CronJob {
 
 			if enabled {
 				job.State.NextRunAtMS = cs.computeNextRun(&job.Schedule, time.Now().UnixMilli())
+				if job.State.NextRunAtMS == nil {
+					job.Enabled = false
+					job.State.LastStatus = "error"
+					job.State.LastError = "schedule does not have a future run"
+				}
 			} else {
 				job.State.NextRunAtMS = nil
 			}
@@ -440,7 +535,8 @@ func (cs *CronService) EnableJob(jobID string, enabled bool) *CronJob {
 			if err := cs.saveStoreUnsafe(); err != nil {
 				log.Printf("[cron] failed to save store after enable: %v", err)
 			}
-			return job
+			jobCopy := cloneJob(*job)
+			return &jobCopy
 		}
 	}
 
@@ -452,13 +548,13 @@ func (cs *CronService) ListJobs(includeDisabled bool) []CronJob {
 	defer cs.mu.RUnlock()
 
 	if includeDisabled {
-		return cs.store.Jobs
+		return cloneJobs(cs.store.Jobs)
 	}
 
 	var enabled []CronJob
 	for _, job := range cs.store.Jobs {
 		if job.Enabled {
-			enabled = append(enabled, job)
+			enabled = append(enabled, cloneJob(job))
 		}
 	}
 
@@ -480,7 +576,33 @@ func (cs *CronService) Status() map[string]interface{} {
 		"enabled":      cs.running,
 		"jobs":         len(cs.store.Jobs),
 		"nextWakeAtMS": cs.getNextWakeMS(),
+		"enabledJobs":  enabledCount,
 	}
+}
+
+func cloneJobs(jobs []CronJob) []CronJob {
+	out := make([]CronJob, 0, len(jobs))
+	for _, job := range jobs {
+		out = append(out, cloneJob(job))
+	}
+	return out
+}
+
+func cloneInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+func cloneJob(job CronJob) CronJob {
+	out := job
+	out.Schedule.AtMS = cloneInt64Ptr(job.Schedule.AtMS)
+	out.Schedule.EveryMS = cloneInt64Ptr(job.Schedule.EveryMS)
+	out.State.NextRunAtMS = cloneInt64Ptr(job.State.NextRunAtMS)
+	out.State.LastRunAtMS = cloneInt64Ptr(job.State.LastRunAtMS)
+	return out
 }
 
 func generateID() string {

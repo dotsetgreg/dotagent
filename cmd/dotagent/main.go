@@ -811,6 +811,14 @@ func cronEnableCmd(storePath string, disable bool) {
 
 	job := cs.EnableJob(jobID, enabled)
 	if job != nil {
+		if enabled && !job.Enabled {
+			if strings.TrimSpace(job.State.LastError) != "" {
+				fmt.Printf("✗ Job '%s' cannot be enabled: %s\n", job.Name, job.State.LastError)
+				return
+			}
+			fmt.Printf("✗ Job '%s' cannot be enabled because no future run can be scheduled\n", job.Name)
+			return
+		}
 		status := "enabled"
 		if disable {
 			status = "disabled"

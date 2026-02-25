@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os/exec"
@@ -16,6 +18,9 @@ import (
 
 const (
 	defaultProcessOutputBytes = 64000
+	maxManagedProcesses       = 32
+	maxPollsPerMinute         = 48
+	stalePollLimit            = 6
 )
 
 type managedProcess struct {
@@ -28,9 +33,18 @@ type managedProcess struct {
 	exitCode   int
 	lastError  string
 	output     []byte
+	dropped    int
 	stdin      io.WriteCloser
 	cancel     context.CancelFunc
-	mu         sync.RWMutex
+
+	lastPollAt        time.Time
+	pollWindowStart   time.Time
+	pollWindowCount   int
+	lastPollDigest    string
+	stalePollCount    int
+	staleGuardTripped bool
+
+	mu sync.RWMutex
 }
 
 func (mp *managedProcess) appendOutput(chunk []byte, maxBytes int) {
@@ -41,7 +55,9 @@ func (mp *managedProcess) appendOutput(chunk []byte, maxBytes int) {
 	defer mp.mu.Unlock()
 	mp.output = append(mp.output, chunk...)
 	if maxBytes > 0 && len(mp.output) > maxBytes {
-		mp.output = mp.output[len(mp.output)-maxBytes:]
+		drop := len(mp.output) - maxBytes
+		mp.output = mp.output[drop:]
+		mp.dropped += drop
 	}
 }
 
@@ -59,7 +75,7 @@ func (mp *managedProcess) snapshot(tail int) string {
 		output = output[len(output)-tail:]
 	}
 	return strings.TrimSpace(fmt.Sprintf(
-		"Process %s\n- Status: %s\n- Command: %s\n- Working dir: %s\n- Started: %s\n- Finished: %s\n- Exit code: %d\n- Error: %s\n- Output:\n%s",
+		"Process %s\n- Status: %s\n- Command: %s\n- Working dir: %s\n- Started: %s\n- Finished: %s\n- Exit code: %d\n- Error: %s\n- Output dropped bytes: %d\n- Output:\n%s",
 		mp.id,
 		status,
 		mp.command,
@@ -68,8 +84,80 @@ func (mp *managedProcess) snapshot(tail int) string {
 		timeOrUnset(mp.finishedAt),
 		mp.exitCode,
 		valueOrUnset(mp.lastError),
+		mp.dropped,
 		string(output),
 	))
+}
+
+func (mp *managedProcess) pollSnapshot(tail int, force bool) (string, error) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	now := time.Now()
+	if mp.pollWindowStart.IsZero() || now.Sub(mp.pollWindowStart) >= time.Minute {
+		mp.pollWindowStart = now
+		mp.pollWindowCount = 0
+	}
+	mp.pollWindowCount++
+	if mp.pollWindowCount > maxPollsPerMinute {
+		return "", fmt.Errorf("polling too frequently (%d polls/min). Slow down polling cadence", maxPollsPerMinute)
+	}
+
+	if force {
+		mp.staleGuardTripped = false
+		mp.stalePollCount = 0
+	}
+	if mp.staleGuardTripped && !force {
+		return "", fmt.Errorf("stale polling guard is active for %s; set force=true once progress is expected", mp.id)
+	}
+
+	output := mp.output
+	if tail > 0 && len(output) > tail {
+		output = output[len(output)-tail:]
+	}
+	digest := digestPollState(mp.running, mp.exitCode, output)
+	if mp.lastPollDigest == digest {
+		mp.stalePollCount++
+	} else {
+		mp.stalePollCount = 0
+		mp.lastPollDigest = digest
+	}
+	mp.lastPollAt = now
+	if mp.running && mp.stalePollCount >= stalePollLimit {
+		mp.staleGuardTripped = true
+		return "", fmt.Errorf("stale polling detected: no output/status progress across %d polls", stalePollLimit)
+	}
+
+	status := "running"
+	if !mp.running {
+		status = "completed"
+	}
+	return strings.TrimSpace(fmt.Sprintf(
+		"Process %s\n- Status: %s\n- Command: %s\n- Working dir: %s\n- Started: %s\n- Finished: %s\n- Exit code: %d\n- Error: %s\n- Output dropped bytes: %d\n- Output:\n%s",
+		mp.id,
+		status,
+		mp.command,
+		valueOrUnset(mp.workingDir),
+		mp.startedAt.Format(time.RFC3339),
+		timeOrUnset(mp.finishedAt),
+		mp.exitCode,
+		valueOrUnset(mp.lastError),
+		mp.dropped,
+		string(output),
+	)), nil
+}
+
+func digestPollState(running bool, exitCode int, output []byte) string {
+	state := "completed"
+	if running {
+		state = "running"
+	}
+	h := sha1.New()
+	_, _ = io.WriteString(h, state)
+	_, _ = io.WriteString(h, "|")
+	_, _ = io.WriteString(h, strconv.Itoa(exitCode))
+	_, _ = h.Write(output)
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 func valueOrUnset(v string) string {
@@ -146,6 +234,10 @@ func (t *ProcessTool) Parameters() map[string]interface{} {
 				"description": "Output tail size in chars for action=poll. Default 4000.",
 				"minimum":     128.0,
 				"maximum":     32000.0,
+			},
+			"force": map[string]interface{}{
+				"type":        "boolean",
+				"description": "For action=poll: bypass stale-poll guard once and resume polling.",
 			},
 			"all_completed": map[string]interface{}{
 				"type":        "boolean",
@@ -232,6 +324,14 @@ func (t *ProcessTool) start(args map[string]interface{}) *ToolResult {
 	if guardErr := t.guard.guardCommand(command, cwd); guardErr != "" {
 		return ErrorResult(guardErr)
 	}
+
+	t.mu.Lock()
+	t.pruneCompletedLocked()
+	if len(t.processes) >= maxManagedProcesses {
+		t.mu.Unlock()
+		return ErrorResult(fmt.Sprintf("too many managed processes (%d). Clear completed processes before starting another.", maxManagedProcesses))
+	}
+	t.mu.Unlock()
 
 	procCtx, cancel := context.WithCancel(context.Background())
 	var cmd *exec.Cmd
@@ -351,11 +451,16 @@ func (t *ProcessTool) poll(args map[string]interface{}) *ToolResult {
 			tail = int(raw)
 		}
 	}
+	force, _ := args["force"].(bool)
 	mp := t.get(id)
 	if mp == nil {
 		return ErrorResult(fmt.Sprintf("process %s not found", id))
 	}
-	return UserResult(mp.snapshot(tail))
+	out, err := mp.pollSnapshot(tail, force)
+	if err != nil {
+		return ErrorResult(err.Error()).WithError(err)
+	}
+	return UserResult(out)
 }
 
 func (t *ProcessTool) write(args map[string]interface{}) *ToolResult {
@@ -437,6 +542,18 @@ func (t *ProcessTool) clear(args map[string]interface{}) *ToolResult {
 		removed++
 	}
 	return UserResult(fmt.Sprintf("Removed %d completed process records", removed))
+}
+
+func (t *ProcessTool) pruneCompletedLocked() {
+	for pid, mp := range t.processes {
+		mp.mu.RLock()
+		running := mp.running
+		mp.mu.RUnlock()
+		if running {
+			continue
+		}
+		delete(t.processes, pid)
+	}
 }
 
 func (t *ProcessTool) get(id string) *managedProcess {

@@ -152,3 +152,97 @@ func TestHybridRetriever_HandlesSpecialQueryTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestHybridRetriever_DeduplicatesNearDuplicateCards(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(filepath.Join(dir, "state", "memory.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	userID := "u-dedupe"
+	agentID := "dotagent"
+	sessionKey := "discord:dedupe"
+	now := time.Now().UnixMilli()
+
+	seeds := []MemoryItem{
+		{
+			UserID:       userID,
+			AgentID:      agentID,
+			SessionKey:   sessionKey,
+			Kind:         MemoryUserPreference,
+			Key:          "coffee/preference-primary",
+			Content:      "I strongly prefer pour-over coffee in the morning.",
+			Confidence:   0.91,
+			Weight:       1.0,
+			LastSeenAtMS: now,
+		},
+		{
+			UserID:       userID,
+			AgentID:      agentID,
+			SessionKey:   sessionKey,
+			Kind:         MemoryUserPreference,
+			Key:          "coffee/preference-duplicate",
+			Content:      "I prefer pour over coffee in the morning.",
+			Confidence:   0.90,
+			Weight:       1.0,
+			LastSeenAtMS: now - 10,
+		},
+		{
+			UserID:       userID,
+			AgentID:      agentID,
+			SessionKey:   sessionKey,
+			Kind:         MemoryUserPreference,
+			Key:          "tea/preference",
+			Content:      "I also enjoy green tea in the afternoon.",
+			Confidence:   0.88,
+			Weight:       1.0,
+			LastSeenAtMS: now - 20,
+		},
+	}
+	for _, item := range seeds {
+		if _, err := store.UpsertMemoryItem(ctx, item); err != nil {
+			t.Fatalf("upsert memory item: %v", err)
+		}
+	}
+
+	r := NewHybridRetriever(store, nil)
+	cards, err := r.Recall(ctx, "what drinks do I prefer in the day", RetrievalOptions{
+		SessionKey:      sessionKey,
+		UserID:          userID,
+		AgentID:         agentID,
+		MaxCards:        3,
+		CandidateLimit:  20,
+		MinScore:        0.0,
+		IncludeSession:  true,
+		IncludeGlobal:   true,
+		RecencyHalfLife: 24 * time.Hour,
+		NowMS:           now + 1,
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(cards) < 2 {
+		t.Fatalf("expected at least 2 diverse cards, got %d", len(cards))
+	}
+
+	pourOverMentions := 0
+	teaMentions := 0
+	for _, c := range cards {
+		lower := strings.ToLower(c.Content)
+		if strings.Contains(lower, "pour-over") || strings.Contains(lower, "pour over") {
+			pourOverMentions++
+		}
+		if strings.Contains(lower, "green tea") {
+			teaMentions++
+		}
+	}
+	if pourOverMentions > 1 {
+		t.Fatalf("expected duplicate suppression for near-identical pour-over memories, got %d mentions", pourOverMentions)
+	}
+	if teaMentions == 0 {
+		t.Fatalf("expected MMR diversity to retain tea memory alongside coffee memory")
+	}
+}

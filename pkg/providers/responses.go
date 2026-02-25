@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -131,6 +132,10 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 	if p.options.beforeMarshal != nil {
 		p.options.beforeMarshal(requestBody)
 	}
+	streamCallback := optionAsStreamCallback(options)
+	if streamCallback != nil {
+		requestBody["stream"] = true
+	}
 	streaming := responsesBoolField(requestBody["stream"])
 
 	jsonData, err := json.Marshal(requestBody)
@@ -162,24 +167,38 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("send %s request: %w", p.providerName, err)
+		return nil, "", WrapTransportError(p.providerName, fmt.Errorf("send %s request: %w", p.providerName, err))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("read %s response: %w", p.providerName, err)
-	}
-
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(resp.Body)
 		msg := augmentProviderError(p.providerName, extractAPIError(body))
-		return nil, "", fmt.Errorf("%s API request failed: status=%d error=%s", p.providerName, resp.StatusCode, msg)
+		retryAfter := ParseRetryAfterHeader(resp.Header.Get("Retry-After"))
+		return nil, "", NewHTTPError(p.providerName, resp.StatusCode, msg, retryAfter)
 	}
 
 	var parsed *parsedResponsesResult
 	if streaming {
-		parsed, err = parseResponsesStreamBody(body)
+		var captured bytes.Buffer
+		parsed, err = parseResponsesStream(io.TeeReader(resp.Body, &captured), streamCallback)
+		if err != nil {
+			fallbackParsed, fallbackErr := parseResponsesStreamBody(captured.Bytes(), nil)
+			if fallbackErr == nil {
+				parsed = fallbackParsed
+				err = nil
+				if streamCallback != nil && fallbackParsed != nil && fallbackParsed.Response != nil {
+					if content := strings.TrimSpace(fallbackParsed.Response.Content); content != "" {
+						streamCallback(content)
+					}
+				}
+			}
+		}
 	} else {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, "", fmt.Errorf("read %s response: %w", p.providerName, readErr)
+		}
 		parsed, err = parseResponsesResponse(body)
 	}
 	if err != nil {
@@ -193,6 +212,24 @@ func (p *responsesProvider) GetDefaultModel() string {
 		return ""
 	}
 	return p.defaultModel
+}
+
+func (p *responsesProvider) ResolveContextWindow(ctx context.Context, model string) (int, error) {
+	_ = ctx
+	if p == nil {
+		return 0, fmt.Errorf("provider not initialized")
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = p.defaultModel
+	}
+	if model == "" {
+		return 0, fmt.Errorf("model is required")
+	}
+	if tokens := knownModelContextWindow(model); tokens > 0 {
+		return tokens, nil
+	}
+	return 0, fmt.Errorf("context window metadata unavailable")
 }
 
 func defaultResponsesEndpoint(apiBase string) string {
@@ -317,7 +354,7 @@ func parseResponsesResponse(body []byte) (*parsedResponsesResult, error) {
 	}, nil
 }
 
-func parseResponsesStreamBody(body []byte) (*parsedResponsesResult, error) {
+func parseResponsesStreamBody(body []byte, onDelta func(string)) (*parsedResponsesResult, error) {
 	trimmed := strings.TrimSpace(string(body))
 	if trimmed == "" {
 		return nil, fmt.Errorf("empty streaming response body")
@@ -325,44 +362,53 @@ func parseResponsesStreamBody(body []byte) (*parsedResponsesResult, error) {
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		return parseResponsesResponse([]byte(trimmed))
 	}
+	return parseResponsesStream(strings.NewReader(trimmed), onDelta)
+}
 
-	normalized := strings.ReplaceAll(trimmed, "\r\n", "\n")
-	chunks := strings.Split(normalized, "\n\n")
+func parseResponsesStream(r io.Reader, onDelta func(string)) (*parsedResponsesResult, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	chunkLines := make([]string, 0, 16)
 	var content strings.Builder
+	var completedPayload []byte
 
-	for _, chunk := range chunks {
+	processChunk := func(chunk string) error {
 		data := extractSSEDataChunk(chunk)
 		if data == "" || data == "[DONE]" {
-			continue
+			return nil
 		}
 
 		var event map[string]interface{}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
+			return nil
 		}
 
 		eventType := strings.TrimSpace(responsesAsString(event["type"]))
 		switch eventType {
 		case "error":
-			return nil, fmt.Errorf("%s", extractSSEErrorMessage(event))
+			return fmt.Errorf("%s", extractSSEErrorMessage(event))
 		case "response.failed":
 			if msg := extractResponsesErrorMessage(event); msg != "" {
-				return nil, fmt.Errorf("%s", msg)
+				return fmt.Errorf("%s", msg)
 			}
-			return nil, fmt.Errorf("response.failed")
+			return fmt.Errorf("response.failed")
 		case "response.done", "response.completed":
 			raw, ok := event["response"].(map[string]interface{})
 			if !ok {
-				continue
+				return nil
 			}
 			payload, err := json.Marshal(raw)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			return parseResponsesResponse(payload)
+			completedPayload = payload
 		case "response.output_text.delta", "response.refusal.delta":
 			if delta := responsesAsString(event["delta"]); delta != "" {
 				content.WriteString(delta)
+				if onDelta != nil {
+					onDelta(delta)
+				}
 			}
 		case "response.output_text.done":
 			text := strings.TrimSpace(responsesAsString(event["text"]))
@@ -373,6 +419,34 @@ func parseResponsesStreamBody(body []byte) (*parsedResponsesResult, error) {
 				content.WriteString(text)
 			}
 		}
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			if len(chunkLines) == 0 {
+				continue
+			}
+			if err := processChunk(strings.Join(chunkLines, "\n")); err != nil {
+				return nil, err
+			}
+			chunkLines = chunkLines[:0]
+			continue
+		}
+		chunkLines = append(chunkLines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(chunkLines) > 0 {
+		if err := processChunk(strings.Join(chunkLines, "\n")); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(completedPayload) > 0 {
+		return parseResponsesResponse(completedPayload)
 	}
 
 	if fallback := strings.TrimSpace(content.String()); fallback != "" {

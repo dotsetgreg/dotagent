@@ -191,8 +191,67 @@ func TestScheduleTurnMaintenance_DeduplicatesJobs(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM memory_jobs`).Scan(&jobs); err != nil {
 		t.Fatalf("count jobs: %v", err)
 	}
-	if jobs != 5 {
-		t.Fatalf("expected 5 deduplicated jobs (2 consolidate + 2 persona_apply + 1 compact), got %d", jobs)
+	if jobs != 6 {
+		t.Fatalf("expected 6 deduplicated jobs (2 consolidate + 2 persona_apply + 1 embedding_sync + 1 compact), got %d", jobs)
+	}
+}
+
+func TestService_SyncSessionEmbeddingDeltas(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:  dir,
+		AgentID:    "dotagent",
+		WorkerPoll: 10 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	store, ok := svc.store.(*SQLiteStore)
+	if !ok {
+		t.Fatalf("expected sqlite store, got %T", svc.store)
+	}
+
+	sessionKey := "discord:index-delta"
+	userID := "u-index-delta"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "index-delta", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	item, err := store.UpsertMemoryItem(ctx, MemoryItem{
+		UserID:        userID,
+		AgentID:       "dotagent",
+		ScopeType:     MemoryScopeSession,
+		ScopeID:       sessionKey,
+		SessionKey:    sessionKey,
+		Kind:          MemorySemanticFact,
+		Key:           "fact/index-delta",
+		Content:       "I need indexed memory delta updates.",
+		Confidence:    0.9,
+		Weight:        1.0,
+		SourceEventID: "evt-index-delta",
+		FirstSeenAtMS: now,
+		LastSeenAtMS:  now,
+	})
+	if err != nil {
+		t.Fatalf("upsert memory item: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM memory_embeddings WHERE item_id = ?`, item.ID); err != nil {
+		t.Fatalf("delete embedding to simulate stale delta: %v", err)
+	}
+
+	if err := svc.syncSessionEmbeddingDeltas(ctx, sessionKey); err != nil {
+		t.Fatalf("sync embedding deltas: %v", err)
+	}
+	emb, err := store.GetEmbeddings(ctx, []string{item.ID})
+	if err != nil {
+		t.Fatalf("get embeddings: %v", err)
+	}
+	if len(emb[item.ID]) == 0 {
+		t.Fatalf("expected synced embedding vector for item %s", item.ID)
 	}
 }
 
@@ -506,5 +565,63 @@ func TestCompactor_WritesStructuredSnapshot(t *testing.T) {
 	}
 	if len(snap.Preferences) == 0 {
 		t.Fatalf("expected snapshot preferences")
+	}
+}
+
+func TestBuildPromptContext_IncludesContinuationHandoff(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	svc, err := NewService(Config{
+		Workspace:        dir,
+		AgentID:          "dotagent",
+		ContextModel:     "openai/gpt-5.2",
+		MaxContextTokens: 2048,
+		WorkerPoll:       100 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:continuity-handoff"
+	userID := "u-continuity-handoff"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "continuity-handoff", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+
+	for i := 0; i < 52; i++ {
+		role := "user"
+		content := "I need to finish the migration checklist and follow up on the database rollback plan."
+		if i%2 == 1 {
+			role = "assistant"
+			content = "Acknowledged. We'll continue this plan."
+		}
+		if err := svc.AppendEvent(ctx, Event{
+			SessionKey: sessionKey,
+			TurnID:     fmt.Sprintf("turn-%d", i/2),
+			Seq:        i + 1,
+			Role:       role,
+			Content:    content,
+		}); err != nil {
+			t.Fatalf("append event %d: %v", i, err)
+		}
+	}
+
+	if err := svc.ForceCompact(ctx, sessionKey, userID, 2048); err != nil {
+		t.Fatalf("force compact: %v", err)
+	}
+
+	pc, err := svc.BuildPromptContext(ctx, sessionKey, userID, "continue the migration plan", 2048)
+	if err != nil {
+		t.Fatalf("build prompt context: %v", err)
+	}
+	if pc.Continuity.SnapshotRevision == 0 {
+		t.Fatalf("expected continuity snapshot revision > 0")
+	}
+	if len(pc.Continuity.ContinuationNotes) == 0 {
+		t.Fatalf("expected continuation notes from compacted snapshot")
+	}
+	if !strings.Contains(strings.ToLower(pc.RecallPrompt), "continuation handoff") {
+		t.Fatalf("expected recall prompt to include continuation handoff block, got: %q", pc.RecallPrompt)
 	}
 }

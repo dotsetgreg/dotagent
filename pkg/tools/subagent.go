@@ -2,7 +2,12 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,14 +18,18 @@ import (
 )
 
 type SubagentTask struct {
-	ID            string
-	Task          string
-	Label         string
-	OriginChannel string
-	OriginChatID  string
-	Status        string
-	Result        string
-	Created       int64
+	ID                 string `json:"id"`
+	Task               string `json:"task"`
+	Label              string `json:"label"`
+	OriginChannel      string `json:"origin_channel"`
+	OriginChatID       string `json:"origin_chat_id"`
+	Status             string `json:"status"`
+	Result             string `json:"result"`
+	Created            int64  `json:"created"`
+	Updated            int64  `json:"updated"`
+	CompletedAt        int64  `json:"completed_at,omitempty"`
+	CompletionNotified bool   `json:"completion_notified,omitempty"`
+	LastNotifyError    string `json:"last_notify_error,omitempty"`
 }
 
 type SubagentManager struct {
@@ -34,10 +43,25 @@ type SubagentManager struct {
 	tools            *ToolRegistry
 	maxIterations    int
 	nextID           int
+	statePath        string
+	pendingResumeIDs []string
+	pendingNotifyIDs []string
+	recoveryOnce     sync.Once
 }
 
+type persistedSubagentState struct {
+	Version int             `json:"version"`
+	NextID  int             `json:"next_id"`
+	Tasks   []*SubagentTask `json:"tasks"`
+}
+
+const (
+	subagentStateVersion = 1
+	subagentStateFile    = "subagent_tasks.json"
+)
+
 func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace string, bus *bus.MessageBus) *SubagentManager {
-	return &SubagentManager{
+	manager := &SubagentManager{
 		tasks:            make(map[string]*SubagentTask),
 		provider:         provider,
 		defaultModel:     defaultModel,
@@ -47,15 +71,26 @@ func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace 
 		tools:            NewToolRegistry(),
 		maxIterations:    10,
 		nextID:           1,
+		statePath:        filepath.Join(workspace, "state", subagentStateFile),
 	}
+	if err := manager.loadState(); err != nil {
+		logger.WarnCF("subagent", "Failed loading persisted subagent tasks", map[string]interface{}{
+			"error": err.Error(),
+			"path":  manager.statePath,
+		})
+	}
+	return manager
 }
 
 // SetTools sets the tool registry for subagent execution.
 // If not set, subagent will have access to the provided tools.
 func (sm *SubagentManager) SetTools(tools *ToolRegistry) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	sm.tools = tools
+	sm.mu.Unlock()
+	sm.recoveryOnce.Do(func() {
+		go sm.recoverPendingState()
+	})
 }
 
 // RegisterTool registers a tool for subagent execution.
@@ -77,7 +112,14 @@ func (sm *SubagentManager) SetWorkspaceContext(workspaceContext string) {
 func (sm *SubagentManager) pruneCompleted() {
 	cutoff := time.Now().Add(-30 * time.Minute).UnixMilli()
 	for id, task := range sm.tasks {
-		if task.Status != "running" && task.Created < cutoff {
+		if task.Status == "running" || task.Status == "queued_resume" {
+			continue
+		}
+		compareTS := task.Updated
+		if compareTS == 0 {
+			compareTS = task.Created
+		}
+		if compareTS < cutoff {
 			delete(sm.tasks, id)
 		}
 	}
@@ -85,26 +127,34 @@ func (sm *SubagentManager) pruneCompleted() {
 
 func (sm *SubagentManager) Spawn(ctx context.Context, task, label, originChannel, originChatID string, callback AsyncCallback) (string, error) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	sm.pruneCompleted()
 
+	now := time.Now().UnixMilli()
 	taskID := fmt.Sprintf("subagent-%d", sm.nextID)
 	sm.nextID++
 
 	subagentTask := &SubagentTask{
-		ID:            taskID,
-		Task:          task,
-		Label:         label,
-		OriginChannel: originChannel,
-		OriginChatID:  originChatID,
-		Status:        "running",
-		Created:       time.Now().UnixMilli(),
+		ID:                 taskID,
+		Task:               task,
+		Label:              label,
+		OriginChannel:      originChannel,
+		OriginChatID:       originChatID,
+		Status:             "running",
+		Created:            now,
+		Updated:            now,
+		CompletionNotified: true,
 	}
 	sm.tasks[taskID] = subagentTask
+	if err := sm.persistStateLocked(); err != nil {
+		logger.WarnCF("subagent", "Failed persisting spawned subagent task", map[string]interface{}{
+			"task_id": taskID,
+			"error":   err.Error(),
+		})
+	}
+	sm.mu.Unlock()
 
 	// Start task in background with context cancellation support
-	go sm.runTask(ctx, subagentTask, callback)
+	go sm.runTask(ctx, taskID, callback)
 
 	if label != "" {
 		return fmt.Sprintf("Spawned subagent '%s' for task: %s", label, task), nil
@@ -112,11 +162,33 @@ func (sm *SubagentManager) Spawn(ctx context.Context, task, label, originChannel
 	return fmt.Sprintf("Spawned subagent for task: %s", task), nil
 }
 
-func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, callback AsyncCallback) {
+func (sm *SubagentManager) runTask(ctx context.Context, taskID string, callback AsyncCallback) {
 	sm.mu.Lock()
+	task := sm.tasks[taskID]
+	if task == nil {
+		sm.mu.Unlock()
+		return
+	}
+	now := time.Now().UnixMilli()
 	task.Status = "running"
-	task.Created = time.Now().UnixMilli()
+	if task.Created == 0 {
+		task.Created = now
+	}
+	task.Updated = now
+	task.CompletedAt = 0
+	task.CompletionNotified = true
+	task.LastNotifyError = ""
 	workspaceContext := sm.workspaceContext
+	originChannel := task.OriginChannel
+	originChatID := task.OriginChatID
+	taskPrompt := task.Task
+	label := task.Label
+	if err := sm.persistStateLocked(); err != nil {
+		logger.WarnCF("subagent", "Failed persisting running state", map[string]interface{}{
+			"task_id": taskID,
+			"error":   err.Error(),
+		})
+	}
 	sm.mu.Unlock()
 
 	// Build system prompt for subagent
@@ -129,7 +201,7 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 		},
 		{
 			Role:    "user",
-			Content: task.Task,
+			Content: taskPrompt,
 		},
 	}
 
@@ -137,8 +209,15 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 	select {
 	case <-ctx.Done():
 		sm.mu.Lock()
-		task.Status = "cancelled"
-		task.Result = "Task cancelled before execution"
+		if existing := sm.tasks[taskID]; existing != nil {
+			existing.Status = "cancelled"
+			existing.Result = "Task cancelled before execution"
+			existing.Updated = time.Now().UnixMilli()
+			existing.CompletedAt = existing.Updated
+			existing.CompletionNotified = true
+			existing.LastNotifyError = ""
+			_ = sm.persistStateLocked()
+		}
 		sm.mu.Unlock()
 		return
 	default:
@@ -159,39 +238,26 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 			"max_tokens":  4096,
 			"temperature": 0.7,
 		},
-	}, messages, task.OriginChannel, task.OriginChatID)
+	}, messages, originChannel, originChatID)
 
-	sm.mu.Lock()
 	var result *ToolResult
-	defer func() {
-		sm.mu.Unlock()
-		// Call callback if provided and result is set
-		if callback != nil && result != nil {
-			callback(ctx, result)
-		}
-	}()
-
+	now = time.Now().UnixMilli()
 	if err != nil {
-		task.Status = "failed"
-		task.Result = fmt.Sprintf("Error: %v", err)
-		// Check if it was cancelled
-		if ctx.Err() != nil {
-			task.Status = "cancelled"
-			task.Result = "Task cancelled during execution"
-		}
 		result = &ToolResult{
-			ForLLM:  task.Result,
+			ForLLM:  fmt.Sprintf("Error: %v", err),
 			ForUser: "",
 			Silent:  false,
 			IsError: true,
 			Async:   false,
 			Err:     err,
 		}
+		// Check if it was cancelled
+		if ctx.Err() != nil {
+			result.ForLLM = "Task cancelled during execution"
+		}
 	} else {
-		task.Status = "completed"
-		task.Result = loopResult.Content
 		result = &ToolResult{
-			ForLLM:  fmt.Sprintf("Subagent '%s' completed (iterations: %d): %s", task.Label, loopResult.Iterations, loopResult.Content),
+			ForLLM:  fmt.Sprintf("Subagent '%s' completed (iterations: %d): %s", label, loopResult.Iterations, loopResult.Content),
 			ForUser: loopResult.Content,
 			Silent:  false,
 			IsError: false,
@@ -199,30 +265,142 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 		}
 	}
 
-	// Send announce message back to main agent
-	if sm.bus != nil {
-		announceContent := fmt.Sprintf("Task '%s' completed.\n\nResult:\n%s", task.Label, task.Result)
-		if err := sm.bus.PublishInbound(bus.InboundMessage{
-			Channel:  "system",
-			SenderID: fmt.Sprintf("subagent:%s", task.ID),
-			// Format: "original_channel:original_chat_id" for routing back
-			ChatID:  fmt.Sprintf("%s:%s", task.OriginChannel, task.OriginChatID),
-			Content: announceContent,
-		}); err != nil {
-			logger.WarnCF("subagent", "Failed to publish subagent completion",
-				map[string]interface{}{
-					"task_id": task.ID,
-					"error":   err.Error(),
-				})
+	sm.mu.Lock()
+	task = sm.tasks[taskID]
+	if task != nil {
+		task.Result = result.ForLLM
+		if err != nil {
+			task.Status = "failed"
+			if ctx.Err() != nil {
+				task.Status = "cancelled"
+			}
+		} else {
+			task.Status = "completed"
+		}
+		task.Updated = now
+		task.CompletedAt = now
+		task.CompletionNotified = false
+		task.LastNotifyError = ""
+		if persistErr := sm.persistStateLocked(); persistErr != nil {
+			logger.WarnCF("subagent", "Failed persisting finished subagent task", map[string]interface{}{
+				"task_id": taskID,
+				"error":   persistErr.Error(),
+			})
 		}
 	}
+	taskSnapshot := cloneSubagentTask(task)
+	sm.mu.Unlock()
+
+	if callback != nil && result != nil {
+		callback(ctx, result)
+	}
+	if taskSnapshot == nil {
+		return
+	}
+
+	publishErr := sm.publishCompletionAnnouncement(*taskSnapshot)
+	sm.mu.Lock()
+	if existing := sm.tasks[taskID]; existing != nil {
+		if publishErr == nil {
+			existing.CompletionNotified = true
+			existing.LastNotifyError = ""
+		} else {
+			existing.CompletionNotified = false
+			existing.LastNotifyError = publishErr.Error()
+			sm.addPendingNotifyLocked(taskID)
+		}
+		existing.Updated = time.Now().UnixMilli()
+		if persistErr := sm.persistStateLocked(); persistErr != nil {
+			logger.WarnCF("subagent", "Failed persisting completion notification state", map[string]interface{}{
+				"task_id": taskID,
+				"error":   persistErr.Error(),
+			})
+		}
+	}
+	sm.mu.Unlock()
+}
+
+func (sm *SubagentManager) recoverPendingState() {
+	sm.mu.Lock()
+	resumeIDs := append([]string(nil), sm.pendingResumeIDs...)
+	notifyIDs := append([]string(nil), sm.pendingNotifyIDs...)
+	sm.pendingResumeIDs = nil
+	sm.pendingNotifyIDs = nil
+	sm.mu.Unlock()
+
+	for _, taskID := range resumeIDs {
+		go sm.runTask(context.Background(), taskID, nil)
+	}
+	for _, taskID := range notifyIDs {
+		go sm.retryPendingAnnouncement(taskID)
+	}
+}
+
+func (sm *SubagentManager) retryPendingAnnouncement(taskID string) {
+	sm.mu.RLock()
+	task := cloneSubagentTask(sm.tasks[taskID])
+	sm.mu.RUnlock()
+	if task == nil {
+		return
+	}
+	err := sm.publishCompletionAnnouncement(*task)
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	existing := sm.tasks[taskID]
+	if existing == nil {
+		return
+	}
+	if err == nil {
+		existing.CompletionNotified = true
+		existing.LastNotifyError = ""
+	} else {
+		existing.CompletionNotified = false
+		existing.LastNotifyError = err.Error()
+		sm.addPendingNotifyLocked(taskID)
+	}
+	existing.Updated = time.Now().UnixMilli()
+	_ = sm.persistStateLocked()
+}
+
+func (sm *SubagentManager) publishCompletionAnnouncement(task SubagentTask) error {
+	if sm.bus == nil {
+		return nil
+	}
+	announceContent := fmt.Sprintf("Task '%s' completed.\n\nResult:\n%s", task.Label, task.Result)
+	msg := bus.InboundMessage{
+		Channel:  "system",
+		SenderID: fmt.Sprintf("subagent:%s", task.ID),
+		ChatID:   fmt.Sprintf("%s:%s", task.OriginChannel, task.OriginChatID),
+		Content:  announceContent,
+	}
+	var lastErr error
+	backoff := []time.Duration{0, 200 * time.Millisecond, 800 * time.Millisecond}
+	for attempt, wait := range backoff {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		if err := sm.bus.PublishInbound(msg); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			logger.WarnCF("subagent", "Failed to publish subagent completion", map[string]interface{}{
+				"task_id": task.ID,
+				"attempt": attempt + 1,
+				"error":   err.Error(),
+			})
+		}
+	}
+	return lastErr
 }
 
 func (sm *SubagentManager) GetTask(taskID string) (*SubagentTask, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	task, ok := sm.tasks[taskID]
-	return task, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneSubagentTask(task), true
 }
 
 func (sm *SubagentManager) ListTasks() []*SubagentTask {
@@ -231,9 +409,150 @@ func (sm *SubagentManager) ListTasks() []*SubagentTask {
 
 	tasks := make([]*SubagentTask, 0, len(sm.tasks))
 	for _, task := range sm.tasks {
-		tasks = append(tasks, task)
+		tasks = append(tasks, cloneSubagentTask(task))
 	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Created < tasks[j].Created })
 	return tasks
+}
+
+func cloneSubagentTask(task *SubagentTask) *SubagentTask {
+	if task == nil {
+		return nil
+	}
+	cp := *task
+	return &cp
+}
+
+func (sm *SubagentManager) loadState() error {
+	data, err := os.ReadFile(sm.statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var state persistedSubagentState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.tasks = make(map[string]*SubagentTask, len(state.Tasks))
+	sm.nextID = 1
+	if state.NextID > 0 {
+		sm.nextID = state.NextID
+	}
+	sm.pendingResumeIDs = nil
+	sm.pendingNotifyIDs = nil
+
+	needsRewrite := false
+	for _, task := range state.Tasks {
+		cp := cloneSubagentTask(task)
+		if cp == nil || strings.TrimSpace(cp.ID) == "" {
+			continue
+		}
+		if cp.Updated == 0 {
+			cp.Updated = cp.Created
+		}
+		if cp.Created == 0 {
+			cp.Created = cp.Updated
+		}
+		switch cp.Status {
+		case "running":
+			cp.Status = "queued_resume"
+			cp.Result = "Resuming after restart"
+			cp.Updated = time.Now().UnixMilli()
+			sm.pendingResumeIDs = append(sm.pendingResumeIDs, cp.ID)
+			needsRewrite = true
+		case "queued_resume":
+			sm.pendingResumeIDs = append(sm.pendingResumeIDs, cp.ID)
+		case "completed", "failed", "cancelled":
+		default:
+			cp.Status = "failed"
+			cp.Result = "Task state recovered with invalid status; marked as failed"
+			cp.Updated = time.Now().UnixMilli()
+			cp.CompletedAt = cp.Updated
+			cp.CompletionNotified = true
+			needsRewrite = true
+		}
+		// Legacy entries (pre-notification metadata) should not be retried.
+		if cp.CompletedAt == 0 && (cp.Status == "completed" || cp.Status == "failed" || cp.Status == "cancelled") {
+			cp.CompletionNotified = true
+		}
+		if (cp.Status == "completed" || cp.Status == "failed" || cp.Status == "cancelled") &&
+			!cp.CompletionNotified &&
+			strings.TrimSpace(cp.OriginChannel) != "" &&
+			strings.TrimSpace(cp.OriginChatID) != "" {
+			sm.pendingNotifyIDs = append(sm.pendingNotifyIDs, cp.ID)
+		}
+		sm.tasks[cp.ID] = cp
+		if n := parseSubagentNumericID(cp.ID); n >= sm.nextID {
+			sm.nextID = n + 1
+		}
+	}
+	sm.pruneCompleted()
+	if sm.nextID <= 0 {
+		sm.nextID = 1
+	}
+	if needsRewrite {
+		_ = sm.persistStateLocked()
+	}
+	return nil
+}
+
+func (sm *SubagentManager) persistStateLocked() error {
+	state := persistedSubagentState{
+		Version: subagentStateVersion,
+		NextID:  sm.nextID,
+		Tasks:   make([]*SubagentTask, 0, len(sm.tasks)),
+	}
+	for _, task := range sm.tasks {
+		state.Tasks = append(state.Tasks, cloneSubagentTask(task))
+	}
+	sort.Slice(state.Tasks, func(i, j int) bool { return state.Tasks[i].Created < state.Tasks[j].Created })
+	return writeJSONFileAtomic(sm.statePath, state)
+}
+
+func writeJSONFileAtomic(path string, value interface{}) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required")
+	}
+	payload, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func parseSubagentNumericID(id string) int {
+	const prefix = "subagent-"
+	if !strings.HasPrefix(id, prefix) {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(id, prefix))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func (sm *SubagentManager) addPendingNotifyLocked(taskID string) {
+	for _, existing := range sm.pendingNotifyIDs {
+		if existing == taskID {
+			return
+		}
+	}
+	sm.pendingNotifyIDs = append(sm.pendingNotifyIDs, taskID)
 }
 
 // SubagentTool executes a subagent task synchronously and returns the result.

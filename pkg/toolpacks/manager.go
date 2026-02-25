@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dotsetgreg/dotagent/pkg/connectors"
@@ -34,6 +35,12 @@ var githubArchiveBaseURL = "https://codeload.github.com"
 var githubAPIBaseURL = "https://api.github.com"
 var githubRepoRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 var githubCommitSHARegex = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
+var newMCPRuntimeFn = func(id string, cfg connectors.MCPConfig) (connectors.Runtime, error) {
+	return connectors.NewMCPRuntime(id, cfg)
+}
+var newOpenAPIRuntimeFn = func(id string, cfg connectors.OpenAPIConfig) (connectors.Runtime, error) {
+	return connectors.NewOpenAPIRuntime(id, cfg)
+}
 
 var reservedToolNames = map[string]struct{}{
 	"read_file":   {},
@@ -99,14 +106,87 @@ type Manager struct {
 }
 
 type connectorInvokerAdapter struct {
+	runtime *sharedConnectorRuntime
+}
+
+type sharedConnectorRuntime struct {
 	runtime connectors.Runtime
+	mu      sync.Mutex
+	refs    int
+	closed  bool
+}
+
+func newSharedConnectorRuntime(runtime connectors.Runtime) *sharedConnectorRuntime {
+	return &sharedConnectorRuntime{runtime: runtime}
+}
+
+func (s *sharedConnectorRuntime) Acquire() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.refs++
+}
+
+func (s *sharedConnectorRuntime) Runtime() connectors.Runtime {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	return s.runtime
+}
+
+func (s *sharedConnectorRuntime) Release() error {
+	if s == nil {
+		return nil
+	}
+	var rt connectors.Runtime
+	s.mu.Lock()
+	if s.refs > 0 {
+		s.refs--
+	}
+	if s.refs == 0 && !s.closed {
+		s.closed = true
+		rt = s.runtime
+	}
+	s.mu.Unlock()
+	if rt == nil {
+		return nil
+	}
+	return rt.Close()
+}
+
+func (s *sharedConnectorRuntime) CloseIfUnused() error {
+	if s == nil {
+		return nil
+	}
+	var rt connectors.Runtime
+	s.mu.Lock()
+	if s.refs == 0 && !s.closed {
+		s.closed = true
+		rt = s.runtime
+	}
+	s.mu.Unlock()
+	if rt == nil {
+		return nil
+	}
+	return rt.Close()
 }
 
 func (a connectorInvokerAdapter) Invoke(ctx context.Context, target string, args map[string]interface{}) (tools.ConnectorInvocationResult, error) {
-	if a.runtime == nil {
+	rt := a.runtime.Runtime()
+	if rt == nil {
 		return tools.ConnectorInvocationResult{}, fmt.Errorf("connector runtime unavailable")
 	}
-	result, err := a.runtime.Invoke(ctx, target, args)
+	result, err := rt.Invoke(ctx, target, args)
 	if err != nil {
 		return tools.ConnectorInvocationResult{}, err
 	}
@@ -118,10 +198,7 @@ func (a connectorInvokerAdapter) Invoke(ctx context.Context, target string, args
 }
 
 func (a connectorInvokerAdapter) Close() error {
-	if a.runtime == nil {
-		return nil
-	}
-	return a.runtime.Close()
+	return a.runtime.Release()
 }
 
 func NewManager(workspace string, restrict bool) *Manager {
@@ -180,6 +257,10 @@ func (m *Manager) LoadEnabledTools() ([]tools.Tool, error) {
 		}
 		packDir := filepath.Join(m.rootDir, filepath.Base(manifest.ID))
 		connectorRuntimes, connWarnings := m.buildConnectorRuntimes(packDir, manifest)
+		sharedRuntimes := make(map[string]*sharedConnectorRuntime, len(connectorRuntimes))
+		for connectorID, runtime := range connectorRuntimes {
+			sharedRuntimes[connectorID] = newSharedConnectorRuntime(runtime)
+		}
 		warnings = append(warnings, connWarnings...)
 		for _, mt := range manifest.Tools {
 			toolType := strings.ToLower(strings.TrimSpace(mt.Type))
@@ -214,9 +295,14 @@ func (m *Manager) LoadEnabledTools() ([]tools.Tool, error) {
 					continue
 				}
 				connectorID := strings.TrimSpace(mt.ConnectorID)
-				runtime, ok := connectorRuntimes[connectorID]
+				runtimeRef, ok := sharedRuntimes[connectorID]
 				if !ok {
 					warnings = append(warnings, fmt.Sprintf("%s: connector %q not available for tool %q", manifest.ID, connectorID, toolName))
+					continue
+				}
+				runtime := runtimeRef.Runtime()
+				if runtime == nil {
+					warnings = append(warnings, fmt.Sprintf("%s: connector %q runtime is unavailable for tool %q", manifest.ID, connectorID, toolName))
 					continue
 				}
 				target := strings.TrimSpace(mt.RemoteTool)
@@ -246,11 +332,17 @@ func (m *Manager) LoadEnabledTools() ([]tools.Tool, error) {
 					nonEmpty(desc, fmt.Sprintf("ToolPack %s %s connector tool", manifest.ID, toolType)),
 					defaultParameters(params),
 					target,
-					connectorInvokerAdapter{runtime: runtime},
+					connectorInvokerAdapter{runtime: runtimeRef},
 				))
+				runtimeRef.Acquire()
 				loadedNames[toolName] = manifest.ID
 			default:
 				warnings = append(warnings, fmt.Sprintf("%s: tool %q has unsupported type %q", manifest.ID, mt.Name, mt.Type))
+			}
+		}
+		for connectorID, runtimeRef := range sharedRuntimes {
+			if closeErr := runtimeRef.CloseIfUnused(); closeErr != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: connector %q close failed: %v", manifest.ID, connectorID, closeErr))
 			}
 		}
 	}
@@ -295,7 +387,7 @@ func (m *Manager) buildConnectorRuntimes(packDir string, manifest Manifest) (map
 			if strings.TrimSpace(cfg.WorkingDir) != "" {
 				cfg.WorkingDir = resolvePackWorkingDir(packDir, cfg.WorkingDir)
 			}
-			rt, err := connectors.NewMCPRuntime(connID, cfg)
+			rt, err := newMCPRuntimeFn(connID, cfg)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: mcp connector %q init failed: %v", manifest.ID, connID, err))
 				continue
@@ -306,7 +398,7 @@ func (m *Manager) buildConnectorRuntimes(packDir string, manifest Manifest) (map
 			if specPath := strings.TrimSpace(cfg.SpecPath); specPath != "" && !filepath.IsAbs(specPath) {
 				cfg.SpecPath = filepath.Join(packDir, specPath)
 			}
-			rt, err := connectors.NewOpenAPIRuntime(connID, cfg)
+			rt, err := newOpenAPIRuntimeFn(connID, cfg)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: openapi connector %q init failed: %v", manifest.ID, connID, err))
 				continue
@@ -356,8 +448,13 @@ func (m *Manager) Validate(id string) ([]string, error) {
 			continue
 		}
 		packDir := filepath.Join(m.rootDir, filepath.Base(manifest.ID))
-		_, connWarnings := m.buildConnectorRuntimes(packDir, manifest)
+		runtimes, connWarnings := m.buildConnectorRuntimes(packDir, manifest)
 		warnings = append(warnings, connWarnings...)
+		for connectorID, runtime := range runtimes {
+			if closeErr := runtime.Close(); closeErr != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: connector %q close failed: %v", manifest.ID, connectorID, closeErr))
+			}
+		}
 	}
 	return warnings, nil
 }

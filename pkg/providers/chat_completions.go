@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +24,7 @@ type chatCompletionsProvider struct {
 	auth         AuthStrategy
 	httpClient   *http.Client
 	extraHeaders map[string]string
+	contextCache sync.Map // model -> context window tokens
 }
 
 func newChatCompletionsProvider(providerName, apiBase, defaultModel, proxy string, auth AuthStrategy, extraHeaders map[string]string) (*chatCompletionsProvider, error) {
@@ -80,6 +84,11 @@ func (p *chatCompletionsProvider) Chat(ctx context.Context, messages []Message, 
 		"model":    model,
 		"messages": messages,
 	}
+	streamCallback := optionAsStreamCallback(options)
+	streaming := streamCallback != nil || optionAsBool(options, "stream")
+	if streaming {
+		requestBody["stream"] = true
+	}
 
 	if len(tools) > 0 {
 		requestBody["tools"] = tools
@@ -114,18 +123,28 @@ func (p *chatCompletionsProvider) Chat(ctx context.Context, messages []Message, 
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("send %s request: %w", p.providerName, err)
+		return nil, WrapTransportError(p.providerName, fmt.Errorf("send %s request: %w", p.providerName, err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(resp.Body)
+		msg := augmentProviderError(p.providerName, extractAPIError(body))
+		retryAfter := ParseRetryAfterHeader(resp.Header.Get("Retry-After"))
+		return nil, NewHTTPError(p.providerName, resp.StatusCode, msg, retryAfter)
+	}
+
+	if streaming {
+		result, err := parseChatCompletionsStreamResponse(resp.Body, streamCallback)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s stream response: %w", p.providerName, err)
+		}
+		return result, nil
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read %s response: %w", p.providerName, err)
-	}
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		msg := augmentProviderError(p.providerName, extractAPIError(body))
-		return nil, fmt.Errorf("%s API request failed: status=%d error=%s", p.providerName, resp.StatusCode, msg)
 	}
 
 	result, err := parseChatCompletionsResponse(body)
@@ -140,6 +159,96 @@ func (p *chatCompletionsProvider) GetDefaultModel() string {
 		return ""
 	}
 	return p.defaultModel
+}
+
+func (p *chatCompletionsProvider) ResolveContextWindow(ctx context.Context, model string) (int, error) {
+	if p == nil {
+		return 0, fmt.Errorf("provider not initialized")
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = p.defaultModel
+	}
+	if model == "" {
+		return 0, fmt.Errorf("model is required")
+	}
+	if v := knownModelContextWindow(model); v > 0 {
+		return v, nil
+	}
+	if cached, ok := p.contextCache.Load(strings.ToLower(model)); ok {
+		if n, ok := cached.(int); ok && n > 0 {
+			return n, nil
+		}
+	}
+	// OpenRouter exposes context lengths via /models; OpenAI chat-completions
+	// generally does not expose this in model metadata.
+	if p.providerName != ProviderOpenRouter {
+		return 0, fmt.Errorf("provider context metadata unavailable")
+	}
+
+	timeout := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem < timeout {
+			timeout = rem
+		}
+	}
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, p.apiBase+"/models", nil)
+	if err != nil {
+		return 0, err
+	}
+	if err := p.auth.Apply(reqCtx, req); err != nil {
+		return 0, err
+	}
+	for name, value := range p.extraHeaders {
+		req.Header.Set(name, value)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, NewHTTPError(p.providerName, resp.StatusCode, extractAPIError(body), ParseRetryAfterHeader(resp.Header.Get("Retry-After")))
+	}
+
+	var payload struct {
+		Data []struct {
+			ID            string `json:"id"`
+			ContextLength int    `json:"context_length"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+	best := 0
+	target := strings.ToLower(strings.TrimSpace(model))
+	for _, entry := range payload.Data {
+		entryID := strings.ToLower(strings.TrimSpace(entry.ID))
+		if entryID == "" || entry.ContextLength <= 0 {
+			continue
+		}
+		if entryID == target || strings.HasSuffix(target, "/"+entryID) || strings.HasSuffix(entryID, "/"+target) {
+			best = entry.ContextLength
+			break
+		}
+	}
+	if best <= 0 {
+		return 0, fmt.Errorf("context window metadata not found for model %s", model)
+	}
+	p.contextCache.Store(target, best)
+	return best, nil
 }
 
 func optionAsInt(opts map[string]interface{}, key string) (int, bool) {
@@ -186,6 +295,36 @@ func optionAsFloat(opts map[string]interface{}, key string) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func optionAsBool(opts map[string]interface{}, key string) bool {
+	if len(opts) == 0 {
+		return false
+	}
+	v, ok := opts[key]
+	if !ok || v == nil {
+		return false
+	}
+	switch vv := v.(type) {
+	case bool:
+		return vv
+	case string:
+		return strings.EqualFold(strings.TrimSpace(vv), "true")
+	default:
+		return false
+	}
+}
+
+func optionAsStreamCallback(opts map[string]interface{}) func(string) {
+	if len(opts) == 0 {
+		return nil
+	}
+	v, ok := opts["stream_callback"]
+	if !ok || v == nil {
+		return nil
+	}
+	cb, _ := v.(func(string))
+	return cb
 }
 
 func parseChatCompletionsResponse(body []byte) (*LLMResponse, error) {
@@ -245,6 +384,139 @@ func parseChatCompletionsResponse(body []byte) (*LLMResponse, error) {
 	}, nil
 }
 
+func parseChatCompletionsStreamResponse(r io.Reader, onDelta func(string)) (*LLMResponse, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	type toolAccumulator struct {
+		ID   string
+		Type string
+		Name string
+		Args strings.Builder
+	}
+
+	accumulators := map[int]*toolAccumulator{}
+	var (
+		content      strings.Builder
+		finishReason string
+		usage        *UsageInfo
+	)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function *struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *UsageInfo `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		for _, choice := range chunk.Choices {
+			if delta := choice.Delta.Content; delta != "" {
+				content.WriteString(delta)
+				if onDelta != nil {
+					onDelta(delta)
+				}
+			}
+			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+			}
+			for _, tc := range choice.Delta.ToolCalls {
+				acc := accumulators[tc.Index]
+				if acc == nil {
+					acc = &toolAccumulator{}
+					accumulators[tc.Index] = acc
+				}
+				if id := strings.TrimSpace(tc.ID); id != "" {
+					acc.ID = id
+				}
+				if typ := strings.TrimSpace(tc.Type); typ != "" {
+					acc.Type = typ
+				}
+				if tc.Function != nil {
+					if name := strings.TrimSpace(tc.Function.Name); name != "" {
+						acc.Name = name
+					}
+					if args := tc.Function.Arguments; args != "" {
+						acc.Args.WriteString(args)
+					}
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	indexes := make([]int, 0, len(accumulators))
+	for idx := range accumulators {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+
+	toolCalls := make([]ToolCall, 0, len(indexes))
+	for _, idx := range indexes {
+		acc := accumulators[idx]
+		if acc == nil {
+			continue
+		}
+		argsRaw := strings.TrimSpace(acc.Args.String())
+		args := map[string]interface{}{}
+		if argsRaw != "" {
+			if err := json.Unmarshal([]byte(argsRaw), &args); err != nil {
+				args["raw"] = argsRaw
+			}
+		}
+		toolCalls = append(toolCalls, ToolCall{
+			ID:        acc.ID,
+			Type:      valueOr(acc.Type, "function"),
+			Name:      acc.Name,
+			Arguments: args,
+		})
+	}
+
+	if finishReason == "" {
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		} else {
+			finishReason = "stop"
+		}
+	}
+	return &LLMResponse{
+		Content:      strings.TrimSpace(content.String()),
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
+		Usage:        usage,
+	}, nil
+}
+
 func flattenMessageContent(raw interface{}) string {
 	switch v := raw.(type) {
 	case string:
@@ -297,4 +569,12 @@ func extractAPIError(body []byte) string {
 		return trimmed[:2000] + "..."
 	}
 	return trimmed
+}
+
+func valueOr(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
 }

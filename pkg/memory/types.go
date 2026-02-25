@@ -68,6 +68,7 @@ type MemoryItem struct {
 	LastSeenAtMS  int64
 	ExpiresAtMS   int64
 	DeletedAtMS   int64
+	Evergreen     bool
 	Metadata      map[string]string
 }
 
@@ -104,6 +105,11 @@ type MemoryCard struct {
 	Confidence float64
 	RecencyMS  int64
 	Source     string
+}
+
+type EmbeddingRecord struct {
+	Model  string
+	Vector []float32
 }
 
 // RetrievalOptions controls memory recall behavior.
@@ -147,12 +153,14 @@ type PromptContext struct {
 
 // PromptContinuity captures context availability guarantees for a turn.
 type PromptContinuity struct {
-	HasPriorTurns bool
-	HasHistory    bool
-	HasSummary    bool
-	HasRecall     bool
-	Degraded      bool
-	DegradedBy    []string
+	HasPriorTurns     bool
+	HasHistory        bool
+	HasSummary        bool
+	HasRecall         bool
+	SnapshotRevision  int
+	ContinuationNotes []string
+	Degraded          bool
+	DegradedBy        []string
 }
 
 // SessionSnapshot is a structured compaction artifact used for long-horizon continuity.
@@ -187,9 +195,11 @@ type ContextBudget struct {
 
 // JobType values for background memory workers.
 const (
-	JobConsolidate  = "consolidate"
-	JobPersonaApply = "persona_apply"
-	JobCompact      = "compact"
+	JobConsolidate      = "consolidate"
+	JobPersonaApply     = "persona_apply"
+	JobCompact          = "compact"
+	JobEmbeddingSync    = "embedding_sync"
+	JobEmbeddingReindex = "embedding_reindex"
 )
 
 // JobStatus values.
@@ -214,4 +224,12 @@ type Job struct {
 	CreatedAtMS   int64
 	UpdatedAtMS   int64
 	CompletedAtMS int64
+}
+
+// EmbeddingReindexReport captures outcome metrics for atomic embedding reindex.
+type EmbeddingReindexReport struct {
+	IndexedItems int
+	FallbackHits int
+	FailedItems  int
+	DurationMS   int64
 }

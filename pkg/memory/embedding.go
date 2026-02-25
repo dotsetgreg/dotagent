@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"hash/fnv"
 	"math"
 	"regexp"
@@ -89,15 +90,11 @@ func init() {
 }
 
 func SetEmbedderByName(name string) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	switch name {
-	case "", defaultEmbeddingModel, "chargram", "chargram-384":
-		SetEmbedder(&chargramEmbedder{dims: 384, modelID: defaultEmbeddingModel})
-	case hashEmbeddingModel, "hash", "hash-256":
-		SetEmbedder(&hashEmbedder{dims: 256, modelID: hashEmbeddingModel})
-	default:
-		SetEmbedder(&chargramEmbedder{dims: 384, modelID: defaultEmbeddingModel})
+	embedder, _, ok := newEmbedderByName(name)
+	if !ok {
+		embedder = &chargramEmbedder{dims: 384, modelID: defaultEmbeddingModel}
 	}
+	SetEmbedder(embedder)
 }
 
 func SetEmbedder(embedder Embedder) {
@@ -123,6 +120,35 @@ func currentEmbeddingModel() string {
 
 func embedText(text string) []float32 {
 	return currentEmbedder().Embed(text)
+}
+
+func embedTextWithModel(model, text string) (_ []float32, modelID string, err error) {
+	embedder, canonicalModel, ok := newEmbedderByName(model)
+	if !ok {
+		return nil, "", fmt.Errorf("unknown embedding model: %s", strings.TrimSpace(model))
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("embedding model panic (%s): %v", canonicalModel, r)
+		}
+	}()
+	vec := embedder.Embed(text)
+	if len(vec) == 0 {
+		return nil, "", fmt.Errorf("embedding model %s returned empty vector", canonicalModel)
+	}
+	return vec, canonicalModel, nil
+}
+
+func newEmbedderByName(name string) (Embedder, string, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "", defaultEmbeddingModel, "chargram", "chargram-384":
+		return &chargramEmbedder{dims: 384, modelID: defaultEmbeddingModel}, defaultEmbeddingModel, true
+	case hashEmbeddingModel, "hash", "hash-256":
+		return &hashEmbedder{dims: 256, modelID: hashEmbeddingModel}, hashEmbeddingModel, true
+	default:
+		return nil, "", false
+	}
 }
 
 func tokenize(text string) []string {

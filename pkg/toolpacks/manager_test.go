@@ -10,10 +10,49 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dotsetgreg/dotagent/pkg/connectors"
 )
+
+type fakeConnectorRuntime struct {
+	id         string
+	typ        string
+	mu         sync.Mutex
+	closeCount int
+}
+
+func (f *fakeConnectorRuntime) ID() string   { return f.id }
+func (f *fakeConnectorRuntime) Type() string { return f.typ }
+
+func (f *fakeConnectorRuntime) Health(ctx context.Context) error {
+	return nil
+}
+
+func (f *fakeConnectorRuntime) ToolSchema(ctx context.Context, target string) (string, map[string]interface{}, error) {
+	return "fake", map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}, nil
+}
+
+func (f *fakeConnectorRuntime) Invoke(ctx context.Context, target string, args map[string]interface{}) (connectors.InvocationResult, error) {
+	return connectors.InvocationResult{Content: "ok"}, nil
+}
+
+func (f *fakeConnectorRuntime) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeCount++
+	return nil
+}
+
+func (f *fakeConnectorRuntime) CloseCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeCount
+}
 
 func TestManager_LoadEnabledTools(t *testing.T) {
 	workspace := t.TempDir()
@@ -591,5 +630,169 @@ func TestResolveGitHubCommitSHA_PassthroughSHA(t *testing.T) {
 	}
 	if resolved != sha {
 		t.Fatalf("expected %s, got %s", sha, resolved)
+	}
+}
+
+func TestManager_Validate_ClosesConnectorRuntimes(t *testing.T) {
+	workspace := t.TempDir()
+	packDir := filepath.Join(workspace, "toolpacks", "validate-pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	manifest := Manifest{
+		ID:      "validate-pack",
+		Name:    "Validate Pack",
+		Version: "1.0.0",
+		Enabled: true,
+		Connectors: []ManifestConnector{
+			{ID: "mcp", Type: "mcp"},
+		},
+		Tools: []ManifestTool{
+			{
+				Name:            "echo_cmd",
+				Type:            "command",
+				CommandTemplate: "echo ok",
+			},
+		},
+	}
+	writeManifestForTest(t, packDir, manifest)
+
+	rt := &fakeConnectorRuntime{id: "mcp", typ: "mcp"}
+	prevMCP := newMCPRuntimeFn
+	newMCPRuntimeFn = func(id string, cfg connectors.MCPConfig) (connectors.Runtime, error) {
+		return rt, nil
+	}
+	defer func() {
+		newMCPRuntimeFn = prevMCP
+	}()
+
+	mgr := NewManager(workspace, false)
+	warnings, err := mgr.Validate("")
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %v", warnings)
+	}
+	if rt.CloseCount() != 1 {
+		t.Fatalf("expected runtime close count 1, got %d", rt.CloseCount())
+	}
+}
+
+func TestManager_LoadEnabledTools_ClosesUnusedConnectorRuntime(t *testing.T) {
+	workspace := t.TempDir()
+	packDir := filepath.Join(workspace, "toolpacks", "unused-connector-pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	manifest := Manifest{
+		ID:      "unused-connector-pack",
+		Name:    "Unused Connector Pack",
+		Version: "1.0.0",
+		Enabled: true,
+		Connectors: []ManifestConnector{
+			{ID: "mcp", Type: "mcp"},
+		},
+		Tools: []ManifestTool{
+			{
+				Name:            "echo_cmd",
+				Type:            "command",
+				CommandTemplate: "echo ok",
+			},
+		},
+	}
+	writeManifestForTest(t, packDir, manifest)
+
+	rt := &fakeConnectorRuntime{id: "mcp", typ: "mcp"}
+	prevMCP := newMCPRuntimeFn
+	newMCPRuntimeFn = func(id string, cfg connectors.MCPConfig) (connectors.Runtime, error) {
+		return rt, nil
+	}
+	defer func() {
+		newMCPRuntimeFn = prevMCP
+	}()
+
+	mgr := NewManager(workspace, false)
+	loaded, err := mgr.LoadEnabledTools()
+	if err != nil {
+		t.Fatalf("LoadEnabledTools failed: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected one loaded command tool, got %d", len(loaded))
+	}
+	if rt.CloseCount() != 1 {
+		t.Fatalf("expected unused connector runtime to be closed once, got %d", rt.CloseCount())
+	}
+}
+
+func TestManager_LoadEnabledTools_SharedConnectorRuntimeClosedOnce(t *testing.T) {
+	workspace := t.TempDir()
+	packDir := filepath.Join(workspace, "toolpacks", "shared-connector-pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	params := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}
+	manifest := Manifest{
+		ID:      "shared-connector-pack",
+		Name:    "Shared Connector Pack",
+		Version: "1.0.0",
+		Enabled: true,
+		Connectors: []ManifestConnector{
+			{ID: "mcp", Type: "mcp"},
+		},
+		Tools: []ManifestTool{
+			{Name: "remote_a", Type: "mcp", ConnectorID: "mcp", RemoteTool: "toolA", Parameters: params},
+			{Name: "remote_b", Type: "mcp", ConnectorID: "mcp", RemoteTool: "toolB", Parameters: params},
+		},
+	}
+	writeManifestForTest(t, packDir, manifest)
+
+	rt := &fakeConnectorRuntime{id: "mcp", typ: "mcp"}
+	prevMCP := newMCPRuntimeFn
+	newMCPRuntimeFn = func(id string, cfg connectors.MCPConfig) (connectors.Runtime, error) {
+		return rt, nil
+	}
+	defer func() {
+		newMCPRuntimeFn = prevMCP
+	}()
+
+	mgr := NewManager(workspace, false)
+	loaded, err := mgr.LoadEnabledTools()
+	if err != nil {
+		t.Fatalf("LoadEnabledTools failed: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected two loaded connector tools, got %d", len(loaded))
+	}
+
+	for _, tool := range loaded {
+		closer, ok := tool.(interface{ Close() error })
+		if !ok {
+			t.Fatalf("expected loaded tool %q to be closable", tool.Name())
+		}
+		if err := closer.Close(); err != nil {
+			t.Fatalf("close %q failed: %v", tool.Name(), err)
+		}
+	}
+
+	if rt.CloseCount() != 1 {
+		t.Fatalf("expected shared connector runtime to be closed once, got %d", rt.CloseCount())
+	}
+}
+
+func writeManifestForTest(t *testing.T, packDir string, manifest Manifest) {
+	t.Helper()
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "toolpack.json"), raw, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
 	}
 }
