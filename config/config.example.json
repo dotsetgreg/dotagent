@@ -1,48 +1,107 @@
 {
   "agents": {
     "defaults": {
-      "workspace": "~/.dotagent/workspace",
-      "restrict_to_workspace": true,
-      "provider": "openrouter",
+      "max_concurrent_runs": 4,
+      "max_tokens": 16384,
+      "max_tool_iterations": 50,
       "model": "openai/gpt-5.2",
-      "max_tokens": 8192,
+      "provider": "openrouter",
+      "restrict_to_workspace": true,
+      "session_file_lock_enabled": true,
+      "session_lock_max_hold_seconds": 420,
+      "session_lock_stale_seconds": 1800,
+      "session_lock_timeout_ms": 15000,
       "temperature": 0.7,
-      "max_tool_iterations": 20
+      "workspace": "~/.dotagent/workspace"
     }
   },
   "channels": {
     "discord": {
-      "token": "YOUR_DISCORD_BOT_TOKEN",
-      "allow_from": []
+      "allow_from": [],
+      "token": ""
     }
   },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790
+  },
+  "heartbeat": {
+    "enabled": true,
+    "interval": 30
+  },
+  "memory": {
+    "audit_retention_days": 365,
+    "candidate_limit": 80,
+    "compaction_chunk_chars": 9000,
+    "compaction_max_transcript_chars": 48000,
+    "compaction_partial_skip_chars": 2600,
+    "compaction_summary_timeout_seconds": 60,
+    "context_pruning_keep_last_tool_results": 5,
+    "context_pruning_mode": "off",
+    "embedding_batch_size": 96,
+    "embedding_concurrency": 2,
+    "embedding_fallback_models": [
+      "dotagent-chargram-384-v1",
+      "dotagent-hash-256-v1"
+    ],
+    "embedding_model": "dotagent-chargram-384-v1",
+    "embedding_ollama_api_base": "http://127.0.0.1:11434",
+    "event_retention_days": 90,
+    "file_memory_dir": "",
+    "file_memory_enabled": true,
+    "file_memory_max_file_bytes": 262144,
+    "file_memory_poll_seconds": 15,
+    "file_memory_watch_debounce_ms": 1200,
+    "file_memory_watch_enabled": true,
+    "max_recall_items": 8,
+    "persona_file_sync_mode": "export_only",
+    "persona_min_confidence": 0.52,
+    "persona_policy_mode": "balanced",
+    "persona_sync_apply": true,
+    "retrieval_cache_seconds": 20,
+    "tool_loop_detection_enabled": true,
+    "tool_loop_drift_critical_threshold": 8,
+    "tool_loop_drift_warn_threshold": 6,
+    "tool_loop_global_circuit_threshold": 12,
+    "tool_loop_no_progress_critical_threshold": 6,
+    "tool_loop_no_progress_warn_threshold": 4,
+    "tool_loop_ping_pong_critical_threshold": 6,
+    "tool_loop_ping_pong_warn_threshold": 4,
+    "tool_loop_polling_critical_threshold": 5,
+    "tool_loop_polling_warn_threshold": 4,
+    "tool_loop_signature_critical_threshold": 3,
+    "tool_loop_signature_warn_threshold": 2,
+    "tool_loop_warnings_enabled": true,
+    "worker_lease_seconds": 60,
+    "worker_poll_ms": 700
+  },
   "providers": {
-    "openrouter": {
-      "api_key": "sk-or-v1-xxx",
-      "api_base": "https://openrouter.ai/api/v1",
-      "proxy": ""
-    },
     "openai": {
+      "api_base": "https://api.openai.com/v1",
       "api_key": "",
       "oauth_access_token": "",
       "oauth_token_file": "",
-      "api_base": "https://api.openai.com/v1",
-      "proxy": "",
       "organization": "",
-      "project": ""
+      "project": "",
+      "proxy": ""
     },
     "openai_codex": {
-      "oauth_access_token": "",
-      "oauth_token_file": "~/.codex/auth.json",
       "api_base": "https://chatgpt.com/backend-api",
+      "oauth_access_token": "",
+      "oauth_token_file": "",
+      "proxy": ""
+    },
+    "openrouter": {
+      "api_base": "https://openrouter.ai/api/v1",
+      "api_key": "",
       "proxy": ""
     }
   },
   "tools": {
     "web": {
       "brave": {
-        "enabled": false,
         "api_key": "",
+        "enabled": false,
         "max_results": 5
       },
       "duckduckgo": {
@@ -50,27 +109,5 @@
         "max_results": 5
       }
     }
-  },
-  "memory": {
-    "max_recall_items": 8,
-    "candidate_limit": 80,
-    "retrieval_cache_seconds": 20,
-    "worker_poll_ms": 700,
-    "worker_lease_seconds": 60,
-    "embedding_model": "dotagent-chargram-384-v1",
-    "event_retention_days": 90,
-    "audit_retention_days": 365,
-    "persona_sync_apply": true,
-    "persona_file_sync_mode": "export_only",
-    "persona_policy_mode": "balanced",
-    "persona_min_confidence": 0.52
-  },
-  "heartbeat": {
-    "enabled": true,
-    "interval": 30
-  },
-  "gateway": {
-    "host": "0.0.0.0",
-    "port": 18790
   }
 }

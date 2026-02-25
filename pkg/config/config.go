@@ -210,9 +210,15 @@ func DefaultConfig() *Config {
 			},
 		},
 		Providers: ProvidersConfig{
-			OpenRouter:  OpenRouterProviderConfig{},
-			OpenAI:      OpenAIProviderConfig{},
-			OpenAICodex: OpenAICodexProviderConfig{},
+			OpenRouter: OpenRouterProviderConfig{
+				APIBase: "https://openrouter.ai/api/v1",
+			},
+			OpenAI: OpenAIProviderConfig{
+				APIBase: "https://api.openai.com/v1",
+			},
+			OpenAICodex: OpenAICodexProviderConfig{
+				APIBase: "https://chatgpt.com/backend-api",
+			},
 		},
 		Gateway: GatewayConfig{
 			Host: "0.0.0.0",
