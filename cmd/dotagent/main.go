@@ -146,6 +146,7 @@ func onboard() {
 	fmt.Println("       providers.openai.api_key OR providers.openai.oauth_access_token OR providers.openai.oauth_token_file")
 	fmt.Println("     - OpenAI Codex OAuth: set agents.defaults.provider=openai-codex and configure exactly one auth source:")
 	fmt.Println("       providers.openai_codex.oauth_access_token OR providers.openai_codex.oauth_token_file")
+	fmt.Println("     - Ollama (local): set agents.defaults.provider=ollama, agents.defaults.model=<local-model>, providers.ollama.api_base=http://127.0.0.1:11434/v1")
 	fmt.Println("  2. (Gateway mode) Add your Discord bot token to channels.discord.token")
 	fmt.Println("  3. Chat locally: dotagent agent -m \"Hello!\"")
 	fmt.Println("  4. Run gateway: dotagent gateway")

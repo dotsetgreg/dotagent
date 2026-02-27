@@ -13,6 +13,7 @@ import (
 const (
 	authModeAPIKey      = "api_key"
 	authModeBearerToken = "bearer_token"
+	authModeNone        = "none"
 )
 
 // TokenSource returns bearer material for request auth.
@@ -116,6 +117,20 @@ func (a *bearerTokenAuth) Mode() string {
 
 func (a *bearerTokenAuth) Apply(ctx context.Context, req *http.Request) error {
 	return applyBearerAuth(ctx, req, a.source)
+}
+
+type noAuth struct{}
+
+func NewNoAuth() AuthStrategy {
+	return noAuth{}
+}
+
+func (noAuth) Mode() string {
+	return authModeNone
+}
+
+func (noAuth) Apply(context.Context, *http.Request) error {
+	return nil
 }
 
 func applyBearerAuth(ctx context.Context, req *http.Request, source TokenSource) error {

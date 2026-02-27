@@ -2,7 +2,7 @@
 
 DotAgent is a Go-based personal agent runtime with:
 - Messaging: Discord
-- LLM providers: OpenRouter, OpenAI API, OpenAI Codex OAuth
+- LLM providers: OpenRouter, OpenAI API, OpenAI Codex OAuth, Ollama local models
 - Memory: unified SQLite store (`data/state/memory.db`)
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 - Context continuity: strict fail-closed checks when durable context is unavailable
@@ -15,7 +15,8 @@ DotAgent is a Go-based personal agent runtime with:
 - Provider credentials:
   - OpenRouter API key, or
   - OpenAI API key / bearer token, or
-  - OpenAI Codex OAuth token (for `openai-codex`)
+  - OpenAI Codex OAuth token (for `openai-codex`), or
+  - Ollama local runtime (no auth required by default)
 - Discord bot token (for `gateway` mode)
 
 ## Install
@@ -41,7 +42,7 @@ This creates:
 - `~/.dotagent/instances/default/logs/`
 - `~/.dotagent/instances/default/runtime/`
 
-Set minimum credentials:
+Set minimum credentials (OpenRouter example):
 
 ```bash
 dotagent config set providers.openrouter.api_key '"<OPENROUTER_KEY>"'
@@ -78,7 +79,7 @@ dotagent gateway --dev
 
 ## Config Notes
 
-- Supported providers: `openrouter`, `openai`, and `openai-codex` (`agents.defaults.provider`)
+- Supported providers: `openrouter`, `openai`, `openai-codex`, and `ollama` (`agents.defaults.provider`)
 - OpenAI (`openai`) auth modes: API key, direct bearer token, or bearer token file (for externally refreshed OAuth tokens)
   - Set exactly one auth source: `providers.openai.api_key`, `providers.openai.oauth_access_token`, or `providers.openai.oauth_token_file`.
   - `providers.openai.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
@@ -87,6 +88,10 @@ dotagent gateway --dev
   - `providers.openai_codex.oauth_token_file` accepts either a plain token file or Codex/OpenAI auth JSON (extracts `tokens.access_token`).
   - Default `providers.openai_codex.api_base` is `https://chatgpt.com/backend-api` (DotAgent resolves the request endpoint to `/codex/responses`).
   - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
+- Ollama (`ollama`) auth mode: none by default (optional API key)
+  - Set `agents.defaults.provider=ollama` and choose a local model (for example `llama3.2`).
+  - Default `providers.ollama.api_base` is `http://127.0.0.1:11434/v1`.
+  - Optional: `providers.ollama.api_key` when your Ollama deployment requires auth.
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2` (OpenRouter default)
 - Canonical memory DB: `~/.dotagent/instances/default/data/state/memory.db`
@@ -152,6 +157,10 @@ DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE=~/.codex/auth.json
 DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE=https://chatgpt.com/backend-api
 DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY=
 
+DOTAGENT_PROVIDERS_OLLAMA_API_BASE=http://127.0.0.1:11434/v1
+DOTAGENT_PROVIDERS_OLLAMA_API_KEY=
+DOTAGENT_PROVIDERS_OLLAMA_PROXY=
+
 DOTAGENT_AGENTS_DEFAULTS_PROVIDER=openrouter
 DOTAGENT_AGENTS_DEFAULTS_MODEL=openai/gpt-5.2
 
@@ -187,6 +196,19 @@ OpenAI Codex OAuth in Docker:
     "openai_codex": {
       "oauth_token_file": "/root/.codex/auth.json",
       "api_base": "https://chatgpt.com/backend-api"
+    }
+  }
+}
+```
+
+Ollama on host + DotAgent in Docker:
+
+```json
+{
+  "agents": { "defaults": { "provider": "ollama", "model": "llama3.2" } },
+  "providers": {
+    "ollama": {
+      "api_base": "http://host.docker.internal:11434/v1"
     }
   }
 }

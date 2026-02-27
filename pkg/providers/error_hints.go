@@ -42,6 +42,18 @@ func augmentProviderError(providerName, message string) string {
 			strings.Contains(lower, "missing chatgpt_account_id") {
 			return msg + " Hint: providers.openai_codex requires a ChatGPT/Codex OAuth access token that contains chatgpt_account_id (Codex CLI auth.json tokens do)."
 		}
+	case ProviderOllama:
+		if strings.Contains(lower, "model") && strings.Contains(lower, "not found") {
+			return msg + " Hint: the requested Ollama model is not available locally. Run `ollama pull <model>` and retry."
+		}
+		if strings.Contains(lower, "connection refused") ||
+			strings.Contains(lower, "connect: cannot assign requested address") ||
+			strings.Contains(lower, "no such host") {
+			return msg + " Hint: DotAgent could not reach the local Ollama daemon. Verify Ollama is running and check providers.ollama.api_base."
+		}
+		if detectContextOverflowFromMessage(lower) {
+			return msg + " Hint: request exceeded model context. Reduce agents.defaults.max_tokens or use a model with a larger context window."
+		}
 	}
 
 	return msg

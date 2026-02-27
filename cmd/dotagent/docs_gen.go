@@ -549,6 +549,14 @@ func buildProvidersReferenceMarkdown() (string, error) {
 			DefaultBase: defaults["providers.openai_codex.api_base"],
 			StructType:  providerStructs["openai_codex"],
 		},
+		{
+			Name:        "ollama",
+			ConfigKey:   "providers.ollama",
+			Summary:     "Ollama local-model provider via OpenAI-compatible chat completions.",
+			AuthModel:   "No auth required by default; optional `api_key` supported.",
+			DefaultBase: defaults["providers.ollama.api_base"],
+			StructType:  providerStructs["ollama"],
+		},
 	}
 
 	supported := providers.SupportedProviders()

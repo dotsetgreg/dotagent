@@ -9,6 +9,15 @@ dotagent config set providers.openrouter.api_key '"YOUR_OPENROUTER_KEY"'
 dotagent config set channels.discord.token '"YOUR_DISCORD_BOT_TOKEN"'
 ```
 
+Or use local Ollama:
+
+```bash
+dotagent config set agents.defaults.provider '"ollama"'
+dotagent config set agents.defaults.model '"llama3.2"'
+dotagent config set providers.ollama.api_base '"http://127.0.0.1:11434/v1"'
+dotagent config set channels.discord.token '"YOUR_DISCORD_BOT_TOKEN"'
+```
+
 Or edit:
 
 `~/.dotagent/instances/default/config/config.json`

@@ -27,3 +27,9 @@ Gateway exposes:
 Default bind:
 - `gateway.host`: `0.0.0.0`
 - `gateway.port`: `18790`
+
+## Ollama on Host
+
+If DotAgent runs in Docker but Ollama runs on the host, set:
+
+- `providers.ollama.api_base`: `http://host.docker.internal:11434/v1`

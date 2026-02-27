@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -68,6 +69,103 @@ func TestCreateProvider_OpenRouter_DefaultSelection(t *testing.T) {
 	}
 	if seenPath != "/chat/completions" {
 		t.Fatalf("expected /chat/completions path, got %q", seenPath)
+	}
+}
+
+func TestCreateProvider_Ollama_NoAuth_DefaultBaseNormalization(t *testing.T) {
+	var seenAuth string
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenPath = r.URL.Path
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got := req["model"]; got != defaultOllamaModel {
+			t.Fatalf("expected default model %q, got %v", defaultOllamaModel, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOllama
+	cfg.Providers.Ollama.APIBase = server.URL
+	cfg.Providers.Ollama.APIKey = ""
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	resp, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("expected response content ok, got %q", resp.Content)
+	}
+	if seenAuth != "" {
+		t.Fatalf("expected no auth header for ollama without api key, got %q", seenAuth)
+	}
+	if seenPath != "/v1/chat/completions" {
+		t.Fatalf("expected /v1/chat/completions path, got %q", seenPath)
+	}
+
+	providerName, configured, mode, err := ProviderCredentialStatus(cfg)
+	if err != nil {
+		t.Fatalf("provider credential status: %v", err)
+	}
+	if providerName != ProviderOllama {
+		t.Fatalf("expected provider %q, got %q", ProviderOllama, providerName)
+	}
+	if !configured {
+		t.Fatalf("expected ollama credentials to be considered configured")
+	}
+	if mode != authModeNone {
+		t.Fatalf("expected ollama mode %q, got %q", authModeNone, mode)
+	}
+}
+
+func TestCreateProvider_Ollama_WithAPIKey(t *testing.T) {
+	var seenAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOllama
+	cfg.Providers.Ollama.APIBase = server.URL + "/v1"
+	cfg.Providers.Ollama.APIKey = "ollama-key"
+
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if _, err := provider.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, nil, "", nil); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if seenAuth != "Bearer ollama-key" {
+		t.Fatalf("expected bearer auth for ollama api key, got %q", seenAuth)
+	}
+
+	providerName, configured, mode, err := ProviderCredentialStatus(cfg)
+	if err != nil {
+		t.Fatalf("provider credential status: %v", err)
+	}
+	if providerName != ProviderOllama || !configured || mode != authModeAPIKey {
+		t.Fatalf("unexpected provider status: provider=%q configured=%v mode=%q", providerName, configured, mode)
+	}
+}
+
+func TestSupportedProviders_IncludesOllama(t *testing.T) {
+	supported := SupportedProviders()
+	if !slices.Contains(supported, ProviderOllama) {
+		t.Fatalf("expected supported providers to include %q, got %v", ProviderOllama, supported)
 	}
 }
 
@@ -248,8 +346,12 @@ func TestCreateProvider_UnsupportedProvider(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.Provider = "does-not-exist"
 
-	if _, err := CreateProvider(cfg); err == nil {
+	_, err := CreateProvider(cfg)
+	if err == nil {
 		t.Fatalf("expected unsupported provider error")
+	}
+	if !strings.Contains(err.Error(), ProviderOllama) {
+		t.Fatalf("expected unsupported provider error to include %q in supported providers, got %v", ProviderOllama, err)
 	}
 }
 

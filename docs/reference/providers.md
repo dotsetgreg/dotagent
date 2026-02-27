@@ -4,6 +4,7 @@ Generated from provider factories and config structs.
 
 ## Supported Providers
 
+- `ollama`
 - `openai`
 - `openai-codex`
 - `openrouter`
@@ -54,3 +55,17 @@ ChatGPT/Codex OAuth provider for Codex backend routing.
 | `providers.openai_codex.oauth_access_token` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_ACCESS_TOKEN` | `-` |
 | `providers.openai_codex.oauth_token_file` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE` | `-` |
 | `providers.openai_codex.proxy` | `string` | `DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY` | `-` |
+
+## `ollama`
+
+Ollama local-model provider via OpenAI-compatible chat completions.
+
+- Config path: `providers.ollama`
+- Auth: No auth required by default; optional `api_key` supported.
+- Default API base: `"http://127.0.0.1:11434/v1"`
+
+| Key | Type | Env Var | Default |
+| --- | --- | --- | --- |
+| `providers.ollama.api_base` | `string` | `DOTAGENT_PROVIDERS_OLLAMA_API_BASE` | `"http://127.0.0.1:11434/v1"` |
+| `providers.ollama.api_key` | `string` | `DOTAGENT_PROVIDERS_OLLAMA_API_KEY` | `-` |
+| `providers.ollama.proxy` | `string` | `DOTAGENT_PROVIDERS_OLLAMA_PROXY` | `-` |

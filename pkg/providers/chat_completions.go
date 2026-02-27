@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -180,12 +181,6 @@ func (p *chatCompletionsProvider) ResolveContextWindow(ctx context.Context, mode
 			return n, nil
 		}
 	}
-	// OpenRouter exposes context lengths via /models; OpenAI chat-completions
-	// generally does not expose this in model metadata.
-	if p.providerName != ProviderOpenRouter {
-		return 0, fmt.Errorf("provider context metadata unavailable")
-	}
-
 	timeout := 4 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
 		if rem := time.Until(deadline); rem < timeout {
@@ -198,11 +193,34 @@ func (p *chatCompletionsProvider) ResolveContextWindow(ctx context.Context, mode
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, p.apiBase+"/models", nil)
+	target := strings.ToLower(strings.TrimSpace(model))
+
+	var best int
+	var err error
+	switch p.providerName {
+	case ProviderOpenRouter:
+		best, err = p.resolveOpenRouterContextWindow(reqCtx, model)
+	case ProviderOllama:
+		best, err = p.resolveOllamaContextWindow(reqCtx, model)
+	default:
+		return 0, fmt.Errorf("provider context metadata unavailable")
+	}
 	if err != nil {
 		return 0, err
 	}
-	if err := p.auth.Apply(reqCtx, req); err != nil {
+	if best <= 0 {
+		return 0, fmt.Errorf("context window metadata not found for model %s", model)
+	}
+	p.contextCache.Store(target, best)
+	return best, nil
+}
+
+func (p *chatCompletionsProvider) resolveOpenRouterContextWindow(ctx context.Context, model string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.apiBase+"/models", nil)
+	if err != nil {
+		return 0, err
+	}
+	if err := p.auth.Apply(ctx, req); err != nil {
 		return 0, err
 	}
 	for name, value := range p.extraHeaders {
@@ -247,8 +265,177 @@ func (p *chatCompletionsProvider) ResolveContextWindow(ctx context.Context, mode
 	if best <= 0 {
 		return 0, fmt.Errorf("context window metadata not found for model %s", model)
 	}
-	p.contextCache.Store(target, best)
 	return best, nil
+}
+
+func (p *chatCompletionsProvider) resolveOllamaContextWindow(ctx context.Context, model string) (int, error) {
+	nativeBase := ollamaNativeBaseFromAPIBase(p.apiBase)
+	if nativeBase == "" {
+		return 0, fmt.Errorf("context window metadata unavailable for ollama")
+	}
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"model": strings.TrimSpace(model),
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nativeBase+"/api/show", bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if err := p.auth.Apply(ctx, req); err != nil {
+		return 0, err
+	}
+	for name, value := range p.extraHeaders {
+		req.Header.Set(name, value)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, NewHTTPError(p.providerName, resp.StatusCode, extractAPIError(body), ParseRetryAfterHeader(resp.Header.Get("Retry-After")))
+	}
+	return parseOllamaContextWindow(body)
+}
+
+func ollamaNativeBaseFromAPIBase(apiBase string) string {
+	parsed, err := url.Parse(strings.TrimSpace(apiBase))
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(path, "/v1") {
+		path = strings.TrimSuffix(path, "/v1")
+	}
+	if path == "" {
+		path = "/"
+	}
+	parsed.Path = path
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func parseOllamaContextWindow(body []byte) (int, error) {
+	var payload struct {
+		ModelInfo  map[string]interface{} `json:"model_info"`
+		Parameters string                 `json:"parameters"`
+		Error      string                 `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+	if msg := strings.TrimSpace(payload.Error); msg != "" {
+		return 0, fmt.Errorf("%s", msg)
+	}
+
+	best := 0
+	for key, raw := range payload.ModelInfo {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		if lower != "context_length" && !strings.HasSuffix(lower, ".context_length") {
+			continue
+		}
+		if n, ok := parsePositiveInt(raw); ok && n > best {
+			best = n
+		}
+	}
+	if best > 0 {
+		return best, nil
+	}
+
+	if n := parseOllamaNumCtx(payload.Parameters); n > 0 {
+		return n, nil
+	}
+	return 0, fmt.Errorf("context window metadata not found")
+}
+
+func parseOllamaNumCtx(parameters string) int {
+	lines := strings.Split(parameters, "\n")
+	for _, line := range lines {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if lower == "" {
+			continue
+		}
+		fields := strings.Fields(lower)
+		for i, token := range fields {
+			token = strings.TrimSpace(token)
+			if token == "num_ctx" && i+1 < len(fields) {
+				if n, ok := parsePositiveInt(fields[i+1]); ok {
+					return n
+				}
+			}
+			if token == "num_ctx:" && i+1 < len(fields) {
+				if n, ok := parsePositiveInt(fields[i+1]); ok {
+					return n
+				}
+			}
+			if token == "num_ctx=" && i+1 < len(fields) {
+				if n, ok := parsePositiveInt(fields[i+1]); ok {
+					return n
+				}
+			}
+			if strings.HasPrefix(token, "num_ctx=") {
+				if n, ok := parsePositiveInt(strings.TrimPrefix(token, "num_ctx=")); ok {
+					return n
+				}
+			}
+			if strings.HasPrefix(token, "num_ctx:") {
+				if n, ok := parsePositiveInt(strings.TrimPrefix(token, "num_ctx:")); ok {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func parsePositiveInt(raw interface{}) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return v, v > 0
+	case int32:
+		n := int(v)
+		return n, n > 0
+	case int64:
+		n := int(v)
+		return n, n > 0
+	case float64:
+		n := int(v)
+		return n, n > 0
+	case float32:
+		n := int(v)
+		return n, n > 0
+	case json.Number:
+		n64, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		n := int(n64)
+		return n, n > 0
+	case string:
+		value := strings.TrimSpace(strings.Trim(v, " ,;"))
+		if value == "" {
+			return 0, false
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, false
+		}
+		return n, n > 0
+	default:
+		return 0, false
+	}
 }
 
 func optionAsInt(opts map[string]interface{}, key string) (int, bool) {

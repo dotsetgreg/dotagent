@@ -5,7 +5,8 @@
 1. Confirm active provider + model in `dotagent doctor`.
 2. Verify credential source matches provider auth requirements.
 3. Check provider `api_base` for the selected provider.
-4. Restart runtime after config changes (`dotagent runtime restart`).
+4. For `ollama`, verify the daemon is running and `providers.ollama.api_base` is reachable.
+5. Restart runtime after config changes (`dotagent runtime restart`).
 
 ## Tool Access Problems
 

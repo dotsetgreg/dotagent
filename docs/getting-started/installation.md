@@ -5,7 +5,7 @@
 - Go 1.25+
 - Docker / Docker Compose (recommended for gateway mode)
 - A Discord bot token
-- Provider credentials (`openrouter`, `openai`, or `openai-codex`)
+- Provider setup (`openrouter`, `openai`, `openai-codex`, or local `ollama`)
 
 ## Build
 

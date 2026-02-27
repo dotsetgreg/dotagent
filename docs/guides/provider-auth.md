@@ -4,6 +4,7 @@ DotAgent supports:
 - `openrouter`
 - `openai`
 - `openai-codex`
+- `ollama`
 
 ## Selection
 
@@ -21,11 +22,14 @@ Set:
 - `openai-codex`: exactly one of:
   - `providers.openai_codex.oauth_access_token`
   - `providers.openai_codex.oauth_token_file`
+- `ollama`: no auth required by default; optional:
+  - `providers.ollama.api_key`
 
 ## Base URLs
 
 - OpenRouter: `https://openrouter.ai/api/v1`
 - OpenAI Platform: `https://api.openai.com/v1`
 - OpenAI Codex backend: `https://chatgpt.com/backend-api`
+- Ollama (OpenAI-compatible): `http://127.0.0.1:11434/v1`
 
 See full generated details in [Provider Reference](../reference/providers.md).

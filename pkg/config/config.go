@@ -45,19 +45,19 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	SchemaVersion int            `json:"schema_version"`
-	Instance      InstanceConfig `json:"instance"`
-	Paths         PathsConfig    `json:"paths"`
-	Runtime       RuntimeConfig  `json:"runtime"`
-	Admin         AdminConfig    `json:"admin"`
-	Agents    AgentsConfig    `json:"agents"`
-	Channels  ChannelsConfig  `json:"channels"`
-	Providers ProvidersConfig `json:"providers"`
-	Gateway   GatewayConfig   `json:"gateway"`
-	Tools     ToolsConfig     `json:"tools"`
-	Memory    MemoryConfig    `json:"memory"`
-	Heartbeat HeartbeatConfig `json:"heartbeat"`
-	mu        sync.RWMutex
+	SchemaVersion int             `json:"schema_version"`
+	Instance      InstanceConfig  `json:"instance"`
+	Paths         PathsConfig     `json:"paths"`
+	Runtime       RuntimeConfig   `json:"runtime"`
+	Admin         AdminConfig     `json:"admin"`
+	Agents        AgentsConfig    `json:"agents"`
+	Channels      ChannelsConfig  `json:"channels"`
+	Providers     ProvidersConfig `json:"providers"`
+	Gateway       GatewayConfig   `json:"gateway"`
+	Tools         ToolsConfig     `json:"tools"`
+	Memory        MemoryConfig    `json:"memory"`
+	Heartbeat     HeartbeatConfig `json:"heartbeat"`
+	mu            sync.RWMutex
 }
 
 type InstanceConfig struct {
@@ -123,6 +123,7 @@ type ProvidersConfig struct {
 	OpenRouter  OpenRouterProviderConfig  `json:"openrouter"`
 	OpenAI      OpenAIProviderConfig      `json:"openai"`
 	OpenAICodex OpenAICodexProviderConfig `json:"openai_codex"`
+	Ollama      OllamaProviderConfig      `json:"ollama"`
 }
 
 type OpenRouterProviderConfig struct {
@@ -146,6 +147,12 @@ type OpenAICodexProviderConfig struct {
 	OAuthTokenFile   string `json:"oauth_token_file,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_OAUTH_TOKEN_FILE"`
 	APIBase          string `json:"api_base" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_API_BASE"`
 	Proxy            string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OPENAI_CODEX_PROXY"`
+}
+
+type OllamaProviderConfig struct {
+	APIBase string `json:"api_base" env:"DOTAGENT_PROVIDERS_OLLAMA_API_BASE"`
+	APIKey  string `json:"api_key,omitempty" env:"DOTAGENT_PROVIDERS_OLLAMA_API_KEY"`
+	Proxy   string `json:"proxy,omitempty" env:"DOTAGENT_PROVIDERS_OLLAMA_PROXY"`
 }
 
 type GatewayConfig struct {
@@ -308,6 +315,9 @@ func DefaultConfigForInstance(instanceID string) *Config {
 			},
 			OpenAICodex: OpenAICodexProviderConfig{
 				APIBase: "https://chatgpt.com/backend-api",
+			},
+			Ollama: OllamaProviderConfig{
+				APIBase: "http://127.0.0.1:11434/v1",
 			},
 		},
 		Gateway: GatewayConfig{

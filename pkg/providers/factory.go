@@ -14,6 +14,7 @@ const (
 	ProviderOpenRouter  = "openrouter"
 	ProviderOpenAI      = "openai"
 	ProviderOpenAICodex = "openai-codex"
+	ProviderOllama      = "ollama"
 )
 
 type providerFactory struct {

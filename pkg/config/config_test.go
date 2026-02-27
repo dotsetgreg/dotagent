@@ -99,6 +99,12 @@ func TestDefaultConfig_Providers(t *testing.T) {
 	if cfg.Providers.OpenAICodex.OAuthTokenFile != "" {
 		t.Error("OpenAI Codex OAuth token file should be empty by default")
 	}
+	if cfg.Providers.Ollama.APIBase != "http://127.0.0.1:11434/v1" {
+		t.Errorf("Ollama API base = %q, want %q", cfg.Providers.Ollama.APIBase, "http://127.0.0.1:11434/v1")
+	}
+	if cfg.Providers.Ollama.APIKey != "" {
+		t.Error("Ollama API key should be empty by default")
+	}
 }
 
 // TestDefaultConfig_Channels verifies Discord config defaults
@@ -232,10 +238,37 @@ func TestLoadConfig_OpenAICodexEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_OllamaEnvOverrides(t *testing.T) {
+	t.Setenv("DOTAGENT_AGENTS_DEFAULTS_PROVIDER", "ollama")
+	t.Setenv("DOTAGENT_PROVIDERS_OLLAMA_API_BASE", "http://localhost:11434")
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if got := cfg.Agents.Defaults.Provider; got != "ollama" {
+		t.Fatalf("expected provider ollama, got %q", got)
+	}
+	if got := cfg.Providers.Ollama.APIBase; got != "http://localhost:11434" {
+		t.Fatalf("expected ollama api base from env, got %q", got)
+	}
+}
+
 func TestConfigValidate_DefaultConfigPasses(t *testing.T) {
 	cfg := DefaultConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should be valid, got: %v", err)
+	}
+}
+
+func TestConfigValidate_OllamaProviderWithoutCredentialsPasses(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Agents.Defaults.Provider = "ollama"
+	cfg.Agents.Defaults.Model = "llama3.2"
+	cfg.Providers.OpenRouter.APIKey = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("ollama config should be valid without provider credentials, got: %v", err)
 	}
 }
 

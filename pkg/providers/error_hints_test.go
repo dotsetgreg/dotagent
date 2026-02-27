@@ -53,3 +53,24 @@ func TestAugmentProviderError_OpenAICodexPreviousResponseIDHint(t *testing.T) {
 		t.Fatalf("expected previous_response_id hint, got %q", msg)
 	}
 }
+
+func TestAugmentProviderError_OllamaModelNotFoundHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOllama, "model 'llama3.2' not found")
+	if !strings.Contains(strings.ToLower(msg), "ollama pull") {
+		t.Fatalf("expected ollama pull hint, got %q", msg)
+	}
+}
+
+func TestAugmentProviderError_OllamaConnectionHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOllama, "dial tcp 127.0.0.1:11434: connect: connection refused")
+	if !strings.Contains(strings.ToLower(msg), "providers.ollama.api_base") {
+		t.Fatalf("expected ollama api base hint, got %q", msg)
+	}
+}
+
+func TestAugmentProviderError_OllamaContextOverflowHint(t *testing.T) {
+	msg := augmentProviderError(ProviderOllama, "context length exceeded")
+	if !strings.Contains(strings.ToLower(msg), "agents.defaults.max_tokens") {
+		t.Fatalf("expected max_tokens hint, got %q", msg)
+	}
+}
