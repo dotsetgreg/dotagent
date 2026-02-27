@@ -2,10 +2,12 @@
 
 ## Preserve Memory and Workspace
 
-Persist `~/.dotagent/workspace` as a volume.
+Persist the instance root volume:
+
+`~/.dotagent/instances/<id>/`
 
 Critical path:
-- `workspace/state/memory.db`
+- `data/state/memory.db`
 
 Do not remove that volume during upgrades.
 
@@ -13,8 +15,8 @@ Do not remove that volume during upgrades.
 
 1. Pull latest code on host.
 2. Rebuild image/container.
-3. Restart container with same mounted workspace volume.
-4. Validate with `dotagent status`.
+3. Restart runtime with same mounted instance volume.
+4. Validate with `dotagent runtime status --check`.
 
 ## Health Checks
 

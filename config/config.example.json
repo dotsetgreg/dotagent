@@ -1,4 +1,33 @@
 {
+  "schema_version": 2,
+  "instance": {
+    "id": "default"
+  },
+  "paths": {
+    "workspace": "~/.dotagent/instances/default/workspace",
+    "data": "~/.dotagent/instances/default/data",
+    "logs": "~/.dotagent/instances/default/logs",
+    "runtime": "~/.dotagent/instances/default/runtime"
+  },
+  "runtime": {
+    "mode": "docker",
+    "image": "ghcr.io/dotsetgreg/dotagent:latest"
+  },
+  "admin": {
+    "config_apply": {
+      "enabled": true,
+      "require_approval": true,
+      "mutable_keys": [
+        "agents.defaults.model",
+        "agents.defaults.provider",
+        "agents.defaults.temperature",
+        "channels.discord.token",
+        "channels.discord.allow_from",
+        "gateway.host",
+        "gateway.port"
+      ]
+    }
+  },
   "agents": {
     "defaults": {
       "max_concurrent_runs": 4,
@@ -12,7 +41,7 @@
       "session_lock_stale_seconds": 1800,
       "session_lock_timeout_ms": 15000,
       "temperature": 0.7,
-      "workspace": "~/.dotagent/workspace"
+      "workspace": "~/.dotagent/instances/default/workspace"
     }
   },
   "channels": {

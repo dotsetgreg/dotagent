@@ -14,9 +14,15 @@ Install, inspect, validate, and doctor executable toolpacks that extend agent ca
   -h, --help   help for toolpacks
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
-* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing
+* [dotagent](dotagent.md)   - Instance-based AI agent runtime with Docker-first operations
 * [dotagent toolpacks disable](dotagent_toolpacks_disable.md)   - Disable a toolpack
 * [dotagent toolpacks doctor](dotagent_toolpacks_doctor.md)   - Run connector health checks
 * [dotagent toolpacks enable](dotagent_toolpacks_enable.md)   - Enable a toolpack

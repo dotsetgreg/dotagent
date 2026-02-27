@@ -727,6 +727,67 @@ func TestManager_LoadEnabledTools_ClosesUnusedConnectorRuntime(t *testing.T) {
 	}
 }
 
+func TestManager_LoadEnabledTools_RestrictedMCPWorkingDirOutsideWorkspaceSkipped(t *testing.T) {
+	workspace := t.TempDir()
+	packDir := filepath.Join(workspace, "toolpacks", "restricted-mcp-pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	manifest := Manifest{
+		ID:      "restricted-mcp-pack",
+		Name:    "Restricted MCP Pack",
+		Version: "1.0.0",
+		Enabled: true,
+		Connectors: []ManifestConnector{
+			{
+				ID:   "mcp",
+				Type: "mcp",
+				MCP: connectors.MCPConfig{
+					Command:    "echo",
+					WorkingDir: "/tmp",
+				},
+			},
+		},
+		Tools: []ManifestTool{
+			{
+				Name:        "remote_echo",
+				Type:        "mcp",
+				ConnectorID: "mcp",
+				RemoteTool:  "echo",
+				Parameters: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+	}
+	writeManifestForTest(t, packDir, manifest)
+
+	runtimeInitCount := 0
+	prevMCP := newMCPRuntimeFn
+	newMCPRuntimeFn = func(id string, cfg connectors.MCPConfig) (connectors.Runtime, error) {
+		runtimeInitCount++
+		return &fakeConnectorRuntime{id: id, typ: "mcp"}, nil
+	}
+	defer func() { newMCPRuntimeFn = prevMCP }()
+
+	mgr := NewManager(workspace, true)
+	loaded, err := mgr.LoadEnabledTools()
+	if err == nil {
+		t.Fatalf("expected warning error for out-of-workspace mcp working_dir")
+	}
+	if !strings.Contains(err.Error(), "outside workspace") {
+		t.Fatalf("expected outside workspace warning, got %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("expected no loaded tools, got %d", len(loaded))
+	}
+	if runtimeInitCount != 0 {
+		t.Fatalf("expected runtime init to be skipped, got %d", runtimeInitCount)
+	}
+}
+
 func TestManager_LoadEnabledTools_SharedConnectorRuntimeClosedOnce(t *testing.T) {
 	workspace := t.TempDir()
 	packDir := filepath.Join(workspace, "toolpacks", "shared-connector-pack")

@@ -274,12 +274,19 @@ func (m *Manager) LoadEnabledTools() ([]tools.Tool, error) {
 					warnings = append(warnings, fmt.Sprintf("%s: tool %q collides with %s; skipping", manifest.ID, toolName, owner))
 					continue
 				}
+				workingDir := resolvePackWorkingDir(packDir, mt.WorkingDir)
+				if m.restrict {
+					if !withinWorkspacePath(workingDir, m.workspace) {
+						warnings = append(warnings, fmt.Sprintf("%s: tool %q working_dir %q is outside workspace; skipping", manifest.ID, toolName, workingDir))
+						continue
+					}
+				}
 				registered = append(registered, tools.NewTemplateCommandTool(tools.TemplateCommandConfig{
 					Name:            toolName,
 					Description:     nonEmpty(mt.Description, fmt.Sprintf("ToolPack %s command tool", manifest.ID)),
 					Parameters:      defaultParameters(mt.Parameters),
 					CommandTemplate: mt.CommandTemplate,
-					WorkingDir:      resolvePackWorkingDir(packDir, mt.WorkingDir),
+					WorkingDir:      workingDir,
 					TimeoutSeconds:  mt.TimeoutSeconds,
 					Workspace:       m.workspace,
 					Restrict:        m.restrict,
@@ -373,6 +380,25 @@ func resolvePackWorkingDir(packDir, wd string) string {
 	return filepath.Join(packDir, wd)
 }
 
+func withinWorkspacePath(candidate, workspace string) bool {
+	candidateAbs, err := filepath.Abs(filepath.Clean(candidate))
+	if err != nil {
+		return false
+	}
+	workspaceAbs, err := filepath.Abs(filepath.Clean(workspace))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(workspaceAbs, candidateAbs)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
+}
+
 func (m *Manager) buildConnectorRuntimes(packDir string, manifest Manifest) (map[string]connectors.Runtime, []string) {
 	runtimes := map[string]connectors.Runtime{}
 	warnings := []string{}
@@ -386,6 +412,10 @@ func (m *Manager) buildConnectorRuntimes(packDir string, manifest Manifest) (map
 			cfg := conn.MCP
 			if strings.TrimSpace(cfg.WorkingDir) != "" {
 				cfg.WorkingDir = resolvePackWorkingDir(packDir, cfg.WorkingDir)
+				if m.restrict && !withinWorkspacePath(cfg.WorkingDir, m.workspace) {
+					warnings = append(warnings, fmt.Sprintf("%s: mcp connector %q working_dir %q is outside workspace; skipping", manifest.ID, connID, cfg.WorkingDir))
+					continue
+				}
 			}
 			rt, err := newMCPRuntimeFn(connID, cfg)
 			if err != nil {

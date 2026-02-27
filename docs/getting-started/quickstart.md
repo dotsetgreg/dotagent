@@ -2,7 +2,16 @@
 
 ## 1. Configure Provider and Discord
 
-Edit `~/.dotagent/config.json`.
+Run:
+
+```bash
+dotagent config set providers.openrouter.api_key '"YOUR_OPENROUTER_KEY"'
+dotagent config set channels.discord.token '"YOUR_DISCORD_BOT_TOKEN"'
+```
+
+Or edit:
+
+`~/.dotagent/instances/default/config/config.json`
 
 Minimum defaults:
 
@@ -25,7 +34,7 @@ Minimum defaults:
 ## 2. Run Gateway
 
 ```bash
-dotagent gateway
+dotagent runtime up
 ```
 
 ## 3. Verify Commands

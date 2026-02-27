@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -124,7 +125,8 @@ func onboard() {
 		}
 	}
 
-	cfg := config.DefaultConfig()
+	instanceID := resolveInstanceID(os.Getenv("DOTAGENT_INSTANCE"))
+	cfg := config.DefaultConfigForInstance(instanceID)
 	if err := config.SaveConfig(configPath, cfg); err != nil {
 		fmt.Printf("Error saving config: %v\n", err)
 		os.Exit(1)
@@ -378,7 +380,21 @@ func gatewayCmd() {
 		}
 	}
 
+	instanceID := resolveInstanceID(os.Getenv("DOTAGENT_INSTANCE"))
+	configPath := getConfigPath()
+
 	cfg, err := loadConfig()
+	if err != nil {
+		recovered, recoverErr := maybeRollbackPendingConfigOnLoadFailure(instanceID, configPath, err)
+		if recoverErr != nil {
+			fmt.Printf("Error loading config: %v\n", err)
+			fmt.Printf("Error rolling back pending config apply: %v\n", recoverErr)
+			os.Exit(1)
+		}
+		if recovered {
+			cfg, err = loadConfig()
+		}
+	}
 	if err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
@@ -420,7 +436,7 @@ func gatewayCmd() {
 		})
 
 	// Setup cron tool and service
-	cronService, err := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
+	cronService, err := setupCronTool(agentLoop, msgBus, cfg.DataPath(), cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
 	if err != nil {
 		fmt.Printf("Failed to setup cron tool: %v\n", err)
 		os.Exit(1)
@@ -428,6 +444,8 @@ func gatewayCmd() {
 
 	heartbeatService := heartbeat.NewHeartbeatService(
 		cfg.WorkspacePath(),
+		cfg.DataPath(),
+		cfg.LogsPath(),
 		cfg.Heartbeat.Interval,
 		cfg.Heartbeat.Enabled,
 	)
@@ -488,6 +506,22 @@ func gatewayCmd() {
 	}
 
 	healthServer := health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
+	refreshHealthChecks := func() {
+		registerGatewayHealthChecks(healthServer, cfg, cronService, heartbeatService, channelManager)
+	}
+	refreshHealthChecks()
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refreshHealthChecks()
+			}
+		}
+	}()
 	go func() {
 		if err := healthServer.Start(); err != nil && err != http.ErrServerClosed {
 			logger.ErrorCF("health", "Health server error", map[string]interface{}{"error": err.Error()})
@@ -495,10 +529,21 @@ func gatewayCmd() {
 	}()
 	fmt.Printf("✓ Health endpoints available at http://%s:%d/health and /ready\n", cfg.Gateway.Host, cfg.Gateway.Port)
 
+	if err := finalizePendingConfigApply(instanceID, configPath); err != nil {
+		fmt.Printf("Pending config apply validation failed: %v\n", err)
+		cancel()
+		healthServer.Stop(context.Background())
+		heartbeatService.Stop()
+		cronService.Stop()
+		agentLoop.Stop()
+		channelManager.StopAll(ctx)
+		os.Exit(1)
+	}
+
 	go agentLoop.Run(ctx)
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
 	fmt.Println("\nShutting down...")
@@ -509,6 +554,180 @@ func gatewayCmd() {
 	agentLoop.Stop()
 	channelManager.StopAll(ctx)
 	fmt.Println("✓ Gateway stopped")
+}
+
+func maybeRollbackPendingConfigOnLoadFailure(instanceID, configPath string, loadErr error) (bool, error) {
+	pendingPath := configRestartPendingPath(instanceID)
+	pending, err := tools.LoadConfigRestartPending(pendingPath)
+	if err != nil {
+		return false, err
+	}
+	if pending == nil {
+		return false, nil
+	}
+	if err := tools.RollbackConfigFromBackup(configPath, pending.BackupPath); err != nil {
+		return false, err
+	}
+	_, auditPath := configAdminPaths(instanceID)
+	now := time.Now().UnixMilli()
+	_ = tools.AppendConfigAuditLog(auditPath, map[string]any{
+		"timestamp":   now,
+		"action":      "post_restart_rollback",
+		"request_id":  pending.RequestID,
+		"key":         pending.Key,
+		"backup_path": pending.BackupPath,
+		"reason":      fmt.Sprintf("config load failed: %v", loadErr),
+	})
+	_ = tools.RemoveConfigRestartPending(pendingPath)
+	return true, nil
+}
+
+func finalizePendingConfigApply(instanceID, configPath string) error {
+	pendingPath := configRestartPendingPath(instanceID)
+	pending, err := tools.LoadConfigRestartPending(pendingPath)
+	if err != nil {
+		return err
+	}
+	if pending == nil {
+		return nil
+	}
+
+	_, auditPath := configAdminPaths(instanceID)
+	checkTimeout := 10 * time.Second
+	if pending.CheckTimeoutMS > 0 {
+		checkTimeout = time.Duration(pending.CheckTimeoutMS) * time.Millisecond
+	}
+	checkDeadline := time.Now().Add(checkTimeout)
+	report := runServeCheck(instanceID)
+	for !report.Ready && time.Now().Before(checkDeadline) {
+		time.Sleep(1 * time.Second)
+		report = runServeCheck(instanceID)
+	}
+	now := time.Now().UnixMilli()
+	deadlineExpired := pending.DeadlineAt > 0 && now > pending.DeadlineAt
+	if deadlineExpired || !report.Ready {
+		reason := failedChecksSummary(report)
+		if deadlineExpired {
+			if strings.TrimSpace(reason) == "" {
+				reason = "post-restart readiness deadline exceeded"
+			} else {
+				reason = reason + "; post-restart readiness deadline exceeded"
+			}
+		}
+		rollbackErr := tools.RollbackConfigFromBackup(configPath, pending.BackupPath)
+		if rollbackErr != nil {
+			_ = tools.AppendConfigAuditLog(auditPath, map[string]any{
+				"timestamp":      now,
+				"action":         "post_restart_rollback_failed",
+				"request_id":     pending.RequestID,
+				"key":            pending.Key,
+				"backup_path":    pending.BackupPath,
+				"reason":         reason,
+				"rollback_error": rollbackErr.Error(),
+			})
+			return fmt.Errorf("rollback from %s failed: %w", pending.BackupPath, rollbackErr)
+		}
+		_ = tools.AppendConfigAuditLog(auditPath, map[string]any{
+			"timestamp":   now,
+			"action":      "post_restart_rollback",
+			"request_id":  pending.RequestID,
+			"key":         pending.Key,
+			"backup_path": pending.BackupPath,
+			"reason":      reason,
+		})
+		_ = tools.RemoveConfigRestartPending(pendingPath)
+		return fmt.Errorf("post-restart readiness failed: %s", reason)
+	}
+
+	_ = tools.AppendConfigAuditLog(auditPath, map[string]any{
+		"timestamp":   now,
+		"action":      "post_restart_verified",
+		"request_id":  pending.RequestID,
+		"key":         pending.Key,
+		"backup_path": pending.BackupPath,
+	})
+	_ = tools.RemoveConfigRestartPending(pendingPath)
+	return nil
+}
+
+func failedChecksSummary(report doctorReport) string {
+	failures := make([]string, 0, len(report.Checks))
+	for _, check := range report.Checks {
+		if check.OK {
+			continue
+		}
+		detail := strings.TrimSpace(check.Detail)
+		if detail == "" {
+			failures = append(failures, check.Name)
+			continue
+		}
+		failures = append(failures, fmt.Sprintf("%s: %s", check.Name, detail))
+	}
+	if len(failures) == 0 {
+		return ""
+	}
+	return strings.Join(failures, "; ")
+}
+
+func registerGatewayHealthChecks(healthServer *health.Server, cfg *config.Config, cronService *cron.CronService, heartbeatService *heartbeat.HeartbeatService, channelManager *channels.Manager) {
+	healthServer.RegisterCheck("provider_config", func() (bool, string) {
+		if err := providers.ValidateProviderConfig(cfg); err != nil {
+			return false, err.Error()
+		}
+		return true, providers.ActiveProviderName(cfg)
+	})
+	healthServer.RegisterCheck("discord_token", func() (bool, string) {
+		if strings.TrimSpace(cfg.Channels.Discord.Token) == "" {
+			return false, "channels.discord.token is empty"
+		}
+		return true, "configured"
+	})
+	healthServer.RegisterCheck("memory_db", func() (bool, string) {
+		path := filepath.Join(cfg.DataPath(), "state", "memory.db")
+		if err := ensureFileAccessible(path); err != nil {
+			return false, err.Error()
+		}
+		return true, path
+	})
+	healthServer.RegisterCheck("cron_service", func() (bool, string) {
+		status := cronService.Status()
+		running, _ := status["enabled"].(bool)
+		if !running {
+			return false, "scheduler not running"
+		}
+		return true, "running"
+	})
+	healthServer.RegisterCheck("heartbeat_service", func() (bool, string) {
+		if !cfg.Heartbeat.Enabled {
+			return true, "disabled"
+		}
+		if heartbeatService.IsRunning() {
+			return true, "running"
+		}
+		return false, "not running"
+	})
+	healthServer.RegisterCheck("channels_running", func() (bool, string) {
+		statuses := channelManager.GetStatus()
+		if len(statuses) == 0 {
+			return false, "no channels enabled"
+		}
+		failures := make([]string, 0)
+		for name, raw := range statuses {
+			info, ok := raw.(map[string]interface{})
+			if !ok {
+				failures = append(failures, name)
+				continue
+			}
+			running, _ := info["running"].(bool)
+			if !running {
+				failures = append(failures, name)
+			}
+		}
+		if len(failures) > 0 {
+			return false, "not running: " + strings.Join(failures, ", ")
+		}
+		return true, fmt.Sprintf("%d channel(s) running", len(statuses))
+	})
 }
 
 func statusCmd() {
@@ -540,7 +759,7 @@ func statusCmd() {
 	} else {
 		fmt.Println("Workspace:", workspace, "✗")
 	}
-	memoryDB := filepath.Join(workspace, "state", "memory.db")
+	memoryDB := filepath.Join(cfg.DataPath(), "state", "memory.db")
 	if _, err := os.Stat(memoryDB); err == nil {
 		fmt.Println("Memory DB:", memoryDB, "✓")
 	} else {
@@ -584,12 +803,15 @@ func statusCmd() {
 }
 
 func getConfigPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".dotagent", "config.json")
+	if explicit := strings.TrimSpace(os.Getenv("DOTAGENT_CONFIG")); explicit != "" {
+		return explicit
+	}
+	instanceID := resolveInstanceID(strings.TrimSpace(os.Getenv("DOTAGENT_INSTANCE")))
+	return instanceConfigPath(instanceID)
 }
 
-func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) (*cron.CronService, error) {
-	cronStorePath := filepath.Join(workspace, "cron", "jobs.json")
+func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, storeRoot string, workspace string, restrict bool) (*cron.CronService, error) {
+	cronStorePath := filepath.Join(storeRoot, "cron", "jobs.json")
 
 	// Create cron service
 	cronService, err := cron.NewCronService(cronStorePath, nil)
@@ -629,7 +851,7 @@ func cronCmd() {
 		return
 	}
 
-	cronStorePath := filepath.Join(cfg.WorkspacePath(), "cron", "jobs.json")
+	cronStorePath := filepath.Join(cfg.DataPath(), "cron", "jobs.json")
 
 	switch subcommand {
 	case "list":

@@ -1,0 +1,41 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-doctor - Run deterministic instance readiness checks
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent doctor [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run deterministic instance readiness checks
+
+
+.SH OPTIONS
+.PP
+\fB--check\fP[=false]
+	Exit non-zero when checks fail
+
+.PP
+\fB--format\fP="text"
+	Output format: text|json
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for doctor
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent(1)\fP

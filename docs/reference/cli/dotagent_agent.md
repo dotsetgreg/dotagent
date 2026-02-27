@@ -2,7 +2,7 @@
 
 ## dotagent agent
 
-Run direct local chat with the agent (CLI mode)
+Run direct local chat with the agent (dev mode)
 
 ### Synopsis
 
@@ -29,6 +29,12 @@ dotagent agent [flags]
   -s, --session string   Session key for continuity (default "cli:default")
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
-* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing
+* [dotagent](dotagent.md)   - Instance-based AI agent runtime with Docker-first operations

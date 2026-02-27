@@ -3,7 +3,7 @@
 
 .SH NAME
 .PP
-dotagent - Personal AI agent with Discord gateway, tools, memory, and provider routing
+dotagent - Instance-based AI agent runtime with Docker-first operations
 
 
 .SH SYNOPSIS
@@ -13,11 +13,11 @@ dotagent - Personal AI agent with Discord gateway, tools, memory, and provider r
 
 .SH DESCRIPTION
 .PP
-dotagent is a lean, extensible agent runtime.
+dotagent is an operator-focused, instance-scoped AI agent runtime.
 
 .PP
-Use CLI commands to onboard, run local agent sessions, run the Discord gateway,
-manage cron jobs, install skills, and manage executable toolpacks.
+Use init/doctor/runtime/config/backup commands for production lifecycle operations.
+Use agent/gateway in dev mode only.
 
 
 .SH OPTIONS
@@ -26,10 +26,14 @@ manage cron jobs, install skills, and manage executable toolpacks.
 	help for dotagent
 
 .PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+.PP
 \fB-v\fP, \fB--version\fP[=false]
 	Show build/version metadata
 
 
 .SH SEE ALSO
 .PP
-\fBdotagent-agent(1)\fP, \fBdotagent-cron(1)\fP, \fBdotagent-gateway(1)\fP, \fBdotagent-onboard(1)\fP, \fBdotagent-skills(1)\fP, \fBdotagent-status(1)\fP, \fBdotagent-toolpacks(1)\fP, \fBdotagent-version(1)\fP
+\fBdotagent-agent(1)\fP, \fBdotagent-backup(1)\fP, \fBdotagent-config(1)\fP, \fBdotagent-cron(1)\fP, \fBdotagent-doctor(1)\fP, \fBdotagent-gateway(1)\fP, \fBdotagent-init(1)\fP, \fBdotagent-migrate(1)\fP, \fBdotagent-runtime(1)\fP, \fBdotagent-skills(1)\fP, \fBdotagent-toolpacks(1)\fP, \fBdotagent-version(1)\fP

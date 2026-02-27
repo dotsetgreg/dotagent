@@ -2,10 +2,10 @@
 
 ## Provider 401 / 403 / 400 Errors
 
-1. Confirm active provider + model in `dotagent status`.
+1. Confirm active provider + model in `dotagent doctor`.
 2. Verify credential source matches provider auth requirements.
 3. Check provider `api_base` for the selected provider.
-4. Restart container after config changes.
+4. Restart runtime after config changes (`dotagent runtime restart`).
 
 ## Tool Access Problems
 

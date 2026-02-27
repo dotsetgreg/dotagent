@@ -1,0 +1,41 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-config-approve - Approve a pending guarded config request
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent config approve  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Approve a pending guarded config request
+
+
+.SH OPTIONS
+.PP
+\fB--by\fP=""
+	Approver identity for audit trail (default: $USER)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for approve
+
+.PP
+\fB--note\fP=""
+	Optional approval note
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent-config(1)\fP

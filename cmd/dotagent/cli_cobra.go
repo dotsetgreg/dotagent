@@ -20,17 +20,30 @@ func executeCLI() error {
 }
 
 func buildRootCommand(includeDocsCommand bool) *cobra.Command {
-	var showVersion bool
+	var (
+		showVersion bool
+		instanceID  string
+	)
 
 	root := &cobra.Command{
 		Use:   "dotagent",
-		Short: "Personal AI agent with Discord gateway, tools, memory, and provider routing",
-		Long: strings.TrimSpace(`dotagent is a lean, extensible agent runtime.
+		Short: "Instance-based AI agent runtime with Docker-first operations",
+		Long: strings.TrimSpace(`dotagent is an operator-focused, instance-scoped AI agent runtime.
 
-Use CLI commands to onboard, run local agent sessions, run the Discord gateway,
-manage cron jobs, install skills, and manage executable toolpacks.`),
+Use init/doctor/runtime/config/backup commands for production lifecycle operations.
+Use agent/gateway in dev mode only.`),
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			id := resolveInstanceID(instanceID)
+			if err := validateInstanceID(id); err != nil {
+				return err
+			}
+			if err := os.Setenv("DOTAGENT_INSTANCE", id); err != nil {
+				return err
+			}
+			return os.Setenv("DOTAGENT_CONFIG", instanceConfigPath(id))
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if showVersion {
 				printVersion()
@@ -42,11 +55,20 @@ manage cron jobs, install skills, and manage executable toolpacks.`),
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.Flags().BoolVarP(&showVersion, "version", "v", false, "Show build/version metadata")
+	root.PersistentFlags().StringVar(&instanceID, "instance", defaultInstanceID, "Instance ID under ~/.dotagent/instances")
 
-	root.AddCommand(newOnboardCommand())
-	root.AddCommand(newAgentCommand())
-	root.AddCommand(newGatewayCommand())
-	root.AddCommand(newStatusCommand())
+	root.AddCommand(newInitCommand(&instanceID))
+	root.AddCommand(newMigrateCommand(&instanceID))
+	root.AddCommand(newDoctorCommand(&instanceID))
+	root.AddCommand(newRuntimeCommand(&instanceID))
+	root.AddCommand(newConfigCommand(&instanceID))
+	root.AddCommand(newBackupCommand(&instanceID))
+	root.AddCommand(newAgentCommand(&instanceID))
+	root.AddCommand(newGatewayCommand(&instanceID))
+	root.AddCommand(newServeCommand())
+	root.AddCommand(newServeCheckCommand())
+	root.AddCommand(newStatusAliasCommand())
+	root.AddCommand(newOnboardAliasCommand(&instanceID))
 	root.AddCommand(newCronCommand())
 	root.AddCommand(newSkillsCommand())
 	root.AddCommand(newToolpacksCommand())
@@ -61,28 +83,54 @@ manage cron jobs, install skills, and manage executable toolpacks.`),
 }
 
 func runLegacyWithArgs(args []string, fn func()) error {
-	original := os.Args
-	os.Args = append([]string{original[0]}, args...)
+	originalArgs := os.Args
+	originalCfg := os.Getenv("DOTAGENT_CONFIG")
+	originalInstance := os.Getenv("DOTAGENT_INSTANCE")
+
+	os.Args = append([]string{originalArgs[0]}, args...)
 	defer func() {
-		os.Args = original
+		os.Args = originalArgs
+		if originalCfg == "" {
+			_ = os.Unsetenv("DOTAGENT_CONFIG")
+		} else {
+			_ = os.Setenv("DOTAGENT_CONFIG", originalCfg)
+		}
+		if originalInstance == "" {
+			_ = os.Unsetenv("DOTAGENT_INSTANCE")
+		} else {
+			_ = os.Setenv("DOTAGENT_INSTANCE", originalInstance)
+		}
 	}()
 	fn()
 	return nil
 }
 
-func newOnboardCommand() *cobra.Command {
+func newOnboardAliasCommand(instanceID *string) *cobra.Command {
+	cmd := newInitCommand(instanceID)
+	cmd.Use = "onboard"
+	cmd.Aliases = []string{"bootstrap"}
+	cmd.Short = "Deprecated alias for init"
+	cmd.Deprecated = "use `dotagent init`"
+	return cmd
+}
+
+func newStatusAliasCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:     "onboard",
-		Short:   "Initialize ~/.dotagent config and workspace templates",
-		Long:    "Create default configuration and workspace template files for a new dotagent installation.",
-		Example: "  dotagent onboard",
+		Use:        "status",
+		Deprecated: "use `dotagent doctor` or `dotagent runtime status`",
+		Short:      "Deprecated alias for doctor",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLegacyWithArgs([]string{"onboard"}, onboard)
+			report := runDoctor(resolveInstanceID(os.Getenv("DOTAGENT_INSTANCE")))
+			printDoctorText(report)
+			if !report.Ready {
+				return fmt.Errorf("doctor checks failed")
+			}
+			return nil
 		},
 	}
 }
 
-func newAgentCommand() *cobra.Command {
+func newAgentCommand(instanceID *string) *cobra.Command {
 	var (
 		message string
 		session string
@@ -91,7 +139,7 @@ func newAgentCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "agent",
-		Short: "Run direct local chat with the agent (CLI mode)",
+		Short: "Run direct local chat with the agent (dev mode)",
 		Long:  "Run an interactive local agent session or send one-shot messages without Discord.",
 		Example: strings.Join([]string{
 			"  dotagent agent",
@@ -120,15 +168,20 @@ func newAgentCommand() *cobra.Command {
 	return cmd
 }
 
-func newGatewayCommand() *cobra.Command {
-	var debug bool
+func newGatewayCommand(instanceID *string) *cobra.Command {
+	var (
+		debug bool
+		dev   bool
+	)
 
 	cmd := &cobra.Command{
-		Use:     "gateway",
-		Short:   "Run the Discord gateway + health server",
-		Long:    "Start channel adapters, memory-backed agent loop, cron service, and heartbeat worker.",
-		Example: "  dotagent gateway --debug",
+		Use:   "gateway",
+		Short: "Run native gateway (dev mode only)",
+		Long:  "Start native gateway process for development. Production should use `dotagent runtime up`.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !dev && strings.TrimSpace(os.Getenv("DOTAGENT_ALLOW_PROD_GATEWAY")) != "1" {
+				return fmt.Errorf("gateway is dev-only; use `dotagent runtime up` for production, or pass --dev")
+			}
 			legacyArgs := []string{"gateway"}
 			if debug {
 				legacyArgs = append(legacyArgs, "--debug")
@@ -138,16 +191,18 @@ func newGatewayCommand() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+	cmd.Flags().BoolVar(&dev, "dev", false, "Acknowledge native gateway usage for development mode")
 	return cmd
 }
 
-func newStatusCommand() *cobra.Command {
+func newServeCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:     "status",
-		Short:   "Show configuration, provider, and runtime readiness",
-		Example: "  dotagent status",
+		Use:    "serve",
+		Short:  "Run gateway for managed runtime environments",
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLegacyWithArgs([]string{"status"}, statusCmd)
+			_ = os.Setenv("DOTAGENT_ALLOW_PROD_GATEWAY", "1")
+			return runLegacyWithArgs([]string{"gateway"}, gatewayCmd)
 		},
 	}
 }
@@ -293,10 +348,10 @@ func newSkillsCommand() *cobra.Command {
 				cfg, err := loadConfig()
 				if err != nil {
 					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
+					return
 				}
 				workspace := cfg.WorkspacePath()
-				globalDir := filepath.Dir(getConfigPath())
+				globalDir := filepath.Dir(filepath.Dir(getConfigPath()))
 				globalSkillsDir := filepath.Join(globalDir, "skills")
 				builtinSkillsDir := filepath.Join(globalDir, "dotagent", "skills")
 				loader := skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir)
@@ -315,7 +370,7 @@ func newSkillsCommand() *cobra.Command {
 				cfg, err := loadConfig()
 				if err != nil {
 					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
+					return
 				}
 				installer := skills.NewSkillInstaller(cfg.WorkspacePath())
 				skillsInstallCmd(installer)
@@ -335,7 +390,7 @@ func newSkillsCommand() *cobra.Command {
 				cfg, err := loadConfig()
 				if err != nil {
 					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
+					return
 				}
 				installer := skills.NewSkillInstaller(cfg.WorkspacePath())
 				skillsRemoveCmd(installer, args[0])
@@ -353,7 +408,7 @@ func newSkillsCommand() *cobra.Command {
 				cfg, err := loadConfig()
 				if err != nil {
 					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
+					return
 				}
 				installer := skills.NewSkillInstaller(cfg.WorkspacePath())
 				skillsSearchCmd(installer)
@@ -372,10 +427,10 @@ func newSkillsCommand() *cobra.Command {
 				cfg, err := loadConfig()
 				if err != nil {
 					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
+					return
 				}
 				workspace := cfg.WorkspacePath()
-				globalDir := filepath.Dir(getConfigPath())
+				globalDir := filepath.Dir(filepath.Dir(getConfigPath()))
 				globalSkillsDir := filepath.Join(globalDir, "skills")
 				builtinSkillsDir := filepath.Join(globalDir, "dotagent", "skills")
 				loader := skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir)

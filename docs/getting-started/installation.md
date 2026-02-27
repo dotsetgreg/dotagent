@@ -20,17 +20,18 @@ Binary output:
 ## Initial Onboarding
 
 ```bash
-dotagent onboard
+dotagent init --non-interactive
 ```
 
 This creates:
-- `~/.dotagent/config.json`
-- `~/.dotagent/workspace/*` template files
+- `~/.dotagent/instances/default/config/config.json`
+- `~/.dotagent/instances/default/workspace/*` template files
+- `~/.dotagent/instances/default/data/*` runtime state directories
 
 ## Validate Setup
 
 ```bash
-dotagent status
+dotagent doctor --check
 ```
 
 Check that provider credentials and Discord token are marked ready.

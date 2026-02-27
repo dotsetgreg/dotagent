@@ -1,40 +1,15 @@
 services:
-  # ─────────────────────────────────────────────
-  # DotAgent Agent (one-shot query)
-  #   docker compose run --rm dotagent-agent -m "Hello"
-  # ─────────────────────────────────────────────
-  dotagent-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dotagent-agent
-    profiles:
-      - agent
-    volumes:
-      - ./config/config.json:/root/.dotagent/config.json:ro
-      - dotagent-workspace:/root/.dotagent/workspace
-    entrypoint: ["dotagent", "agent"]
-    stdin_open: true
-    tty: true
-
-  # ─────────────────────────────────────────────
-  # DotAgent Gateway (Long-running Bot)
-  #   docker compose up dotagent-gateway
-  # ─────────────────────────────────────────────
   dotagent-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dotagent-gateway
+    image: ghcr.io/dotsetgreg/dotagent:latest
+    container_name: dotagent-default-gateway
     restart: unless-stopped
-    profiles:
-      - gateway
+    environment:
+      - DOTAGENT_CONFIG=/var/lib/dotagent/config/config.json
+      - DOTAGENT_INSTANCE=default
+      - DOTAGENT_DATA_DIR=/var/lib/dotagent/data
+      - DOTAGENT_LOGS_DIR=/var/lib/dotagent/logs
+      - DOTAGENT_RUNTIME_DIR=/var/lib/dotagent/runtime
+      - DOTAGENT_ALLOW_PROD_GATEWAY=1
     volumes:
-      # Configuration file
-      - ./config/config.json:/root/.dotagent/config.json:ro
-      # Persistent workspace (state DB, skills, logs)
-      - dotagent-workspace:/root/.dotagent/workspace
-    command: ["gateway"]
-
-volumes:
-  dotagent-workspace:
+      - ${HOME}/.dotagent/instances/default:/var/lib/dotagent
+    command: ["serve"]

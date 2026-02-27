@@ -1,25 +1,30 @@
-dotagent is a lean, extensible agent runtime.
+dotagent is an operator-focused, instance-scoped AI agent runtime.
 
-Use CLI commands to onboard, run local agent sessions, run the Discord gateway,
-manage cron jobs, install skills, and manage executable toolpacks.
+Use init/doctor/runtime/config/backup commands for production lifecycle operations.
+Use agent/gateway in dev mode only.
 
 Usage:
   dotagent [flags]
   dotagent [command]
 
 Available Commands:
-  agent       Run direct local chat with the agent (CLI mode)
+  agent       Run direct local chat with the agent (dev mode)
+  backup      Create and restore instance backups
+  config      Inspect and mutate instance configuration
   cron        Manage scheduled jobs
-  gateway     Run the Discord gateway + health server
+  doctor      Run deterministic instance readiness checks
+  gateway     Run native gateway (dev mode only)
   help        Help about any command
-  onboard     Initialize ~/.dotagent config and workspace templates
+  init        Initialize an instance-scoped DotAgent installation
+  migrate     Migrate legacy ~/.dotagent config/workspace into instance layout
+  runtime     Manage Docker runtime lifecycle for an instance
   skills      Install, remove, search, and inspect skills
-  status      Show configuration, provider, and runtime readiness
   toolpacks   Manage executable tool packs
   version     Show build/version metadata
 
 Flags:
-  -h, --help      help for dotagent
-  -v, --version   Show build/version metadata
+  -h, --help              help for dotagent
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+  -v, --version           Show build/version metadata
 
 Use "dotagent [command] --help" for more information about a command.

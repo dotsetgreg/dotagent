@@ -1,0 +1,49 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-init - Initialize an instance-scoped DotAgent installation
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent init [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Create instance directories, config v2, workspace templates, and runtime compose artifacts.
+
+
+.SH OPTIONS
+.PP
+\fB--force\fP[=false]
+	Overwrite existing config and runtime artifacts
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for init
+
+.PP
+\fB--migrate-legacy\fP[=true]
+	Import legacy ~/.dotagent layout when present
+
+.PP
+\fB--non-interactive\fP[=false]
+	Fail instead of prompting when user input is required
+
+.PP
+\fB--yes\fP[=false]
+	Assume yes for overwrite prompts
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent(1)\fP

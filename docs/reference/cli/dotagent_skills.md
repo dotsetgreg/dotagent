@@ -10,9 +10,15 @@ Install, remove, search, and inspect skills
   -h, --help   help for skills
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
-* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing
+* [dotagent](dotagent.md)   - Instance-based AI agent runtime with Docker-first operations
 * [dotagent skills install](dotagent_skills_install.md)   - Install a skill from GitHub
 * [dotagent skills list](dotagent_skills_list.md)   - List installed skills
 * [dotagent skills remove](dotagent_skills_remove.md)   - Remove an installed skill

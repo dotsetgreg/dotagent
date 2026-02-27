@@ -14,9 +14,15 @@ Create and manage recurring or cron-expression based jobs for the agent.
   -h, --help   help for cron
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
-* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing
+* [dotagent](dotagent.md)   - Instance-based AI agent runtime with Docker-first operations
 * [dotagent cron add](dotagent_cron_add.md)   - Add a scheduled job
 * [dotagent cron disable](dotagent_cron_disable.md)   - Disable a job
 * [dotagent cron enable](dotagent_cron_enable.md)   - Enable a disabled job

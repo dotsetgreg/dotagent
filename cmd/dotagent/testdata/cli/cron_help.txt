@@ -13,4 +13,7 @@ Available Commands:
 Flags:
   -h, --help   help for cron
 
+Global Flags:
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+
 Use "dotagent cron [command] --help" for more information about a command.

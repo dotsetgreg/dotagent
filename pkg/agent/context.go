@@ -29,12 +29,12 @@ type SystemPromptMetadata struct {
 	BootstrapConflict bool
 }
 
-func getGlobalConfigDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+func instanceRootFromWorkspace(workspace string) string {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
 		return ""
 	}
-	return filepath.Join(home, ".dotagent")
+	return filepath.Dir(workspace)
 }
 
 func NewContextBuilder(workspace string) *ContextBuilder {
@@ -42,7 +42,7 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 	// Use the skills/ directory under the current working directory
 	wd, _ := os.Getwd()
 	builtinSkillsDir := filepath.Join(wd, "skills")
-	globalSkillsDir := filepath.Join(getGlobalConfigDir(), "skills")
+	globalSkillsDir := filepath.Join(instanceRootFromWorkspace(workspace), "skills")
 
 	return &ContextBuilder{
 		workspace:    workspace,

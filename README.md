@@ -3,7 +3,7 @@
 DotAgent is a Go-based personal agent runtime with:
 - Messaging: Discord
 - LLM providers: OpenRouter, OpenAI API, OpenAI Codex OAuth
-- Memory: unified SQLite store (`workspace/state/memory.db`)
+- Memory: unified SQLite store (`data/state/memory.db`)
 - Persona: unified identity/soul/user profile pipeline with automatic persistence and recall
 - Context continuity: strict fail-closed checks when durable context is unavailable
 - Session identity: canonical v2 session keys derived from workspace/channel/conversation/actor
@@ -26,61 +26,54 @@ cd dotagent
 go build -o dotagent ./cmd/dotagent
 ```
 
-## Onboard
+## Initialize Instance
 
 ```bash
-./dotagent onboard
+./dotagent init --non-interactive
 ```
 
-This creates `~/.dotagent/config.json` and a default workspace.
+This creates:
 
-Update at least:
-- `providers.openrouter.api_key` (OpenRouter), or set:
-  - `agents.defaults.provider=openai`
-  - `providers.openai.api_key` (or `providers.openai.oauth_access_token` / `providers.openai.oauth_token_file`)
-  - or `agents.defaults.provider=openai-codex`
-  - `providers.openai_codex.oauth_access_token` (or `providers.openai_codex.oauth_token_file`)
-- `channels.discord.token` (for gateway mode)
+- `~/.dotagent/instances/default/config/config.json`
+- `~/.dotagent/instances/default/config/history/`
+- `~/.dotagent/instances/default/workspace/`
+- `~/.dotagent/instances/default/data/`
+- `~/.dotagent/instances/default/logs/`
+- `~/.dotagent/instances/default/runtime/`
+
+Set minimum credentials:
+
+```bash
+dotagent config set providers.openrouter.api_key '"<OPENROUTER_KEY>"'
+dotagent config set channels.discord.token '"<DISCORD_BOT_TOKEN>"'
+```
 
 Validate setup:
 
 ```bash
-./dotagent status
+dotagent doctor --check
 ```
 
-## Run
+## Run (Production, Docker-First)
 
-Local CLI interaction:
+Managed runtime lifecycle:
 
 ```bash
-./dotagent agent
-./dotagent agent -m "Summarize this repo"
+dotagent runtime up
+dotagent runtime status --check
+dotagent runtime logs -f
+dotagent runtime restart
+dotagent runtime down
 ```
 
-Discord gateway:
+## Run (Development)
+
+Local one-shot/interactive:
 
 ```bash
-./dotagent gateway
-```
-
-Headless gateway management with Docker Compose:
-
-```bash
-# Start in background
-docker compose --profile gateway up -d dotagent-gateway
-
-# Check service status
-docker compose ps dotagent-gateway
-
-# Stream logs
-docker compose logs -f dotagent-gateway
-
-# Restart
-docker compose restart dotagent-gateway
-
-# Stop / start
-docker compose stop dotagent-gateway
-docker compose start dotagent-gateway
+dotagent agent
+dotagent agent -m "Summarize this repo"
+dotagent gateway --dev
 ```
 
 ## Config Notes
@@ -96,7 +89,7 @@ docker compose start dotagent-gateway
   - DotAgent does not perform browser OAuth login; provide token material from your own auth workflow.
 - Discord is the only messaging channel (`channels.discord`)
 - Default model is `openai/gpt-5.2` (OpenRouter default)
-- Canonical memory DB: `~/.dotagent/workspace/state/memory.db`
+- Canonical memory DB: `~/.dotagent/instances/default/data/state/memory.db`
 - Canonical persona profile and revision history are stored in the same SQLite DB
 
 ## Persona System
@@ -199,15 +192,19 @@ OpenAI Codex OAuth in Docker:
 }
 ```
 
-Switching providers does not clear memory. Memory remains in `workspace/state/memory.db`.
+Switching providers does not clear memory. Memory remains in `data/state/memory.db`.
 
 ## Commands
 
 ```bash
-dotagent onboard
+dotagent init
+dotagent migrate
+dotagent doctor
+dotagent runtime
+dotagent config
+dotagent backup
 dotagent agent
-dotagent gateway
-dotagent status
+dotagent gateway --dev
 dotagent cron
 dotagent skills
 dotagent toolpacks

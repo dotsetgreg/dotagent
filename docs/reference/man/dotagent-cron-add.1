@@ -50,6 +50,12 @@ Add a recurring job with either --every (seconds) or --cron expression.
 	Recipient/chat target
 
 
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+
 .SH EXAMPLE
 .EX
   dotagent cron add --name backup --message "run backup" --every 3600

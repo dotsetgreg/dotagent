@@ -20,6 +20,12 @@ dotagent toolpacks list [flags]
   -h, --help   help for list
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
 * [dotagent toolpacks](dotagent_toolpacks.md)   - Manage executable tool packs

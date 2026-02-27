@@ -39,6 +39,7 @@ type SubagentManager struct {
 	defaultModel           string
 	bus                    *bus.MessageBus
 	workspace              string
+	stateRoot              string
 	workspaceContext       string
 	tools                  *ToolRegistry
 	maxIterations          int
@@ -75,13 +76,17 @@ const (
 	subagentStateFile    = "subagent_tasks.json"
 )
 
-func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace string, bus *bus.MessageBus) *SubagentManager {
+func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace string, stateRoot string, bus *bus.MessageBus) *SubagentManager {
+	if strings.TrimSpace(stateRoot) == "" {
+		stateRoot = workspace
+	}
 	manager := &SubagentManager{
 		tasks:                  make(map[string]*SubagentTask),
 		provider:               provider,
 		defaultModel:           defaultModel,
 		bus:                    bus,
 		workspace:              workspace,
+		stateRoot:              stateRoot,
 		workspaceContext:       strings.TrimSpace(workspace),
 		tools:                  NewToolRegistry(),
 		maxIterations:          10,
@@ -91,7 +96,7 @@ func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace 
 		maxOverflowCompactions: 2,
 		retry:                  providers.DefaultRetryConfig(),
 		nextID:                 1,
-		statePath:              filepath.Join(workspace, "state", subagentStateFile),
+		statePath:              filepath.Join(stateRoot, "state", subagentStateFile),
 	}
 	if err := manager.loadState(); err != nil {
 		logger.WarnCF("subagent", "Failed loading persisted subagent tasks", map[string]interface{}{

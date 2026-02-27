@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
@@ -156,11 +158,75 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 		return nil, err
 	}
 
+	if cfg != nil && cfg.Admin.ConfigApply.Enabled {
+		configPath := strings.TrimSpace(os.Getenv("DOTAGENT_CONFIG"))
+		if configPath == "" {
+			instanceRoot := filepath.Dir(cfg.RuntimePath())
+			configPath = filepath.Join(instanceRoot, "config", "config.json")
+		}
+		historyDir := filepath.Join(filepath.Dir(configPath), "history")
+		adminOpts := tools.ConfigApplyOptions{
+			ConfigPath:         configPath,
+			HistoryDir:         historyDir,
+			AuditLogPath:       filepath.Join(cfg.RuntimePath(), "config_audit.log"),
+			RequestsPath:       filepath.Join(cfg.RuntimePath(), "config_requests.json"),
+			PendingRestartPath: filepath.Join(cfg.RuntimePath(), "config_restart_pending.json"),
+			RequireApproval:    cfg.Admin.ConfigApply.RequireApproval,
+			MutableKeys:        append([]string(nil), cfg.Admin.ConfigApply.MutableKeys...),
+			OnRestartRequest: func(context.Context) error {
+				proc, err := os.FindProcess(os.Getpid())
+				if err != nil {
+					return err
+				}
+				return proc.Signal(syscall.SIGTERM)
+			},
+			PostApplyTimeout: 20 * time.Second,
+			PostApplyCheck: func(context.Context) error {
+				nextCfg, err := config.LoadConfig(configPath)
+				if err != nil {
+					return fmt.Errorf("reload config: %w", err)
+				}
+				if err := providers.ValidateProviderConfig(nextCfg); err != nil {
+					return fmt.Errorf("provider validation failed: %w", err)
+				}
+				paths := []string{
+					nextCfg.WorkspacePath(),
+					nextCfg.DataPath(),
+					nextCfg.LogsPath(),
+					nextCfg.RuntimePath(),
+				}
+				for _, p := range paths {
+					if err := os.MkdirAll(p, 0o755); err != nil {
+						return fmt.Errorf("ensure path %s: %w", p, err)
+					}
+				}
+				stateDir := filepath.Join(nextCfg.DataPath(), "state")
+				if err := os.MkdirAll(stateDir, 0o755); err != nil {
+					return fmt.Errorf("ensure state dir: %w", err)
+				}
+				healthProbe := filepath.Join(stateDir, ".config-apply-probe")
+				if err := os.WriteFile(healthProbe, []byte("ok"), 0o600); err != nil {
+					return fmt.Errorf("state dir not writable: %w", err)
+				}
+				_ = os.Remove(healthProbe)
+				return nil
+			},
+		}
+		if err := register(tools.NewConfigRequestTool(adminOpts)); err != nil {
+			return nil, err
+		}
+		if err := register(tools.NewConfigApplyTool(adminOpts)); err != nil {
+			return nil, err
+		}
+	}
+
 	return registry, nil
 }
 
 func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) (*AgentLoop, error) {
 	workspace := cfg.WorkspacePath()
+	dataRoot := cfg.DataPath()
+	_ = os.MkdirAll(dataRoot, 0755)
 	os.MkdirAll(workspace, 0755)
 
 	restrict := cfg.Agents.Defaults.RestrictToWorkspace
@@ -182,7 +248,7 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	}
 
 	// Create subagent manager with its own tool registry
-	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, msgBus)
+	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, dataRoot, msgBus)
 	subagentTools, err := createToolRegistry(workspace, restrict, cfg, msgBus)
 	if err != nil {
 		return nil, fmt.Errorf("create subagent tool registry: %w", err)
@@ -203,7 +269,7 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	}
 
 	// Create state manager for atomic state persistence
-	stateManager := state.NewManager(workspace)
+	stateManager := state.NewManager(dataRoot)
 
 	// Create context builder and set tools registry
 	contextBuilder := NewContextBuilder(workspace)
@@ -349,6 +415,7 @@ TURN TRANSCRIPT:
 
 	memSvc, err := memory.NewService(memory.Config{
 		Workspace:               workspace,
+		DataDir:                 dataRoot,
 		AgentID:                 "dotagent",
 		ContextModel:            cfg.Agents.Defaults.Model,
 		EmbeddingModel:          cfg.Memory.EmbeddingModel,
@@ -437,7 +504,7 @@ TURN TRANSCRIPT:
 		tools:          toolsRegistry,
 		toolpacks:      packManager,
 		sessionLocks: newSessionLockManager(sessionLockOptions{
-			WorkspaceRoot:   workspace,
+			WorkspaceRoot:   dataRoot,
 			FileLockEnabled: cfg.Agents.Defaults.SessionFileLockEnabled,
 			LockTimeout:     time.Duration(cfg.Agents.Defaults.SessionLockTimeoutMS) * time.Millisecond,
 			StaleAfter:      time.Duration(cfg.Agents.Defaults.SessionLockStaleSeconds) * time.Second,

@@ -20,6 +20,12 @@ dotagent version [flags]
   -h, --help   help for version
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
-* [dotagent](dotagent.md)   - Personal AI agent with Discord gateway, tools, memory, and provider routing
+* [dotagent](dotagent.md)   - Instance-based AI agent runtime with Docker-first operations

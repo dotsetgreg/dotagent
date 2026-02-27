@@ -7,6 +7,8 @@ Generated from runtime tool registration and tool descriptions.
 | Tool | Description |
 | --- | --- |
 | `append_file` | Append content to the end of a file |
+| `config_apply` | Apply an approved config request with validation, history backup, and restart trigger. Actions: apply. |
+| `config_request` | Propose and inspect guarded runtime configuration changes. Actions: propose, list, show. |
 | `cron` | Schedule reminders, tasks, or system commands. IMPORTANT: When user asks to be reminded or scheduled, you MUST call this tool. Use 'at_seconds' for one-time reminders (e.g., 'remind me in 10 minutes' → at_seconds=600). Use 'every_seconds' ONLY for recurring tasks (e.g., 'every 2 hours' → every_seconds=7200). Use 'cron_expr' for complex recurring schedules. Use 'command' to execute shell commands directly. |
 | `edit_file` | Edit a file by replacing old_text with new_text. Use match_index when old_text appears multiple times. |
 | `exec` | Execute a shell command and return its output. Use with caution. |

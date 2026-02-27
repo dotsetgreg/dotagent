@@ -45,6 +45,11 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
+	SchemaVersion int            `json:"schema_version"`
+	Instance      InstanceConfig `json:"instance"`
+	Paths         PathsConfig    `json:"paths"`
+	Runtime       RuntimeConfig  `json:"runtime"`
+	Admin         AdminConfig    `json:"admin"`
 	Agents    AgentsConfig    `json:"agents"`
 	Channels  ChannelsConfig  `json:"channels"`
 	Providers ProvidersConfig `json:"providers"`
@@ -53,6 +58,32 @@ type Config struct {
 	Memory    MemoryConfig    `json:"memory"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
 	mu        sync.RWMutex
+}
+
+type InstanceConfig struct {
+	ID string `json:"id" env:"DOTAGENT_INSTANCE"`
+}
+
+type PathsConfig struct {
+	Workspace string `json:"workspace" env:"DOTAGENT_PATHS_WORKSPACE"`
+	Data      string `json:"data" env:"DOTAGENT_PATHS_DATA"`
+	Logs      string `json:"logs" env:"DOTAGENT_PATHS_LOGS"`
+	Runtime   string `json:"runtime" env:"DOTAGENT_PATHS_RUNTIME"`
+}
+
+type RuntimeConfig struct {
+	Mode  string `json:"mode" env:"DOTAGENT_RUNTIME_MODE"`
+	Image string `json:"image" env:"DOTAGENT_RUNTIME_IMAGE"`
+}
+
+type AdminConfig struct {
+	ConfigApply AdminConfigApply `json:"config_apply"`
+}
+
+type AdminConfigApply struct {
+	Enabled         bool     `json:"enabled" env:"DOTAGENT_ADMIN_CONFIG_APPLY_ENABLED"`
+	RequireApproval bool     `json:"require_approval" env:"DOTAGENT_ADMIN_CONFIG_APPLY_REQUIRE_APPROVAL"`
+	MutableKeys     []string `json:"mutable_keys" env:"DOTAGENT_ADMIN_CONFIG_APPLY_MUTABLE_KEYS"`
 }
 
 type AgentsConfig struct {
@@ -188,10 +219,67 @@ type MemoryConfig struct {
 }
 
 func DefaultConfig() *Config {
+	return DefaultConfigForInstance("default")
+}
+
+func DefaultConfigForInstance(instanceID string) *Config {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		instanceID = "default"
+	}
+	instanceRoot := defaultInstanceRoot(instanceID)
+	workspacePath := filepath.Join(instanceRoot, "workspace")
+	dataPath := filepath.Join(instanceRoot, "data")
+	logsPath := filepath.Join(instanceRoot, "logs")
+	runtimePath := filepath.Join(instanceRoot, "runtime")
+
 	return &Config{
+		SchemaVersion: 2,
+		Instance: InstanceConfig{
+			ID: instanceID,
+		},
+		Paths: PathsConfig{
+			Workspace: workspacePath,
+			Data:      dataPath,
+			Logs:      logsPath,
+			Runtime:   runtimePath,
+		},
+		Runtime: RuntimeConfig{
+			Mode:  "docker",
+			Image: "ghcr.io/dotsetgreg/dotagent:latest",
+		},
+		Admin: AdminConfig{
+			ConfigApply: AdminConfigApply{
+				Enabled:         true,
+				RequireApproval: true,
+				MutableKeys: []string{
+					"agents.defaults.model",
+					"agents.defaults.provider",
+					"agents.defaults.temperature",
+					"channels.discord.token",
+					"channels.discord.allow_from",
+					"gateway.host",
+					"gateway.port",
+					"tools.web.brave.enabled",
+					"tools.web.brave.api_key",
+					"tools.web.brave.max_results",
+					"tools.web.duckduckgo.enabled",
+					"tools.web.duckduckgo.max_results",
+					"memory.max_recall_items",
+					"memory.candidate_limit",
+					"memory.retrieval_cache_seconds",
+					"memory.worker_poll_ms",
+					"memory.worker_lease_seconds",
+					"memory.persona_sync_apply",
+					"memory.persona_file_sync_mode",
+					"memory.persona_policy_mode",
+					"memory.persona_min_confidence",
+				},
+			},
+		},
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
-				Workspace:                 "~/.dotagent/workspace",
+				Workspace:                 workspacePath,
 				RestrictToWorkspace:       true,
 				Provider:                  "openrouter",
 				Model:                     "openai/gpt-5.2",
@@ -291,7 +379,11 @@ func DefaultConfig() *Config {
 }
 
 func LoadConfig(path string) (*Config, error) {
-	cfg := DefaultConfig()
+	instanceID := "default"
+	if v := strings.TrimSpace(os.Getenv("DOTAGENT_INSTANCE")); v != "" {
+		instanceID = v
+	}
+	cfg := DefaultConfigForInstance(instanceID)
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -334,7 +426,46 @@ func SaveConfig(path string, cfg *Config) error {
 func (c *Config) WorkspacePath() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.Paths.Workspace) != "" {
+		return expandHome(c.Paths.Workspace)
+	}
 	return expandHome(c.Agents.Defaults.Workspace)
+}
+
+func (c *Config) DataPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.Paths.Data) != "" {
+		return expandHome(c.Paths.Data)
+	}
+	return filepath.Join(expandHome(c.Agents.Defaults.Workspace), "state")
+}
+
+func (c *Config) LogsPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.Paths.Logs) != "" {
+		return expandHome(c.Paths.Logs)
+	}
+	return filepath.Join(expandHome(c.Agents.Defaults.Workspace), "logs")
+}
+
+func (c *Config) RuntimePath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.Paths.Runtime) != "" {
+		return expandHome(c.Paths.Runtime)
+	}
+	return filepath.Join(expandHome(c.Agents.Defaults.Workspace), "runtime")
+}
+
+func (c *Config) InstanceID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.Instance.ID) == "" {
+		return "default"
+	}
+	return strings.TrimSpace(c.Instance.ID)
 }
 
 func expandHome(path string) string {
@@ -381,6 +512,29 @@ func (c *Config) Validate() error {
 
 	if strings.TrimSpace(c.Agents.Defaults.Workspace) == "" {
 		addErr("agents.defaults.workspace is required")
+	}
+	if c.SchemaVersion <= 0 {
+		addErr("schema_version must be > 0")
+	}
+	if strings.TrimSpace(c.Instance.ID) == "" {
+		addErr("instance.id is required")
+	}
+	if strings.TrimSpace(c.Paths.Workspace) == "" {
+		addErr("paths.workspace is required")
+	}
+	if strings.TrimSpace(c.Paths.Data) == "" {
+		addErr("paths.data is required")
+	}
+	if strings.TrimSpace(c.Paths.Logs) == "" {
+		addErr("paths.logs is required")
+	}
+	if strings.TrimSpace(c.Paths.Runtime) == "" {
+		addErr("paths.runtime is required")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Runtime.Mode)) {
+	case "", "docker", "dev":
+	default:
+		addErr("runtime.mode must be one of docker|dev (got %q)", c.Runtime.Mode)
 	}
 	if strings.TrimSpace(c.Agents.Defaults.Provider) == "" {
 		addErr("agents.defaults.provider is required")
@@ -501,4 +655,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func defaultInstanceRoot(instanceID string) string {
+	homeRoot := strings.TrimSpace(os.Getenv("DOTAGENT_HOME"))
+	if homeRoot == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			homeRoot = filepath.Join(home, ".dotagent")
+		} else {
+			homeRoot = ".dotagent"
+		}
+	}
+	return filepath.Join(homeRoot, "instances", instanceID)
 }

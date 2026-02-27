@@ -19,6 +19,7 @@ import (
 // Config configures the memory subsystem.
 type Config struct {
 	Workspace                    string
+	DataDir                      string
 	AgentID                      string
 	ContextModel                 string
 	EmbeddingModel               string
@@ -105,6 +106,9 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 	if strings.TrimSpace(cfg.Workspace) == "" {
 		return nil, fmt.Errorf("memory workspace is required")
 	}
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		cfg.DataDir = cfg.Workspace
+	}
 	if cfg.AgentID == "" {
 		cfg.AgentID = "dotagent"
 	}
@@ -179,7 +183,7 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 		SetEmbedderByName(defaultEmbeddingModel)
 	}
 
-	dbPath := filepath.Join(cfg.Workspace, "state", "memory.db")
+	dbPath := filepath.Join(cfg.DataDir, "state", "memory.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		return nil, err

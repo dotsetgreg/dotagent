@@ -77,7 +77,7 @@ func TestSubagentManager_ResumesRunningTaskFromStateFile(t *testing.T) {
 
 	msgBus := bus.NewMessageBus()
 	provider := &countingSubagentProvider{content: "resumed-ok"}
-	manager := NewSubagentManager(provider, "test-model", tmpDir, msgBus)
+	manager := NewSubagentManager(provider, "test-model", tmpDir, tmpDir, msgBus)
 	manager.SetTools(NewToolRegistry())
 
 	task, ok := waitForSubagentTaskStatus(manager, "subagent-1", 3*time.Second, "completed")
@@ -121,7 +121,7 @@ func TestSubagentManager_RetriesPendingCompletionNotificationOnStartup(t *testin
 
 	msgBus := bus.NewMessageBus()
 	provider := &countingSubagentProvider{content: "unused"}
-	manager := NewSubagentManager(provider, "test-model", tmpDir, msgBus)
+	manager := NewSubagentManager(provider, "test-model", tmpDir, tmpDir, msgBus)
 	manager.SetTools(NewToolRegistry())
 
 	consumeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -153,7 +153,7 @@ func TestSubagentManager_PersistsTaskIDsAcrossRestarts(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	providerA := &countingSubagentProvider{content: "first"}
-	managerA := NewSubagentManager(providerA, "test-model", tmpDir, bus.NewMessageBus())
+	managerA := NewSubagentManager(providerA, "test-model", tmpDir, tmpDir, bus.NewMessageBus())
 	managerA.SetTools(NewToolRegistry())
 	if _, err := managerA.Spawn(context.Background(), "first task", "first", "discord", "chat-a", nil); err != nil {
 		t.Fatalf("spawn first task: %v", err)
@@ -163,7 +163,7 @@ func TestSubagentManager_PersistsTaskIDsAcrossRestarts(t *testing.T) {
 	}
 
 	providerB := &countingSubagentProvider{content: "second"}
-	managerB := NewSubagentManager(providerB, "test-model", tmpDir, bus.NewMessageBus())
+	managerB := NewSubagentManager(providerB, "test-model", tmpDir, tmpDir, bus.NewMessageBus())
 	managerB.SetTools(NewToolRegistry())
 	if _, err := managerB.Spawn(context.Background(), "second task", "second", "discord", "chat-b", nil); err != nil {
 		t.Fatalf("spawn second task: %v", err)

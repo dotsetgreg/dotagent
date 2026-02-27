@@ -20,6 +20,12 @@ dotagent cron remove <job_id> [flags]
   -h, --help   help for remove
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
 * [dotagent cron](dotagent_cron.md)   - Manage scheduled jobs

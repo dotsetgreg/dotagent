@@ -20,6 +20,12 @@ dotagent skills show <skill> [flags]
   -h, --help   help for show
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
 * [dotagent skills](dotagent_skills.md)   - Install, remove, search, and inspect skills

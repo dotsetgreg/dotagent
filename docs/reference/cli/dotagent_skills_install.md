@@ -20,6 +20,12 @@ dotagent skills install <owner/repo-or-path> [flags]
   -h, --help   help for install
 ```
 
+### Options inherited from parent commands
+
+```text
+      --instance string   Instance ID under ~/.dotagent/instances (default "default")
+```
+
 ### SEE ALSO
 
 * [dotagent skills](dotagent_skills.md)   - Install, remove, search, and inspect skills

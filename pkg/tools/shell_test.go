@@ -248,3 +248,35 @@ func TestShellTool_RestrictToWorkspace_BlocksAbsolutePathOutsideWorkspace(t *tes
 		t.Fatalf("expected outside working dir message, got %q", guardErr)
 	}
 }
+
+func TestShellTool_RestrictToWorkspace_BlocksWorkingDirOutsideWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	tool := NewExecTool(workspace, true)
+
+	res := tool.Execute(context.Background(), map[string]interface{}{
+		"command":     "pwd",
+		"working_dir": outside,
+	})
+	if !res.IsError {
+		t.Fatalf("expected outside working_dir to be blocked")
+	}
+	if !strings.Contains(strings.ToLower(res.ForLLM), "outside the workspace") {
+		t.Fatalf("expected outside workspace error, got %q", res.ForLLM)
+	}
+}
+
+func TestShellTool_RestrictToWorkspace_BlocksOperatorConfigMutationCommands(t *testing.T) {
+	tmpDir := t.TempDir()
+	tool := NewExecTool(tmpDir, true)
+
+	res := tool.Execute(context.Background(), map[string]interface{}{
+		"command": "dotagent config approve cfgreq-123",
+	})
+	if !res.IsError {
+		t.Fatalf("expected operator mutation command to be blocked")
+	}
+	if !strings.Contains(strings.ToLower(res.ForLLM), "operator-only") {
+		t.Fatalf("expected operator-only guard message, got %q", res.ForLLM)
+	}
+}

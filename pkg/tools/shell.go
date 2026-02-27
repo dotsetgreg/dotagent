@@ -77,9 +77,13 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) *To
 		return ErrorResult("command is required")
 	}
 
-	cwd := t.workingDir
-	if wd, ok := args["working_dir"].(string); ok && wd != "" {
-		cwd = wd
+	cwd := strings.TrimSpace(t.workingDir)
+	if wd, ok := args["working_dir"].(string); ok && strings.TrimSpace(wd) != "" {
+		resolvedWD, err := validatePath(strings.TrimSpace(wd), t.workingDir, t.restrictToWorkspace)
+		if err != nil {
+			return ErrorResult(err.Error())
+		}
+		cwd = resolvedWD
 	}
 
 	if cwd == "" {
@@ -87,6 +91,13 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) *To
 		if err == nil {
 			cwd = wd
 		}
+	}
+	if t.restrictToWorkspace && strings.TrimSpace(t.workingDir) != "" {
+		resolvedWD, err := validatePath(cwd, t.workingDir, t.restrictToWorkspace)
+		if err != nil {
+			return ErrorResult(err.Error())
+		}
+		cwd = resolvedWD
 	}
 
 	if guardError := t.guardCommand(command, cwd); guardError != "" {
@@ -176,6 +187,10 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 	}
 
 	if t.restrictToWorkspace {
+		if isRestrictedOperatorMutationCommand(cmd) {
+			return "Command blocked by safety guard (operator-only config mutation command)"
+		}
+
 		if restrictedShellMetaPattern.MatchString(cmd) {
 			return "Command blocked by safety guard (restricted mode disallows shell control operators)"
 		}
@@ -232,6 +247,29 @@ func looksLikeAbsolutePath(token string) bool {
 		return true
 	}
 	return false
+}
+
+func isRestrictedOperatorMutationCommand(command string) bool {
+	tokens := shellTokenPattern.FindAllString(command, -1)
+	if len(tokens) < 3 {
+		return false
+	}
+
+	binary := strings.ToLower(filepath.Base(strings.Trim(tokens[0], "\"'")))
+	if binary != "dotagent" {
+		return false
+	}
+	sub := strings.ToLower(strings.Trim(tokens[1], "\"'"))
+	action := strings.ToLower(strings.Trim(tokens[2], "\"'"))
+	if sub != "config" {
+		return false
+	}
+	switch action {
+	case "set", "unset", "rollback", "approve":
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *ExecTool) SetTimeout(timeout time.Duration) {

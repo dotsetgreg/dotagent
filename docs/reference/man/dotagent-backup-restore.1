@@ -1,0 +1,41 @@
+.nh
+.TH "DOTAGENT" "1" "Feb 2026" "dotagent" ""
+
+.SH NAME
+.PP
+dotagent-backup-restore - Restore instance from a .tar.gz backup
+
+
+.SH SYNOPSIS
+.PP
+\fBdotagent backup restore [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Restore instance from a .tar.gz backup
+
+
+.SH OPTIONS
+.PP
+\fB--force\fP[=false]
+	Allow restoring into a non-empty instance root
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for restore
+
+.PP
+\fB--input\fP=""
+	Backup archive path (.tar.gz)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
+
+
+.SH SEE ALSO
+.PP
+\fBdotagent-backup(1)\fP

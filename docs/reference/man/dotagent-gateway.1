@@ -3,7 +3,7 @@
 
 .SH NAME
 .PP
-dotagent-gateway - Run the Discord gateway + health server
+dotagent-gateway - Run native gateway (dev mode only)
 
 
 .SH SYNOPSIS
@@ -13,7 +13,7 @@ dotagent-gateway - Run the Discord gateway + health server
 
 .SH DESCRIPTION
 .PP
-Start channel adapters, memory-backed agent loop, cron service, and heartbeat worker.
+Start native gateway process for development. Production should use \fBdotagent runtime up\fR\&.
 
 
 .SH OPTIONS
@@ -22,14 +22,18 @@ Start channel adapters, memory-backed agent loop, cron service, and heartbeat wo
 	Enable debug logging
 
 .PP
+\fB--dev\fP[=false]
+	Acknowledge native gateway usage for development mode
+
+.PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for gateway
 
 
-.SH EXAMPLE
-.EX
-  dotagent gateway --debug
-.EE
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--instance\fP="default"
+	Instance ID under ~/.dotagent/instances
 
 
 .SH SEE ALSO
