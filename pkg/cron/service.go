@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -70,15 +71,17 @@ type CronService struct {
 
 const maxEveryIntervalMS = int64(365 * 24 * 60 * 60 * 1000)
 
-func NewCronService(storePath string, onJob JobHandler) *CronService {
+func NewCronService(storePath string, onJob JobHandler) (*CronService, error) {
 	cs := &CronService{
 		storePath: storePath,
 		onJob:     onJob,
 		gronx:     gronx.New(),
 	}
 	// Initialize and load store on creation
-	cs.loadStore()
-	return cs
+	if err := cs.loadStore(); err != nil {
+		return nil, err
+	}
+	return cs, nil
 }
 
 func normalizeSchedule(schedule CronSchedule) CronSchedule {
@@ -241,7 +244,14 @@ func (cs *CronService) executeJobByID(jobID string) {
 
 	var err error
 	if cs.onJob != nil {
-		_, err = cs.onJob(callbackJob)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("cron job panic: %v\n%s", r, string(debug.Stack()))
+				}
+			}()
+			_, err = cs.onJob(callbackJob)
+		}()
 	}
 
 	// Now acquire lock to update state
@@ -273,7 +283,7 @@ func (cs *CronService) executeJobByID(jobID string) {
 
 	// Compute next run time
 	if job.Schedule.Kind == "at" {
-		if job.DeleteAfterRun {
+		if job.DeleteAfterRun && err == nil {
 			cs.removeJobUnsafe(job.ID)
 		} else {
 			job.Enabled = false
@@ -387,7 +397,26 @@ func (cs *CronService) loadStore() error {
 		return err
 	}
 
-	return json.Unmarshal(data, cs.store)
+	if err := json.Unmarshal(data, cs.store); err != nil {
+		if recoverErr := cs.recoverCorruptStore(err); recoverErr != nil {
+			return recoverErr
+		}
+		return nil
+	}
+	return nil
+}
+
+func (cs *CronService) recoverCorruptStore(cause error) error {
+	backupPath := fmt.Sprintf("%s.corrupt.%d", cs.storePath, time.Now().UnixMilli())
+	if err := os.Rename(cs.storePath, backupPath); err != nil {
+		return fmt.Errorf("recover corrupt cron store: %w (original parse error: %v)", err, cause)
+	}
+	log.Printf("[cron] recovered corrupt store %s (backup: %s): %v", cs.storePath, backupPath, cause)
+	cs.store = &CronStore{
+		Version: 1,
+		Jobs:    []CronJob{},
+	}
+	return nil
 }
 
 func (cs *CronService) saveStoreUnsafe() error {

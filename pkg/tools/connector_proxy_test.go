@@ -56,3 +56,14 @@ func TestConnectorProxyTool_Close(t *testing.T) {
 		t.Fatalf("expected invoker close to be called")
 	}
 }
+
+func TestConnectorProxyTool_EmptySuccessPayloadReturnsError(t *testing.T) {
+	inv := &mockConnectorInvoker{
+		result: ConnectorInvocationResult{},
+	}
+	tool := NewConnectorProxyTool("remote_echo", "desc", nil, "echo", inv)
+	res := tool.Execute(context.Background(), nil)
+	if !res.IsError {
+		t.Fatalf("expected empty success payload to be treated as error")
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
 	"github.com/dotsetgreg/dotagent/pkg/config"
@@ -29,6 +30,11 @@ type Manager struct {
 type asyncTask struct {
 	cancel context.CancelFunc
 }
+
+const (
+	sendRetryAttempts = 3
+	sendRetryDelay    = 300 * time.Millisecond
+)
 
 func NewManager(cfg *config.Config, messageBus *bus.MessageBus) (*Manager, error) {
 	m := &Manager{
@@ -182,7 +188,7 @@ func (m *Manager) dispatchOutbound(ctx context.Context) {
 				continue
 			}
 
-			if err := channel.Send(ctx, msg); err != nil {
+			if err := m.sendWithRetry(ctx, channel, msg); err != nil {
 				logger.ErrorCF("channels", "Error sending message to channel", map[string]interface{}{
 					"channel": msg.Channel,
 					"error":   err.Error(),
@@ -190,6 +196,60 @@ func (m *Manager) dispatchOutbound(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (m *Manager) sendWithRetry(ctx context.Context, channel Channel, msg bus.OutboundMessage) error {
+	var err error
+	attempts := sendRetryAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = channel.Send(ctx, msg)
+		if err == nil {
+			return nil
+		}
+		if attempt == attempts {
+			break
+		}
+		if !isTransientSendError(err) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * sendRetryDelay):
+		}
+	}
+	if strings.TrimSpace(msg.ChatID) != "" {
+		fallback := bus.OutboundMessage{
+			Channel: msg.Channel,
+			ChatID:  msg.ChatID,
+			Content: "⚠️ Delivery failed after retries. Please ask me to resend that response.",
+		}
+		if fallbackErr := channel.Send(ctx, fallback); fallbackErr != nil {
+			logger.ErrorCF("channels", "Failed to send terminal delivery failure notice", map[string]interface{}{
+				"channel": msg.Channel,
+				"chat_id": msg.ChatID,
+				"error":   fallbackErr.Error(),
+			})
+		}
+	}
+	return err
+}
+
+func isTransientSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "tempor") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "429") ||
+		strings.Contains(msg, "5xx")
 }
 
 func (m *Manager) GetChannel(name string) (Channel, bool) {

@@ -33,26 +33,41 @@ type SubagentTask struct {
 }
 
 type SubagentManager struct {
-	tasks            map[string]*SubagentTask
-	mu               sync.RWMutex
-	provider         providers.LLMProvider
-	defaultModel     string
-	bus              *bus.MessageBus
-	workspace        string
-	workspaceContext string
-	tools            *ToolRegistry
-	maxIterations    int
-	nextID           int
-	statePath        string
-	pendingResumeIDs []string
-	pendingNotifyIDs []string
-	recoveryOnce     sync.Once
+	tasks                  map[string]*SubagentTask
+	mu                     sync.RWMutex
+	provider               providers.LLMProvider
+	defaultModel           string
+	bus                    *bus.MessageBus
+	workspace              string
+	workspaceContext       string
+	tools                  *ToolRegistry
+	maxIterations          int
+	contextWindow          int
+	contextPruningMode     string
+	contextPruningKeepLast int
+	maxOverflowCompactions int
+	retry                  providers.RetryConfig
+	loopDetection          ToolLoopDetectionConfig
+	nextID                 int
+	statePath              string
+	pendingResumeIDs       []string
+	pendingNotifyIDs       []string
+	recoveryOnce           sync.Once
 }
 
 type persistedSubagentState struct {
 	Version int             `json:"version"`
 	NextID  int             `json:"next_id"`
 	Tasks   []*SubagentTask `json:"tasks"`
+}
+
+type SubagentLoopRuntimeOptions struct {
+	ContextWindowTokens    int
+	ContextPruningMode     string
+	ContextPruningKeepLast int
+	MaxOverflowCompactions int
+	Retry                  providers.RetryConfig
+	LoopDetection          ToolLoopDetectionConfig
 }
 
 const (
@@ -62,16 +77,21 @@ const (
 
 func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace string, bus *bus.MessageBus) *SubagentManager {
 	manager := &SubagentManager{
-		tasks:            make(map[string]*SubagentTask),
-		provider:         provider,
-		defaultModel:     defaultModel,
-		bus:              bus,
-		workspace:        workspace,
-		workspaceContext: strings.TrimSpace(workspace),
-		tools:            NewToolRegistry(),
-		maxIterations:    10,
-		nextID:           1,
-		statePath:        filepath.Join(workspace, "state", subagentStateFile),
+		tasks:                  make(map[string]*SubagentTask),
+		provider:               provider,
+		defaultModel:           defaultModel,
+		bus:                    bus,
+		workspace:              workspace,
+		workspaceContext:       strings.TrimSpace(workspace),
+		tools:                  NewToolRegistry(),
+		maxIterations:          10,
+		contextWindow:          16384,
+		contextPruningMode:     "off",
+		contextPruningKeepLast: 5,
+		maxOverflowCompactions: 2,
+		retry:                  providers.DefaultRetryConfig(),
+		nextID:                 1,
+		statePath:              filepath.Join(workspace, "state", subagentStateFile),
 	}
 	if err := manager.loadState(); err != nil {
 		logger.WarnCF("subagent", "Failed loading persisted subagent tasks", map[string]interface{}{
@@ -80,6 +100,27 @@ func NewSubagentManager(provider providers.LLMProvider, defaultModel, workspace 
 		})
 	}
 	return manager
+}
+
+func (sm *SubagentManager) ConfigureLoopRuntime(opts SubagentLoopRuntimeOptions) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if opts.ContextWindowTokens > 0 {
+		sm.contextWindow = opts.ContextWindowTokens
+	}
+	if strings.TrimSpace(opts.ContextPruningMode) != "" {
+		sm.contextPruningMode = strings.TrimSpace(opts.ContextPruningMode)
+	}
+	if opts.ContextPruningKeepLast > 0 {
+		sm.contextPruningKeepLast = opts.ContextPruningKeepLast
+	}
+	if opts.MaxOverflowCompactions > 0 {
+		sm.maxOverflowCompactions = opts.MaxOverflowCompactions
+	}
+	if opts.Retry.MaxAttempts > 0 {
+		sm.retry = opts.Retry
+	}
+	sm.loopDetection = opts.LoopDetection
 }
 
 // SetTools sets the tool registry for subagent execution.
@@ -97,7 +138,12 @@ func (sm *SubagentManager) SetTools(tools *ToolRegistry) {
 func (sm *SubagentManager) RegisterTool(tool Tool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.tools.Register(tool)
+	if err := sm.tools.Register(tool); err != nil {
+		logger.ErrorCF("subagent", "Failed registering subagent tool", map[string]interface{}{
+			"tool":  tool.Name(),
+			"error": err.Error(),
+		})
+	}
 }
 
 // SetWorkspaceContext injects workspace/tools context into subagent prompts.
@@ -227,16 +273,32 @@ func (sm *SubagentManager) runTask(ctx context.Context, taskID string, callback 
 	sm.mu.RLock()
 	tools := sm.tools
 	maxIter := sm.maxIterations
+	contextWindow := sm.contextWindow
+	contextPruningMode := sm.contextPruningMode
+	contextPruningKeepLast := sm.contextPruningKeepLast
+	maxOverflowCompactions := sm.maxOverflowCompactions
+	retryCfg := sm.retry
+	loopDetection := sm.loopDetection
 	sm.mu.RUnlock()
+	initialMessages := cloneSubagentMessages(messages)
 
 	loopResult, err := RunToolLoop(ctx, ToolLoopConfig{
-		Provider:      sm.provider,
-		Model:         sm.defaultModel,
-		Tools:         tools,
-		MaxIterations: maxIter,
+		Provider:               sm.provider,
+		Model:                  sm.defaultModel,
+		Tools:                  tools,
+		MaxIterations:          maxIter,
+		ContextWindowTokens:    contextWindow,
+		ContextPruningMode:     contextPruningMode,
+		ContextPruningKeepLast: contextPruningKeepLast,
+		MaxOverflowCompactions: maxOverflowCompactions,
+		Retry:                  retryCfg,
+		LoopDetection:          loopDetection,
 		LLMOptions: map[string]any{
 			"max_tokens":  4096,
 			"temperature": 0.7,
+		},
+		RebuildContext: func(ctx context.Context) ([]providers.Message, error) {
+			return cloneSubagentMessages(initialMessages), nil
 		},
 	}, messages, originChannel, originChatID)
 
@@ -647,16 +709,32 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]interface{})
 	sm.mu.RLock()
 	tools := sm.tools
 	maxIter := sm.maxIterations
+	contextWindow := sm.contextWindow
+	contextPruningMode := sm.contextPruningMode
+	contextPruningKeepLast := sm.contextPruningKeepLast
+	maxOverflowCompactions := sm.maxOverflowCompactions
+	retryCfg := sm.retry
+	loopDetection := sm.loopDetection
 	sm.mu.RUnlock()
+	initialMessages := cloneSubagentMessages(messages)
 
 	loopResult, err := RunToolLoop(ctx, ToolLoopConfig{
-		Provider:      sm.provider,
-		Model:         sm.defaultModel,
-		Tools:         tools,
-		MaxIterations: maxIter,
+		Provider:               sm.provider,
+		Model:                  sm.defaultModel,
+		Tools:                  tools,
+		MaxIterations:          maxIter,
+		ContextWindowTokens:    contextWindow,
+		ContextPruningMode:     contextPruningMode,
+		ContextPruningKeepLast: contextPruningKeepLast,
+		MaxOverflowCompactions: maxOverflowCompactions,
+		Retry:                  retryCfg,
+		LoopDetection:          loopDetection,
 		LLMOptions: map[string]any{
 			"max_tokens":  4096,
 			"temperature": 0.7,
+		},
+		RebuildContext: func(ctx context.Context) ([]providers.Message, error) {
+			return cloneSubagentMessages(initialMessages), nil
 		},
 	}, messages, originChannel, originChatID)
 
@@ -699,4 +777,13 @@ func buildSubagentSystemPrompt(workspaceContext string) string {
 		base = append(base, "## Workspace Context\n"+workspaceContext)
 	}
 	return strings.Join(base, "\n\n")
+}
+
+func cloneSubagentMessages(messages []providers.Message) []providers.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]providers.Message, len(messages))
+	copy(out, messages)
+	return out
 }

@@ -138,3 +138,44 @@ func TestSessionLockManager_DoesNotStealLiveLockByFileAgeOnly(t *testing.T) {
 		t.Fatalf("expected live lock with active pid to remain valid")
 	}
 }
+
+func TestSessionLockManager_WatchdogDoesNotDeleteHeldLock(t *testing.T) {
+	root := t.TempDir()
+	mgr := newSessionLockManager(sessionLockOptions{
+		WorkspaceRoot:   root,
+		FileLockEnabled: true,
+		LockTimeout:     500 * time.Millisecond,
+		StaleAfter:      time.Minute,
+		MaxHoldDuration: 10 * time.Millisecond,
+	})
+	defer mgr.Close()
+
+	unlock, err := mgr.Acquire(context.Background(), "discord:chat-watchdog:user-1")
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer unlock()
+
+	lockPath, err := mgr.sessionLockPath("discord:chat-watchdog:user-1")
+	if err != nil {
+		t.Fatalf("session lock path: %v", err)
+	}
+
+	mgr.fileMu.Lock()
+	held := mgr.heldFile[lockPath]
+	held.AcquiredAt = time.Now().Add(-2 * time.Second)
+	mgr.heldFile[lockPath] = held
+	mgr.fileMu.Unlock()
+
+	mgr.pruneStaleHeldLocks()
+
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Fatalf("expected watchdog to preserve held lock file, stat err=%v", statErr)
+	}
+	mgr.fileMu.Lock()
+	_, ok := mgr.heldFile[lockPath]
+	mgr.fileMu.Unlock()
+	if !ok {
+		t.Fatalf("expected held lock tracking to remain after watchdog warning")
+	}
+}

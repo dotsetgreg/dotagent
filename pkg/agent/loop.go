@@ -8,11 +8,15 @@ package agent
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +56,12 @@ type AgentLoop struct {
 	toolpacks              *toolpacks.Manager
 	scheduler              *sessionScheduler
 	sessionLocks           *sessionLockManager
+	inboundDedupeMu        sync.Mutex
+	recentInbound          map[string]int64
+	inboundDedupeTTL       time.Duration
+	promptBaselineMu       sync.Mutex
+	sessionPromptHash      map[string]string
+	personaSyncTimeout     time.Duration
 	running                atomic.Bool
 	channelManager         *channels.Manager
 }
@@ -72,19 +82,39 @@ type processOptions struct {
 
 // createToolRegistry creates a tool registry with common tools.
 // This is shared between main agent and subagents.
-func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msgBus *bus.MessageBus) *tools.ToolRegistry {
+func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msgBus *bus.MessageBus) (*tools.ToolRegistry, error) {
 	registry := tools.NewToolRegistry()
+	register := func(tool tools.Tool) error {
+		if err := registry.Register(tool); err != nil {
+			return fmt.Errorf("register tool %q: %w", tool.Name(), err)
+		}
+		return nil
+	}
 
 	// File system tools
-	registry.Register(tools.NewReadFileTool(workspace, restrict))
-	registry.Register(tools.NewWriteFileTool(workspace, restrict))
-	registry.Register(tools.NewListDirTool(workspace, restrict))
-	registry.Register(tools.NewEditFileTool(workspace, restrict))
-	registry.Register(tools.NewAppendFileTool(workspace, restrict))
+	if err := register(tools.NewReadFileTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
+	if err := register(tools.NewWriteFileTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
+	if err := register(tools.NewListDirTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
+	if err := register(tools.NewEditFileTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
+	if err := register(tools.NewAppendFileTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
 
 	// Shell execution
-	registry.Register(tools.NewExecTool(workspace, restrict))
-	registry.Register(tools.NewProcessTool(workspace, restrict))
+	if err := register(tools.NewExecTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
+	if err := register(tools.NewProcessTool(workspace, restrict)); err != nil {
+		return nil, err
+	}
 
 	if searchTool := tools.NewWebSearchTool(tools.WebSearchToolOptions{
 		BraveAPIKey:          cfg.Tools.Web.Brave.APIKey,
@@ -93,9 +123,13 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 		DuckDuckGoMaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
 		DuckDuckGoEnabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
 	}); searchTool != nil {
-		registry.Register(searchTool)
+		if err := register(searchTool); err != nil {
+			return nil, err
+		}
 	}
-	registry.Register(tools.NewWebFetchTool(50000))
+	if err := register(tools.NewWebFetchTool(50000)); err != nil {
+		return nil, err
+	}
 
 	// Message tool - available to both agent and subagent
 	// Subagent uses it to communicate directly with user
@@ -118,9 +152,11 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 		}
 		return err
 	})
-	registry.Register(messageTool)
+	if err := register(messageTool); err != nil {
+		return nil, err
+	}
 
-	return registry
+	return registry, nil
 }
 
 func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) (*AgentLoop, error) {
@@ -130,11 +166,16 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	restrict := cfg.Agents.Defaults.RestrictToWorkspace
 
 	// Create tool registry for main agent
-	toolsRegistry := createToolRegistry(workspace, restrict, cfg, msgBus)
+	toolsRegistry, err := createToolRegistry(workspace, restrict, cfg, msgBus)
+	if err != nil {
+		return nil, fmt.Errorf("create main tool registry: %w", err)
+	}
 	packManager := toolpacks.NewManager(workspace, restrict)
 	packTools, err := packManager.LoadEnabledTools()
 	for _, t := range packTools {
-		toolsRegistry.Register(t)
+		if regErr := toolsRegistry.Register(t); regErr != nil {
+			return nil, fmt.Errorf("register toolpack tool %q: %w", t.Name(), regErr)
+		}
 	}
 	if err != nil {
 		logger.WarnCF("agent", "Failed loading toolpacks", map[string]interface{}{"error": err.Error()})
@@ -142,17 +183,24 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 
 	// Create subagent manager with its own tool registry
 	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, msgBus)
-	subagentTools := createToolRegistry(workspace, restrict, cfg, msgBus)
+	subagentTools, err := createToolRegistry(workspace, restrict, cfg, msgBus)
+	if err != nil {
+		return nil, fmt.Errorf("create subagent tool registry: %w", err)
+	}
 	// Subagent doesn't need spawn/subagent tools to avoid recursion
 	subagentManager.SetTools(subagentTools)
 
 	// Register spawn tool (for main agent)
 	spawnTool := tools.NewSpawnTool(subagentManager)
-	toolsRegistry.Register(spawnTool)
+	if err := toolsRegistry.Register(spawnTool); err != nil {
+		return nil, fmt.Errorf("register spawn tool: %w", err)
+	}
 
 	// Register subagent tool (synchronous execution)
 	subagentTool := tools.NewSubagentTool(subagentManager)
-	toolsRegistry.Register(subagentTool)
+	if err := toolsRegistry.Register(subagentTool); err != nil {
+		return nil, fmt.Errorf("register subagent tool: %w", err)
+	}
 
 	// Create state manager for atomic state persistence
 	stateManager := state.NewManager(workspace)
@@ -222,10 +270,40 @@ TURN TRANSCRIPT:
 		if err != nil {
 			return nil, err
 		}
-		return parsePersonaCandidatesResponse(resp.Content), nil
+		candidates, parsed := parsePersonaCandidatesResponse(resp.Content)
+		if !parsed && strings.TrimSpace(resp.Content) != "" {
+			return nil, memory.ErrPersonaExtractorParse
+		}
+		return candidates, nil
 	}
 
 	resolvedContextWindow := resolveRuntimeContextWindow(provider, cfg.Agents.Defaults.Model, cfg.Agents.Defaults.MaxTokens)
+	subagentRetryCfg := providers.DefaultRetryConfig()
+	subagentRetryCfg.MaxAttempts = 3
+	subagentRetryCfg.MinDelay = 1500 * time.Millisecond
+	subagentRetryCfg.MaxDelay = 8 * time.Second
+	subagentManager.ConfigureLoopRuntime(tools.SubagentLoopRuntimeOptions{
+		ContextWindowTokens:    resolvedContextWindow,
+		ContextPruningMode:     strings.TrimSpace(cfg.Memory.ContextPruningMode),
+		ContextPruningKeepLast: cfg.Memory.ContextPruningKeepLastToolResults,
+		MaxOverflowCompactions: 3,
+		Retry:                  subagentRetryCfg,
+		LoopDetection: tools.ToolLoopDetectionConfig{
+			Enabled:                     cfg.Memory.ToolLoopDetectionEnabled,
+			WarningsEnabled:             cfg.Memory.ToolLoopWarningsEnabled,
+			SignatureWarnThreshold:      cfg.Memory.ToolLoopSignatureWarnThreshold,
+			SignatureCriticalThreshold:  cfg.Memory.ToolLoopSignatureCriticalThreshold,
+			DriftWarnThreshold:          cfg.Memory.ToolLoopDriftWarnThreshold,
+			DriftCriticalThreshold:      cfg.Memory.ToolLoopDriftCriticalThreshold,
+			PollingWarnThreshold:        cfg.Memory.ToolLoopPollingWarnThreshold,
+			PollingCriticalThreshold:    cfg.Memory.ToolLoopPollingCriticalThreshold,
+			NoProgressWarnThreshold:     cfg.Memory.ToolLoopNoProgressWarnThreshold,
+			NoProgressCriticalThreshold: cfg.Memory.ToolLoopNoProgressCriticalThreshold,
+			PingPongWarnThreshold:       cfg.Memory.ToolLoopPingPongWarnThreshold,
+			PingPongCriticalThreshold:   cfg.Memory.ToolLoopPingPongCriticalThreshold,
+			GlobalCircuitThreshold:      cfg.Memory.ToolLoopGlobalCircuitThreshold,
+		},
+	})
 	compactionHooks := memory.CompactionHooks{
 		Before: func(_ context.Context, payload memory.CompactionHookPayload) {
 			if msgBus == nil {
@@ -365,6 +443,10 @@ TURN TRANSCRIPT:
 			StaleAfter:      time.Duration(cfg.Agents.Defaults.SessionLockStaleSeconds) * time.Second,
 			MaxHoldDuration: time.Duration(cfg.Agents.Defaults.SessionLockMaxHoldSeconds) * time.Second,
 		}),
+		recentInbound:      map[string]int64{},
+		inboundDedupeTTL:   90 * time.Second,
+		sessionPromptHash:  map[string]string{},
+		personaSyncTimeout: time.Duration(cfg.Memory.PersonaSyncTimeoutMS) * time.Millisecond,
 	}
 
 	sessionTool := tools.NewSessionTool(
@@ -374,12 +456,17 @@ TURN TRANSCRIPT:
 		},
 		agentLoop.ProcessDirectWithChannel,
 	)
-	toolsRegistry.Register(sessionTool)
+	if err := toolsRegistry.Register(sessionTool); err != nil {
+		return nil, fmt.Errorf("register session tool: %w", err)
+	}
 	if agentLoop.maxIterations <= 0 {
 		agentLoop.maxIterations = 50
 	}
 	if agentLoop.maxConcurrent <= 0 {
 		agentLoop.maxConcurrent = 4
+	}
+	if agentLoop.personaSyncTimeout <= 0 {
+		agentLoop.personaSyncTimeout = 2200 * time.Millisecond
 	}
 
 	return agentLoop, nil
@@ -410,8 +497,17 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 			incoming := msg
+			if al.isDuplicateInbound(incoming) {
+				logger.WarnCF("agent", "Skipping duplicate inbound message", map[string]interface{}{
+					"channel":    incoming.Channel,
+					"chat_id":    incoming.ChatID,
+					"sender_id":  incoming.SenderID,
+					"message_id": incoming.MessageID,
+				})
+				continue
+			}
 			laneKey := al.resolveLaneKey(incoming)
-			_ = scheduler.Submit(laneKey, func() {
+			runTask := func() {
 				roundState := tools.NewExecutionRoundState()
 				roundCtx := tools.WithExecutionRoundState(ctx, roundState)
 
@@ -427,11 +523,87 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 						Content: response,
 					}, "run_loop_response")
 				}
-			})
+			}
+			if submitErr := scheduler.Submit(laneKey, runTask); submitErr != nil {
+				logger.ErrorCF("agent", "Failed to submit session task", map[string]interface{}{
+					"session_key": incoming.SessionKey,
+					"lane_key":    laneKey,
+					"error":       submitErr.Error(),
+				})
+				if retryErr := scheduler.Submit(laneKey, runTask); retryErr != nil {
+					logger.ErrorCF("agent", "Retry submit failed; notifying user", map[string]interface{}{
+						"session_key": incoming.SessionKey,
+						"lane_key":    laneKey,
+						"error":       retryErr.Error(),
+					})
+					if !constants.IsInternalChannel(incoming.Channel) {
+						al.publishOutbound(bus.OutboundMessage{
+							Channel: incoming.Channel,
+							ChatID:  incoming.ChatID,
+							Content: "I hit an internal scheduling issue and could not process that message. Please try again.",
+						}, "scheduler_submit_failed")
+					}
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+func (al *AgentLoop) isDuplicateInbound(msg bus.InboundMessage) bool {
+	key := inboundDedupeKey(msg)
+	if key == "" {
+		return false
+	}
+	now := time.Now().UnixMilli()
+	ttl := al.inboundDedupeTTL
+	if ttl <= 0 {
+		ttl = 90 * time.Second
+	}
+	cutoff := now - ttl.Milliseconds()
+	al.inboundDedupeMu.Lock()
+	defer al.inboundDedupeMu.Unlock()
+	for k, seenAt := range al.recentInbound {
+		if seenAt < cutoff {
+			delete(al.recentInbound, k)
+		}
+	}
+	if seenAt, ok := al.recentInbound[key]; ok {
+		if seenAt >= cutoff {
+			return true
+		}
+	}
+	al.recentInbound[key] = now
+	return false
+}
+
+func inboundDedupeKey(msg bus.InboundMessage) string {
+	channel := strings.TrimSpace(msg.Channel)
+	chatID := strings.TrimSpace(msg.ChatID)
+	sender := strings.TrimSpace(msg.SenderID)
+	if mid := strings.TrimSpace(msg.MessageID); mid != "" {
+		return strings.ToLower(channel + "|" + chatID + "|" + sender + "|" + mid)
+	}
+	content := strings.TrimSpace(strings.ToLower(msg.Content))
+	if content == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(content))
+	return strings.ToLower(channel + "|" + chatID + "|" + sender + "|h:" + hex.EncodeToString(sum[:8]))
+}
+
+func (al *AgentLoop) detectPromptBaselineChange(sessionKey, promptHash string) bool {
+	sessionKey = strings.TrimSpace(sessionKey)
+	promptHash = strings.TrimSpace(promptHash)
+	if sessionKey == "" || promptHash == "" {
+		return false
+	}
+	al.promptBaselineMu.Lock()
+	defer al.promptBaselineMu.Unlock()
+	prev := strings.TrimSpace(al.sessionPromptHash[sessionKey])
+	al.sessionPromptHash[sessionKey] = promptHash
+	return prev != "" && prev != promptHash
 }
 
 func (al *AgentLoop) Stop() {
@@ -469,7 +641,18 @@ func (al *AgentLoop) resolveLaneKey(msg bus.InboundMessage) string {
 }
 
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {
-	al.tools.Register(tool)
+	if tool == nil {
+		logger.ErrorCF("agent", "Failed to register tool", map[string]interface{}{
+			"error": "tool is nil",
+		})
+		return
+	}
+	if err := al.tools.Register(tool); err != nil {
+		logger.ErrorCF("agent", "Failed to register tool", map[string]interface{}{
+			"tool":  tool.Name(),
+			"error": err.Error(),
+		})
+	}
 }
 
 func (al *AgentLoop) SetChannelManager(cm *channels.Manager) {
@@ -575,11 +758,14 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 
 	// Parse origin channel from chat_id (format: "channel:chat_id")
 	var originChannel string
+	var originChatID string
 	if idx := strings.Index(msg.ChatID, ":"); idx > 0 {
 		originChannel = msg.ChatID[:idx]
+		originChatID = msg.ChatID[idx+1:]
 	} else {
 		// Fallback
 		originChannel = "cli"
+		originChatID = msg.ChatID
 	}
 
 	// Extract subagent result from message content
@@ -609,7 +795,14 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 			"content_len": len(content),
 		})
 
-	// Agent only logs, does not respond to user
+	if strings.TrimSpace(content) != "" && !constants.IsInternalChannel(originChannel) {
+		al.publishOutbound(bus.OutboundMessage{
+			Channel: originChannel,
+			ChatID:  originChatID,
+			Content: strings.TrimSpace(content),
+		}, "subagent_completion")
+	}
+
 	return "", nil
 }
 
@@ -685,10 +878,25 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		}
 		seq++
 
+		syncPersonaOutcome := "llm_empty"
 		if recordedUserTurn {
 			if shouldApplyPersonaSyncFastPath(opts.UserMessage) {
-				report, applyErr := al.memory.ApplyPersonaDirectivesSync(ctx, opts.SessionKey, turnID, opts.UserID)
+				personaCtx := ctx
+				cancel := func() {}
+				if al.personaSyncTimeout > 0 {
+					personaCtx, cancel = context.WithTimeout(ctx, al.personaSyncTimeout)
+				}
+				report, applyErr := al.memory.ApplyPersonaDirectivesSync(personaCtx, opts.SessionKey, turnID, opts.UserID)
+				cancel()
 				if applyErr != nil {
+					switch {
+					case errors.Is(applyErr, context.DeadlineExceeded), errors.Is(applyErr, context.Canceled):
+						syncPersonaOutcome = "llm_timeout"
+					case errors.Is(applyErr, memory.ErrPersonaExtractorParse):
+						syncPersonaOutcome = "llm_parse_error"
+					default:
+						syncPersonaOutcome = "llm_error"
+					}
 					logger.WarnCF("agent", "Synchronous persona apply failed", map[string]interface{}{
 						"error":       applyErr.Error(),
 						"session_key": opts.SessionKey,
@@ -696,8 +904,12 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 					})
 				} else {
 					syncPersonaReport = report
+					if len(report.Decisions) > 0 {
+						syncPersonaOutcome = "llm_ok"
+					}
 				}
 			} else {
+				syncPersonaOutcome = "heuristic_skip"
 				_ = al.memory.AddMetric(ctx, "memory.persona.apply_sync.skipped", 1, map[string]string{
 					"session_key": opts.SessionKey,
 					"user_id":     opts.UserID,
@@ -709,6 +921,12 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 				})
 			}
 		}
+		_ = al.memory.AddMetric(ctx, "memory.persona.apply_sync.outcome", 1, map[string]string{
+			"session_key": opts.SessionKey,
+			"user_id":     opts.UserID,
+			"turn_id":     turnID,
+			"outcome":     syncPersonaOutcome,
+		})
 	}
 
 	// 3. Build messages (skip history for heartbeat)
@@ -738,7 +956,9 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		// Current user turn is already in persisted history; avoid duplicate copy.
 		currentUserPrompt = ""
 	}
-	messages := al.contextBuilder.BuildMessages(
+	systemPrompt, promptMeta := al.contextBuilder.BuildSystemPromptWithMetadata()
+	messages := al.contextBuilder.BuildMessagesWithSystemPrompt(
+		systemPrompt,
 		history,
 		summary,
 		recall,
@@ -756,6 +976,10 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	}
 	if personaNote != "" {
 		messages = injectSystemNote(messages, personaNote)
+	}
+	if !opts.NoHistory && al.detectPromptBaselineChange(opts.SessionKey, promptMeta.Hash) {
+		messages = injectSystemNote(messages,
+			"System capabilities/bootstrap instructions changed since the previous turn. Use the latest tool list and identity constraints for this response.")
 	}
 
 	// 4. Run shared LLM+tool iteration loop
@@ -831,7 +1055,9 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 			if rebuildErr != nil {
 				return nil, rebuildErr
 			}
-			rebuiltMessages := al.contextBuilder.BuildMessages(
+			rebuiltSystemPrompt, rebuiltMeta := al.contextBuilder.BuildSystemPromptWithMetadata()
+			rebuiltMessages := al.contextBuilder.BuildMessagesWithSystemPrompt(
+				rebuiltSystemPrompt,
 				toProviderMessages(rebuilt.History),
 				rebuilt.Summary,
 				rebuilt.RecallPrompt,
@@ -848,6 +1074,10 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 			}
 			if personaNote != "" {
 				rebuiltMessages = injectSystemNote(rebuiltMessages, personaNote)
+			}
+			if !opts.NoHistory && al.detectPromptBaselineChange(opts.SessionKey, rebuiltMeta.Hash) {
+				rebuiltMessages = injectSystemNote(rebuiltMessages,
+					"System capabilities/bootstrap instructions changed since the previous turn. Use the latest tool list and identity constraints for this response.")
 			}
 			return rebuiltMessages, nil
 		},
@@ -1143,10 +1373,10 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	return result
 }
 
-func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate {
+func parsePersonaCandidatesResponse(raw string) ([]memory.PersonaUpdateCandidate, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil
+		return nil, true
 	}
 
 	type candidate struct {
@@ -1192,12 +1422,12 @@ func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate 
 
 	var env envelope
 	if err := json.Unmarshal([]byte(raw), &env); err == nil && len(env.Candidates) > 0 {
-		return parseCandidates(env.Candidates)
+		return parseCandidates(env.Candidates), true
 	}
 
 	var arr []candidate
 	if err := json.Unmarshal([]byte(raw), &arr); err == nil && len(arr) > 0 {
-		return parseCandidates(arr)
+		return parseCandidates(arr), true
 	}
 
 	// Best effort extraction from markdown code fences or mixed output.
@@ -1206,14 +1436,14 @@ func parsePersonaCandidatesResponse(raw string) []memory.PersonaUpdateCandidate 
 	if start >= 0 && end > start {
 		candidateRaw := raw[start : end+1]
 		if err := json.Unmarshal([]byte(candidateRaw), &env); err == nil && len(env.Candidates) > 0 {
-			return parseCandidates(env.Candidates)
+			return parseCandidates(env.Candidates), true
 		}
 		if err := json.Unmarshal([]byte(candidateRaw), &arr); err == nil && len(arr) > 0 {
-			return parseCandidates(arr)
+			return parseCandidates(arr), true
 		}
 	}
 
-	return nil
+	return nil, false
 }
 
 func toProviderMessages(messages []memory.Message) []providers.Message {

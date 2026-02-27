@@ -47,6 +47,7 @@ Generated from `pkg/config/config.go` and `config.DefaultConfig()`.
 | `memory.persona_min_confidence` | `float` | `DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE` | `0.52` |
 | `memory.persona_policy_mode` | `string` | `DOTAGENT_MEMORY_PERSONA_POLICY_MODE` | `"balanced"` |
 | `memory.persona_sync_apply` | `bool` | `DOTAGENT_MEMORY_PERSONA_SYNC_APPLY` | `true` |
+| `memory.persona_sync_timeout_ms` | `int` | `DOTAGENT_MEMORY_PERSONA_SYNC_TIMEOUT_MS` | `2200` |
 | `memory.retrieval_cache_seconds` | `int` | `DOTAGENT_MEMORY_RETRIEVAL_CACHE_SECONDS` | `20` |
 | `memory.tool_loop_detection_enabled` | `bool` | `DOTAGENT_MEMORY_TOOL_LOOP_DETECTION_ENABLED` | `true` |
 | `memory.tool_loop_drift_critical_threshold` | `int` | `DOTAGENT_MEMORY_TOOL_LOOP_DRIFT_CRITICAL_THRESHOLD` | `8` |

@@ -3,10 +3,12 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -122,7 +124,9 @@ func TestCompactor_ArchivesOldEvents(t *testing.T) {
 		}
 	}
 
-	comp := NewSessionCompactor(store, nil)
+	comp := NewSessionCompactor(store, func(ctx context.Context, existingSummary, transcript string) (string, error) {
+		return strings.TrimSpace(existingSummary + "\n" + transcript), nil
+	})
 	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(1024)); err != nil {
 		t.Fatalf("compact session: %v", err)
 	}
@@ -552,7 +556,9 @@ func TestCompactor_WritesStructuredSnapshot(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed preference memory item: %v", err)
 	}
-	comp := NewSessionCompactor(store, nil)
+	comp := NewSessionCompactor(store, func(ctx context.Context, existingSummary, transcript string) (string, error) {
+		return strings.TrimSpace(existingSummary + "\n" + transcript), nil
+	})
 	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(1024)); err != nil {
 		t.Fatalf("compact session: %v", err)
 	}
@@ -623,5 +629,131 @@ func TestBuildPromptContext_IncludesContinuationHandoff(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(pc.RecallPrompt), "continuation handoff") {
 		t.Fatalf("expected recall prompt to include continuation handoff block, got: %q", pc.RecallPrompt)
+	}
+}
+
+func TestSessionCompactor_AbortsArchiveWhenSummaryUnreliable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(filepath.Join(dir, "state", "memory.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	sessionKey := "discord:unreliable-summary"
+	if err := store.EnsureSession(ctx, sessionKey, "discord", "unreliable-summary", "u1"); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		role := "assistant"
+		if i%2 == 0 {
+			role = "user"
+		}
+		if err := store.AppendEvent(ctx, Event{
+			SessionKey: sessionKey,
+			TurnID:     fmt.Sprintf("turn-%d", i/2),
+			Seq:        i + 1,
+			Role:       role,
+			Content:    "conversation payload for compaction reliability test",
+		}); err != nil {
+			t.Fatalf("append event %d: %v", i, err)
+		}
+	}
+
+	comp := NewSessionCompactor(store, func(ctx context.Context, existingSummary, transcript string) (string, error) {
+		return "", fmt.Errorf("simulated summary failure")
+	})
+	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(128)); !errors.Is(err, ErrCompactionSummaryUnreliable) {
+		t.Fatalf("expected ErrCompactionSummaryUnreliable, got %v", err)
+	}
+	events, err := store.ListRecentEvents(ctx, sessionKey, 128, false)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) < 30 {
+		t.Fatalf("expected events to remain unarchived on unreliable summary, got %d", len(events))
+	}
+}
+
+func TestService_ForceCompactSerializesPerSession(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	var active int32
+	var maxActive int32
+	block := make(chan struct{})
+	started := make(chan struct{}, 1)
+
+	summarize := func(ctx context.Context, existingSummary, transcript string) (string, error) {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			prev := atomic.LoadInt32(&maxActive)
+			if current <= prev || atomic.CompareAndSwapInt32(&maxActive, prev, current) {
+				break
+			}
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-block
+		atomic.AddInt32(&active, -1)
+		return strings.TrimSpace(existingSummary + "\n" + transcript), nil
+	}
+
+	svc, err := NewService(Config{
+		Workspace:        workspace,
+		AgentID:          "dotagent",
+		ContextModel:     "test-model",
+		MaxContextTokens: 2048,
+	}, summarize)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	defer svc.Close()
+
+	sessionKey := "discord:serialize"
+	userID := "u1"
+	if err := svc.EnsureSession(ctx, sessionKey, "discord", "serialize", userID); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	for i := 0; i < 36; i++ {
+		role := "assistant"
+		if i%2 == 0 {
+			role = "user"
+		}
+		if err := svc.AppendEvent(ctx, Event{
+			SessionKey: sessionKey,
+			TurnID:     fmt.Sprintf("turn-%d", i/2),
+			Seq:        i + 1,
+			Role:       role,
+			Content:    "serialized compaction payload",
+		}); err != nil {
+			t.Fatalf("append event: %v", err)
+		}
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- svc.ForceCompact(ctx, sessionKey, userID, 128)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		close(block)
+		t.Fatalf("timed out waiting for first compaction to reach summarize")
+	}
+	go func() {
+		errCh <- svc.ForceCompact(ctx, sessionKey, userID, 128)
+	}()
+
+	close(block)
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("force compact error: %v", err)
+		}
+	}
+	if got := atomic.LoadInt32(&maxActive); got > 1 {
+		t.Fatalf("expected compaction serialization, max concurrent summarizes=%d", got)
 	}
 }

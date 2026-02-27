@@ -13,6 +13,10 @@ func TestInspectError_ContextOverflowFromMessage(t *testing.T) {
 	if meta.Kind != ErrorKindContextOverflow {
 		t.Fatalf("expected context overflow kind, got %q", meta.Kind)
 	}
+	meta = InspectError(fmt.Errorf("bad_request: prompt too long for model"))
+	if meta.Kind != ErrorKindContextOverflow {
+		t.Fatalf("expected prompt-too-long to map to context overflow, got %q", meta.Kind)
+	}
 }
 
 func TestNewHTTPError_RateLimitRetryAfter(t *testing.T) {
@@ -62,5 +66,16 @@ func TestParseRetryAfterHeader(t *testing.T) {
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	if got := ParseRetryAfterHeader(future); got <= 0 {
 		t.Fatalf("expected positive duration for HTTP-date retry-after, got %s", got)
+	}
+}
+
+func TestNormalizeProviderError_WrapsUntypedError(t *testing.T) {
+	err := NormalizeProviderError("openrouter", fmt.Errorf("request too large"))
+	meta := InspectError(err)
+	if meta.Kind != ErrorKindContextOverflow {
+		t.Fatalf("expected normalized context overflow, got %q", meta.Kind)
+	}
+	if meta.Provider != "openrouter" {
+		t.Fatalf("expected provider openrouter, got %q", meta.Provider)
 	}
 }

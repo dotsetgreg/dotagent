@@ -13,7 +13,7 @@ func TestSessionScheduler_SerializesSameLane(t *testing.T) {
 	var mu sync.Mutex
 	order := []string{}
 
-	s.Submit("lane-a", func() {
+	if err := s.Submit("lane-a", func() {
 		mu.Lock()
 		order = append(order, "start-1")
 		mu.Unlock()
@@ -21,13 +21,17 @@ func TestSessionScheduler_SerializesSameLane(t *testing.T) {
 		mu.Lock()
 		order = append(order, "end-1")
 		mu.Unlock()
-	})
-	s.Submit("lane-a", func() {
+	}); err != nil {
+		t.Fatalf("submit lane-a task 1: %v", err)
+	}
+	if err := s.Submit("lane-a", func() {
 		mu.Lock()
 		order = append(order, "start-2")
 		order = append(order, "end-2")
 		mu.Unlock()
-	})
+	}); err != nil {
+		t.Fatalf("submit lane-a task 2: %v", err)
+	}
 
 	if !s.Wait(2 * time.Second) {
 		t.Fatalf("scheduler timed out waiting for same-lane tasks")
@@ -53,14 +57,18 @@ func TestSessionScheduler_AllowsDifferentLanesConcurrent(t *testing.T) {
 	started := make(chan string, 2)
 	release := make(chan struct{})
 
-	s.Submit("lane-a", func() {
+	if err := s.Submit("lane-a", func() {
 		started <- "a"
 		<-release
-	})
-	s.Submit("lane-b", func() {
+	}); err != nil {
+		t.Fatalf("submit lane-a: %v", err)
+	}
+	if err := s.Submit("lane-b", func() {
 		started <- "b"
 		<-release
-	})
+	}); err != nil {
+		t.Fatalf("submit lane-b: %v", err)
+	}
 
 	first := <-started
 	_ = first
@@ -82,16 +90,17 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 	defer s.Stop()
 
 	release := make(chan struct{})
-	if !s.Submit("lane-a", func() { <-release }) {
-		t.Fatalf("failed to enqueue first lane-a task")
+	if err := s.Submit("lane-a", func() { <-release }); err != nil {
+		t.Fatalf("failed to enqueue first lane-a task: %v", err)
 	}
-	if !s.Submit("lane-a", func() { <-release }) {
-		t.Fatalf("failed to enqueue buffered lane-a task")
+	if err := s.Submit("lane-a", func() { <-release }); err != nil {
+		t.Fatalf("failed to enqueue buffered lane-a task: %v", err)
 	}
 
 	thirdDone := make(chan struct{})
+	thirdErr := make(chan error, 1)
 	go func() {
-		_ = s.Submit("lane-a", func() {})
+		thirdErr <- s.Submit("lane-a", func() {})
 		close(thirdDone)
 	}()
 
@@ -103,8 +112,8 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 	}
 
 	start := time.Now()
-	if !s.Submit("lane-b", func() {}) {
-		t.Fatalf("expected lane-b submit to succeed")
+	if err := s.Submit("lane-b", func() {}); err != nil {
+		t.Fatalf("expected lane-b submit to succeed: %v", err)
 	}
 	elapsed := time.Since(start)
 	if elapsed > 100*time.Millisecond {
@@ -114,11 +123,23 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 	close(release)
 	select {
 	case <-thirdDone:
+		if err := <-thirdErr; err != nil {
+			t.Fatalf("third lane-a submit returned error: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("third lane-a submit did not unblock after release")
 	}
 
 	if !s.Wait(3 * time.Second) {
 		t.Fatalf("scheduler timed out waiting for no-head-of-line test")
+	}
+}
+
+func TestSessionScheduler_SubmitRejectedAfterStop(t *testing.T) {
+	s := newSessionScheduler(1)
+	s.Stop()
+
+	if err := s.Submit("lane-a", func() {}); err == nil {
+		t.Fatalf("expected submit error after stop")
 	}
 }

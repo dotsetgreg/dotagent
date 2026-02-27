@@ -197,12 +197,12 @@ func (p *responsesProvider) ChatWithState(ctx context.Context, stateID string, m
 	} else {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return nil, "", fmt.Errorf("read %s response: %w", p.providerName, readErr)
+			return nil, "", NormalizeProviderError(p.providerName, fmt.Errorf("read %s response: %w", p.providerName, readErr))
 		}
 		parsed, err = parseResponsesResponse(body)
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("parse %s response: %w", p.providerName, err)
+		return nil, "", NormalizeProviderError(p.providerName, fmt.Errorf("parse %s response: %w", p.providerName, err))
 	}
 	return parsed.Response, parsed.ResponseID, nil
 }
@@ -372,6 +372,7 @@ func parseResponsesStream(r io.Reader, onDelta func(string)) (*parsedResponsesRe
 	chunkLines := make([]string, 0, 16)
 	var content strings.Builder
 	var completedPayload []byte
+	malformedCount := 0
 
 	processChunk := func(chunk string) error {
 		data := extractSSEDataChunk(chunk)
@@ -381,6 +382,10 @@ func parseResponsesStream(r io.Reader, onDelta func(string)) (*parsedResponsesRe
 
 		var event map[string]interface{}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			malformedCount++
+			if malformedCount > 4 {
+				return fmt.Errorf("too many malformed streaming events (%d)", malformedCount)
+			}
 			return nil
 		}
 

@@ -657,7 +657,10 @@ func buildToolsReferenceMarkdown() (string, error) {
 	}
 
 	cronStore := filepath.Join(tmpWorkspace, "cron", "jobs.json")
-	cronService := cron.NewCronService(cronStore, nil)
+	cronService, err := cron.NewCronService(cronStore, nil)
+	if err != nil {
+		return "", fmt.Errorf("initialize cron service for docs generation: %w", err)
+	}
 	cronTool := tools.NewCronTool(cronService, loop, msgBus, tmpWorkspace, cfg.Agents.Defaults.RestrictToWorkspace)
 	toolRows[cronTool.Name()] = cronTool.Description()
 

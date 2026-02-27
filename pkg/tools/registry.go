@@ -23,10 +23,36 @@ func NewToolRegistry() *ToolRegistry {
 	}
 }
 
-func (r *ToolRegistry) Register(tool Tool) {
+func (r *ToolRegistry) Register(tool Tool) error {
+	if tool == nil {
+		return fmt.Errorf("tool is nil")
+	}
+	name := strings.TrimSpace(tool.Name())
+	if name == "" {
+		return fmt.Errorf("tool name is empty")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.tools[tool.Name()] = tool
+	if _, exists := r.tools[name]; exists {
+		return fmt.Errorf("tool %q already registered", name)
+	}
+	r.tools[name] = tool
+	return nil
+}
+
+// RegisterOverride explicitly replaces an existing tool registration.
+func (r *ToolRegistry) RegisterOverride(tool Tool) error {
+	if tool == nil {
+		return fmt.Errorf("tool is nil")
+	}
+	name := strings.TrimSpace(tool.Name())
+	if name == "" {
+		return fmt.Errorf("tool name is empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools[name] = tool
+	return nil
 }
 
 // Close closes all registered tools that implement ClosableTool.
@@ -128,8 +154,15 @@ func (r *ToolRegistry) GetDefinitions() []map[string]interface{} {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	definitions := make([]map[string]interface{}, 0, len(r.tools))
-	for _, tool := range r.tools {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	definitions := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		tool := r.tools[name]
 		definitions = append(definitions, ToolToSchema(tool))
 	}
 	return definitions
@@ -141,8 +174,15 @@ func (r *ToolRegistry) ToProviderDefs() []providers.ToolDefinition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	definitions := make([]providers.ToolDefinition, 0, len(r.tools))
-	for _, tool := range r.tools {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	definitions := make([]providers.ToolDefinition, 0, len(names))
+	for _, name := range names {
+		tool := r.tools[name]
 		schema := ToolToSchema(tool)
 
 		// Safely extract nested values with type checks

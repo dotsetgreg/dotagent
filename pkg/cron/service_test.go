@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func mustNewCronService(t *testing.T, storePath string) *CronService {
+	t.Helper()
+	cs, err := NewCronService(storePath, nil)
+	if err != nil {
+		t.Fatalf("NewCronService failed: %v", err)
+	}
+	return cs
+}
+
 func TestSaveStore_FilePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("file permission bits are not enforced on Windows")
@@ -17,7 +26,7 @@ func TestSaveStore_FilePermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
 
-	cs := NewCronService(storePath, nil)
+	cs := mustNewCronService(t, storePath)
 
 	_, err := cs.AddJob("test", CronSchedule{Kind: "every", EveryMS: int64Ptr(60000)}, "hello", false, "cli", "direct")
 	if err != nil {
@@ -42,7 +51,7 @@ func int64Ptr(v int64) *int64 {
 func TestAddJob_RejectsInvalidSchedules(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
-	cs := NewCronService(storePath, nil)
+	cs := mustNewCronService(t, storePath)
 
 	tests := []struct {
 		name     string
@@ -76,7 +85,7 @@ func TestAddJob_RejectsInvalidSchedules(t *testing.T) {
 func TestCronService_ListJobsReturnsCopies(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
-	cs := NewCronService(storePath, nil)
+	cs := mustNewCronService(t, storePath)
 
 	job, err := cs.AddJob("immutable", CronSchedule{Kind: "every", EveryMS: int64Ptr(1000)}, "hello", false, "cli", "direct")
 	if err != nil {
@@ -116,7 +125,7 @@ func TestCronService_ListJobsReturnsCopies(t *testing.T) {
 func TestEnableJob_ExpiredOneTimeJobRemainsDisabled(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
-	cs := NewCronService(storePath, nil)
+	cs := mustNewCronService(t, storePath)
 
 	atMS := time.Now().UnixMilli() + 30_000
 	job, err := cs.AddJob("one-shot", CronSchedule{Kind: "at", AtMS: &atMS}, "hello", false, "cli", "direct")
@@ -145,7 +154,7 @@ func TestEnableJob_ExpiredOneTimeJobRemainsDisabled(t *testing.T) {
 func TestStatus_NextWakePointerIsDetached(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
-	cs := NewCronService(storePath, nil)
+	cs := mustNewCronService(t, storePath)
 
 	_, err := cs.AddJob("status", CronSchedule{Kind: "every", EveryMS: int64Ptr(60_000)}, "hello", false, "cli", "direct")
 	if err != nil {
@@ -166,5 +175,98 @@ func TestStatus_NextWakePointerIsDetached(t *testing.T) {
 	}
 	if *ptrB == 1 {
 		t.Fatalf("status exposed mutable internal pointer")
+	}
+}
+
+func TestCronService_ExecuteJobRecoversFromPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
+	cs := mustNewCronService(t, storePath)
+	cs.SetOnJob(func(job *CronJob) (string, error) {
+		panic("boom")
+	})
+
+	job, err := cs.AddJob("panic-job", CronSchedule{Kind: "every", EveryMS: int64Ptr(60_000)}, "hello", false, "cli", "direct")
+	if err != nil {
+		t.Fatalf("AddJob failed: %v", err)
+	}
+
+	cs.executeJobByID(job.ID)
+	var found *CronJob
+	for _, candidate := range cs.ListJobs(true) {
+		if candidate.ID == job.ID {
+			c := candidate
+			found = &c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected job to remain after panic")
+	}
+	if found.State.LastStatus != "error" {
+		t.Fatalf("expected panic execution to mark error status, got %q", found.State.LastStatus)
+	}
+	if !strings.Contains(found.State.LastError, "cron job panic") {
+		t.Fatalf("expected panic marker in LastError, got %q", found.State.LastError)
+	}
+}
+
+func TestCronService_OneTimeJobNotDeletedOnHandlerError(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
+	cs := mustNewCronService(t, storePath)
+	cs.SetOnJob(func(job *CronJob) (string, error) {
+		return "", os.ErrInvalid
+	})
+
+	atMS := time.Now().UnixMilli() + 60_000
+	job, err := cs.AddJob("one-shot", CronSchedule{Kind: "at", AtMS: &atMS}, "hello", false, "cli", "direct")
+	if err != nil {
+		t.Fatalf("AddJob failed: %v", err)
+	}
+
+	cs.executeJobByID(job.ID)
+	var found *CronJob
+	for _, candidate := range cs.ListJobs(true) {
+		if candidate.ID == job.ID {
+			c := candidate
+			found = &c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected one-time job to remain persisted after error")
+	}
+	if found.State.LastStatus != "error" {
+		t.Fatalf("expected one-time failed job status=error, got %q", found.State.LastStatus)
+	}
+	if found.Enabled {
+		t.Fatalf("expected one-time failed job to be disabled after terminal failure")
+	}
+}
+
+func TestCronService_CorruptStoreRecovered(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
+	if err := os.MkdirAll(filepath.Dir(storePath), 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.WriteFile(storePath, []byte("{invalid-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt store failed: %v", err)
+	}
+
+	cs, err := NewCronService(storePath, nil)
+	if err != nil {
+		t.Fatalf("NewCronService should recover corrupt store, got %v", err)
+	}
+	if got := len(cs.ListJobs(true)); got != 0 {
+		t.Fatalf("expected recovered service to start with empty jobs, got %d", got)
+	}
+	backups, globErr := filepath.Glob(storePath + ".corrupt.*")
+	if globErr != nil {
+		t.Fatalf("glob backup failed: %v", globErr)
+	}
+	if len(backups) == 0 {
+		t.Fatalf("expected backup file for corrupt store")
 	}
 }

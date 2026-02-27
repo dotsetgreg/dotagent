@@ -14,9 +14,11 @@ func TestShouldApplyPersonaSyncFastPath(t *testing.T) {
 		{name: "question with explicit rename cue", input: "Can you call me Greg?", wantRun: true},
 		{name: "style directive", input: "Please be more concise.", wantRun: true},
 		{name: "language preference", input: "Could you speak in Spanish?", wantRun: true},
-		{name: "durable preference", input: "I prefer concise responses.", wantRun: true},
+		{name: "durable preference async only", input: "I prefer concise responses.", wantRun: false},
 		{name: "session intent", input: "For this session, focus on shipping speed.", wantRun: true},
 		{name: "question with weak memory word", input: "Can you remember this bug report?", wantRun: false},
+		{name: "save instruction explicit", input: "Please remember this: my timezone is America/New_York", wantRun: true},
+		{name: "casual statement no directive", input: "I live in Seattle and like coffee.", wantRun: false},
 	}
 
 	for _, tt := range tests {

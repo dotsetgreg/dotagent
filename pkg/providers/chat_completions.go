@@ -137,19 +137,19 @@ func (p *chatCompletionsProvider) Chat(ctx context.Context, messages []Message, 
 	if streaming {
 		result, err := parseChatCompletionsStreamResponse(resp.Body, streamCallback)
 		if err != nil {
-			return nil, fmt.Errorf("parse %s stream response: %w", p.providerName, err)
+			return nil, NormalizeProviderError(p.providerName, fmt.Errorf("parse %s stream response: %w", p.providerName, err))
 		}
 		return result, nil
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read %s response: %w", p.providerName, err)
+		return nil, NormalizeProviderError(p.providerName, fmt.Errorf("read %s response: %w", p.providerName, err))
 	}
 
 	result, err := parseChatCompletionsResponse(body)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s response: %w", p.providerName, err)
+		return nil, NormalizeProviderError(p.providerName, fmt.Errorf("parse %s response: %w", p.providerName, err))
 	}
 	return result, nil
 }
@@ -400,6 +400,7 @@ func parseChatCompletionsStreamResponse(r io.Reader, onDelta func(string)) (*LLM
 		content      strings.Builder
 		finishReason string
 		usage        *UsageInfo
+		malformed    int
 	)
 
 	for scanner.Scan() {
@@ -433,6 +434,10 @@ func parseChatCompletionsStreamResponse(r io.Reader, onDelta func(string)) (*LLM
 			Usage *UsageInfo `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			malformed++
+			if malformed > 4 {
+				return nil, fmt.Errorf("too many malformed stream chunks (%d)", malformed)
+			}
 			continue
 		}
 		if chunk.Usage != nil {

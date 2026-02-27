@@ -133,6 +133,33 @@ func TestEditTool_EditFile_MultipleMatches(t *testing.T) {
 	}
 }
 
+func TestEditTool_EditFile_MultipleMatchesWithMatchIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.txt")
+	os.WriteFile(testFile, []byte("test test test"), 0644)
+
+	tool := NewEditFileTool(tmpDir, true)
+	ctx := context.Background()
+	args := map[string]interface{}{
+		"path":        testFile,
+		"old_text":    "test",
+		"new_text":    "done",
+		"match_index": 2,
+	}
+
+	result := tool.Execute(ctx, args)
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if got := string(content); got != "test done test" {
+		t.Fatalf("expected only second occurrence to change, got %q", got)
+	}
+}
+
 // TestEditTool_EditFile_OutsideAllowedDir verifies error when path is outside allowed directory
 func TestEditTool_EditFile_OutsideAllowedDir(t *testing.T) {
 	tmpDir := t.TempDir()

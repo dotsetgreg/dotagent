@@ -68,20 +68,22 @@ func (t *ConnectorProxyTool) Execute(ctx context.Context, args map[string]interf
 		return ErrorResult(fmt.Sprintf("connector invoke failed: %v", err)).WithError(err)
 	}
 	content := strings.TrimSpace(result.Content)
+	userContent := strings.TrimSpace(result.UserContent)
 	if result.IsError {
 		if content == "" {
 			content = "connector invocation failed"
 		}
 		return ErrorResult(content)
 	}
-	if strings.TrimSpace(result.UserContent) != "" {
+	if userContent != "" {
 		return &ToolResult{
-			ForLLM:  valueOr(content, result.UserContent),
-			ForUser: result.UserContent,
+			ForLLM:  valueOr(content, userContent),
+			ForUser: userContent,
 		}
 	}
 	if content == "" {
-		content = "Connector invocation completed."
+		err := fmt.Errorf("connector returned empty success payload for target %q", t.target)
+		return ErrorResult(err.Error()).WithError(err)
 	}
 	return UserResult(content)
 }

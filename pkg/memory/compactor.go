@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -45,6 +46,8 @@ type SessionCompactor struct {
 	summarize SummaryFunc
 	cfg       CompactorConfig
 }
+
+var ErrCompactionSummaryUnreliable = errors.New("compaction summary unreliable; archival aborted")
 
 func NewSessionCompactor(store Store, summarize SummaryFunc, opts ...CompactorConfig) *SessionCompactor {
 	cfg := CompactorConfig{
@@ -171,6 +174,21 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 	if strings.TrimSpace(summary) == "" {
 		summary = fallbackSummary(existingSummary, toArchive)
 		recoveryMode = "heuristic_emergency"
+	}
+	if recoveryMode == "heuristic_emergency" && c.summarize != nil {
+		_ = c.store.CheckpointCompaction(ctx, compactionID, map[string]string{
+			"phase":         "summary_unreliable",
+			"recovery_mode": recoveryMode,
+			"reason":        "heuristic_only_fallback",
+		})
+		_ = c.store.FailCompaction(ctx, compactionID, ErrCompactionSummaryUnreliable.Error())
+		hookPayload.RecoveryMode = recoveryMode
+		hookPayload.Stage = "summary_unreliable"
+		retErr = ErrCompactionSummaryUnreliable
+		return retErr
+	}
+	if recoveryMode == "heuristic_emergency" && c.summarize == nil {
+		recoveryMode = "heuristic_no_summarizer"
 	}
 	hookPayload.RecoveryMode = recoveryMode
 	hookPayload.SummaryLength = len(summary)
@@ -588,19 +606,30 @@ func buildSessionSnapshot(ctx context.Context, store Store, sessionKey, userID, 
 
 	// Preserve unresolved question continuity from compacted user turns.
 	for _, ev := range events {
-		if ev.Role != "user" {
-			continue
-		}
 		content := strings.TrimSpace(ev.Content)
 		if content == "" {
 			continue
 		}
+		snippet := compactionSnippet(content, 220)
 		if strings.Contains(content, "?") && len(openLoops) < 8 {
-			add(&openLoops, content)
+			add(&openLoops, snippet)
 		}
 		normalizedContent, _ := normalizeIntentQuery(content)
-		if containsAnyIntentPhrase(normalizedContent, []string{"need to", "todo", "follow up", "pending", "still need", "finish"}) {
-			add(&tasks, content)
+		if containsAnyIntentPhrase(normalizedContent, []string{"need to", "todo", "follow up", "pending", "still need", "finish", "next step", "remaining"}) {
+			add(&tasks, snippet)
+		}
+		switch strings.ToLower(strings.TrimSpace(ev.Role)) {
+		case "assistant":
+			if isAssistantCommitmentText(normalizedContent) {
+				add(&tasks, "Assistant commitment: "+snippet)
+			}
+			if isLikelyUnresolvedFailure(normalizedContent) {
+				add(&openLoops, "Unresolved assistant failure: "+snippet)
+			}
+		case "tool":
+			if isLikelyUnresolvedFailure(normalizedContent) {
+				add(&openLoops, "Tool failure: "+snippet)
+			}
 		}
 	}
 
@@ -615,4 +644,24 @@ func buildSessionSnapshot(ctx context.Context, store Store, sessionKey, userID, 
 		Summary:      strings.TrimSpace(summary),
 		CompactionID: compactionID,
 	}, nil
+}
+
+func compactionSnippet(content string, max int) string {
+	content = strings.TrimSpace(content)
+	if max <= 0 || len(content) <= max {
+		return content
+	}
+	return content[:max] + "..."
+}
+
+func isAssistantCommitmentText(normalizedContent string) bool {
+	return containsAnyIntentPhrase(normalizedContent, []string{
+		"i will", "i'll", "i can do that", "next i will", "i am going to", "let me",
+	})
+}
+
+func isLikelyUnresolvedFailure(normalizedContent string) bool {
+	return containsAnyIntentPhrase(normalizedContent, []string{
+		"failed", "error", "unable", "timed out", "timeout", "permission denied", "not found",
+	})
 }

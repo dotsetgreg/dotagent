@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -91,7 +92,7 @@ func (t *ReadFileTool) Name() string {
 }
 
 func (t *ReadFileTool) Description() string {
-	return "Read the contents of a file"
+	return "Read file contents with optional pagination via offset and max_chars"
 }
 
 func (t *ReadFileTool) Parameters() map[string]interface{} {
@@ -101,6 +102,14 @@ func (t *ReadFileTool) Parameters() map[string]interface{} {
 			"path": map[string]interface{}{
 				"type":        "string",
 				"description": "Path to the file to read",
+			},
+			"offset": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional character offset for paginated reads (default 0)",
+			},
+			"max_chars": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional maximum characters to return (default 8000, max 50000)",
 			},
 		},
 		"required": []string{"path"},
@@ -122,8 +131,43 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]interface{})
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to read file: %v", err))
 	}
+	text := string(content)
+	runes := []rune(text)
+	total := len(runes)
 
-	return NewToolResult(string(content))
+	offset, err := readOptionalInt(args, "offset", 0)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	if offset < 0 {
+		return ErrorResult("offset must be >= 0")
+	}
+	maxChars, err := readOptionalInt(args, "max_chars", 8000)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	if maxChars < 256 {
+		maxChars = 256
+	}
+	if maxChars > 50000 {
+		maxChars = 50000
+	}
+	if offset > total {
+		return ErrorResult(fmt.Sprintf("offset %d is beyond file length %d", offset, total))
+	}
+	end := offset + maxChars
+	if end > total {
+		end = total
+	}
+	out := string(runes[offset:end])
+	if end < total {
+		out += fmt.Sprintf(
+			"\n\n[read_file truncated: showing chars %d-%d of %d. Continue with {\"path\":\"%s\",\"offset\":%d,\"max_chars\":%d}]",
+			offset, end, total, path, end, maxChars,
+		)
+	}
+
+	return NewToolResult(out)
 }
 
 type WriteFileTool struct {
@@ -244,4 +288,33 @@ func (t *ListDirTool) Execute(ctx context.Context, args map[string]interface{}) 
 	}
 
 	return NewToolResult(result)
+}
+
+func readOptionalInt(args map[string]interface{}, key string, defaultValue int) (int, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return defaultValue, nil
+	}
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int32:
+		return int(v), nil
+	case int64:
+		return int(v), nil
+	case float64:
+		return int(v), nil
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return defaultValue, nil
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s must be an integer", key)
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
 }

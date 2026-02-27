@@ -27,7 +27,7 @@ func (t *EditFileTool) Name() string {
 }
 
 func (t *EditFileTool) Description() string {
-	return "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
+	return "Edit a file by replacing old_text with new_text. Use match_index when old_text appears multiple times."
 }
 
 func (t *EditFileTool) Parameters() map[string]interface{} {
@@ -45,6 +45,10 @@ func (t *EditFileTool) Parameters() map[string]interface{} {
 			"new_text": map[string]interface{}{
 				"type":        "string",
 				"description": "The text to replace with",
+			},
+			"match_index": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional 1-based occurrence index when old_text appears multiple times",
 			},
 		},
 		"required": []string{"path", "old_text", "new_text"},
@@ -88,17 +92,50 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]interface{})
 	}
 
 	count := strings.Count(contentStr, oldText)
-	if count > 1 {
-		return ErrorResult(fmt.Sprintf("old_text appears %d times. Please provide more context to make it unique", count))
+	matchIndex, err := readOptionalInt(args, "match_index", 0)
+	if err != nil {
+		return ErrorResult(err.Error())
 	}
-
-	newContent := strings.Replace(contentStr, oldText, newText, 1)
+	if count > 1 {
+		if matchIndex <= 0 {
+			return ErrorResult(fmt.Sprintf("old_text appears %d times. Provide match_index (1-%d) to choose which occurrence to replace", count, count))
+		}
+		if matchIndex > count {
+			return ErrorResult(fmt.Sprintf("match_index %d is out of range; old_text appears %d times", matchIndex, count))
+		}
+	} else if matchIndex > 1 {
+		return ErrorResult("match_index is out of range for a single match")
+	}
+	targetIdx := firstMatchOffset(contentStr, oldText, matchIndex)
+	if targetIdx < 0 {
+		return ErrorResult("failed to resolve selected match_index")
+	}
+	newContent := contentStr[:targetIdx] + newText + contentStr[targetIdx+len(oldText):]
 
 	if err := os.WriteFile(resolvedPath, []byte(newContent), 0644); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to write file: %v", err))
 	}
 
 	return SilentResult(fmt.Sprintf("File edited: %s", path))
+}
+
+func firstMatchOffset(content, oldText string, matchIndex int) int {
+	if matchIndex <= 0 {
+		matchIndex = 1
+	}
+	searchFrom := 0
+	for i := 1; i <= matchIndex; i++ {
+		next := strings.Index(content[searchFrom:], oldText)
+		if next < 0 {
+			return -1
+		}
+		abs := searchFrom + next
+		if i == matchIndex {
+			return abs
+		}
+		searchFrom = abs + len(oldText)
+	}
+	return -1
 }
 
 type AppendFileTool struct {

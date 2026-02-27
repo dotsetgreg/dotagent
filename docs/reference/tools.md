@@ -8,12 +8,12 @@ Generated from runtime tool registration and tool descriptions.
 | --- | --- |
 | `append_file` | Append content to the end of a file |
 | `cron` | Schedule reminders, tasks, or system commands. IMPORTANT: When user asks to be reminded or scheduled, you MUST call this tool. Use 'at_seconds' for one-time reminders (e.g., 'remind me in 10 minutes' → at_seconds=600). Use 'every_seconds' ONLY for recurring tasks (e.g., 'every 2 hours' → every_seconds=7200). Use 'cron_expr' for complex recurring schedules. Use 'command' to execute shell commands directly. |
-| `edit_file` | Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file. |
+| `edit_file` | Edit a file by replacing old_text with new_text. Use match_index when old_text appears multiple times. |
 | `exec` | Execute a shell command and return its output. Use with caution. |
 | `list_dir` | List files and directories in a path |
 | `message` | Send a message to user on a chat channel. Use this when you want to communicate something. |
 | `process` | Manage long-running shell processes with lifecycle control. Actions: start, list, poll, write, kill, clear. |
-| `read_file` | Read the contents of a file |
+| `read_file` | Read file contents with optional pagination via offset and max_chars |
 | `session` | Inspect and operate on sessions. Actions: list, status, history, send, spawn. |
 | `spawn` | Spawn a subagent to handle a task in the background. Use this for complex or time-consuming tasks that can run independently. The subagent will complete the task and report back when done. |
 | `subagent` | Execute a subagent task synchronously and return the result. Use this for delegating specific tasks to an independent agent instance. Returns execution summary to user and full details to LLM. |

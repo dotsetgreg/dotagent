@@ -42,10 +42,23 @@ func (t *asyncContextProbeTool) Execute(ctx context.Context, args map[string]int
 	return AsyncResult("ok")
 }
 
+type namedTool struct{ name string }
+
+func (t *namedTool) Name() string        { return t.name }
+func (t *namedTool) Description() string { return t.name + " desc" }
+func (t *namedTool) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+}
+func (t *namedTool) Execute(ctx context.Context, args map[string]interface{}) *ToolResult {
+	return SilentResult("ok")
+}
+
 func TestToolRegistry_ExecuteWithContext_UsesRequestScopedContext(t *testing.T) {
 	registry := NewToolRegistry()
 	tool := &executionContextProbeTool{}
-	registry.Register(tool)
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("register probe: %v", err)
+	}
 
 	result := registry.ExecuteWithContext(context.Background(), "probe", map[string]interface{}{}, "discord", "chat-1", nil)
 	if result.IsError {
@@ -62,7 +75,9 @@ func TestToolRegistry_ExecuteWithContext_UsesRequestScopedContext(t *testing.T) 
 func TestToolRegistry_ExecuteWithContext_UsesRequestScopedAsyncCallback(t *testing.T) {
 	registry := NewToolRegistry()
 	tool := &asyncContextProbeTool{}
-	registry.Register(tool)
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("register async probe: %v", err)
+	}
 
 	callbackCalled := false
 	cb := func(ctx context.Context, result *ToolResult) {
@@ -107,5 +122,53 @@ func TestSanitizeToolArgs_RedactsSensitiveValues(t *testing.T) {
 	note, _ := nested["note"].(string)
 	if len(note) >= 400 {
 		t.Fatalf("expected long values to be truncated")
+	}
+}
+
+func TestToolRegistry_RegisterRejectsDuplicateNames(t *testing.T) {
+	registry := NewToolRegistry()
+	tool := &executionContextProbeTool{}
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("first register failed: %v", err)
+	}
+	if err := registry.Register(tool); err == nil {
+		t.Fatalf("expected duplicate registration error")
+	}
+}
+
+func TestToolRegistry_RegisterOverrideReplacesTool(t *testing.T) {
+	registry := NewToolRegistry()
+	first := &executionContextProbeTool{}
+	second := &executionContextProbeTool{}
+	if err := registry.Register(first); err != nil {
+		t.Fatalf("register first tool: %v", err)
+	}
+	if err := registry.RegisterOverride(second); err != nil {
+		t.Fatalf("override tool: %v", err)
+	}
+	got, ok := registry.Get("probe")
+	if !ok {
+		t.Fatalf("expected probe tool to exist")
+	}
+	if got != second {
+		t.Fatalf("expected overridden tool instance")
+	}
+}
+
+func TestToolRegistry_DefinitionsAreDeterministic(t *testing.T) {
+	registry := NewToolRegistry()
+	for _, name := range []string{"zeta", "alpha", "mike"} {
+		if err := registry.Register(&namedTool{name: name}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	defs := registry.ToProviderDefs()
+	if len(defs) != 3 {
+		t.Fatalf("expected 3 definitions, got %d", len(defs))
+	}
+	if defs[0].Function.Name != "alpha" || defs[1].Function.Name != "mike" || defs[2].Function.Name != "zeta" {
+		t.Fatalf("expected deterministic sorted definitions, got [%s, %s, %s]",
+			defs[0].Function.Name, defs[1].Function.Name, defs[2].Function.Name)
 	}
 }

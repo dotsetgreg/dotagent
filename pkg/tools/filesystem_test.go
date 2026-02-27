@@ -39,6 +39,30 @@ func TestFilesystemTool_ReadFile_Success(t *testing.T) {
 	}
 }
 
+func TestFilesystemTool_ReadFile_Paginated(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "paged.txt")
+	if err := os.WriteFile(testFile, []byte(strings.Repeat("abc", 1200)), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	tool := &ReadFileTool{}
+	result := tool.Execute(context.Background(), map[string]interface{}{
+		"path":      testFile,
+		"offset":    100,
+		"max_chars": 300,
+	})
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if !strings.Contains(result.ForLLM, "read_file truncated") {
+		t.Fatalf("expected truncated guidance, got: %s", result.ForLLM)
+	}
+	if !strings.Contains(result.ForLLM, "\"offset\":400") {
+		t.Fatalf("expected continuation offset guidance, got: %s", result.ForLLM)
+	}
+}
+
 // TestFilesystemTool_ReadFile_NotFound verifies error handling for missing file
 func TestFilesystemTool_ReadFile_NotFound(t *testing.T) {
 	tool := &ReadFileTool{}

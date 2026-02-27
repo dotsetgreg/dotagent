@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/dotsetgreg/dotagent/pkg/logger"
 )
 
 type sessionLockOptions struct {
@@ -40,6 +42,7 @@ type sessionLockManager struct {
 type heldSessionFileLock struct {
 	Path       string
 	AcquiredAt time.Time
+	Warned     bool
 }
 
 type sessionLockRef struct {
@@ -266,10 +269,7 @@ func (m *sessionLockManager) isLockFileStale(lockPath string) (bool, error) {
 
 	createdAt := strings.TrimSpace(payload.CreatedAt)
 	if createdAt != "" {
-		if ts, parseErr := time.Parse(time.RFC3339Nano, createdAt); parseErr == nil {
-			if m.opts.MaxHoldDuration > 0 && now.Sub(ts) > m.opts.MaxHoldDuration {
-				return true, nil
-			}
+		if _, parseErr := time.Parse(time.RFC3339Nano, createdAt); parseErr == nil {
 			return false, nil
 		}
 	}
@@ -300,8 +300,17 @@ func (m *sessionLockManager) pruneStaleHeldLocks() {
 		if now.Sub(held.AcquiredAt) <= m.opts.MaxHoldDuration {
 			continue
 		}
-		_ = os.Remove(held.Path)
-		delete(m.heldFile, key)
+		if held.Warned {
+			continue
+		}
+		logger.WarnCF("agent", "Session lock exceeded max hold duration; leaving lock intact to preserve exclusivity", map[string]interface{}{
+			"lock_path":      held.Path,
+			"held_seconds":   now.Sub(held.AcquiredAt).Seconds(),
+			"max_hold_secs":  m.opts.MaxHoldDuration.Seconds(),
+			"workspace_root": m.opts.WorkspaceRoot,
+		})
+		held.Warned = true
+		m.heldFile[key] = held
 	}
 }
 

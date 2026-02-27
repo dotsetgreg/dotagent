@@ -70,7 +70,7 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {
 	return false
 }
 
-func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []string, metadata map[string]string) {
+func (c *BaseChannel) HandleMessage(senderID, chatID, messageID, content string, media []string, metadata map[string]string) {
 	if !c.IsAllowed(senderID) {
 		return
 	}
@@ -86,6 +86,7 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		Content:    content,
 		Media:      media,
 		SessionKey: sessionKey,
+		MessageID:  strings.TrimSpace(messageID),
 		Metadata:   metadata,
 	}
 

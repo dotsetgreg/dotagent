@@ -420,7 +420,11 @@ func gatewayCmd() {
 		})
 
 	// Setup cron tool and service
-	cronService := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
+	cronService, err := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
+	if err != nil {
+		fmt.Printf("Failed to setup cron tool: %v\n", err)
+		os.Exit(1)
+	}
 
 	heartbeatService := heartbeat.NewHeartbeatService(
 		cfg.WorkspacePath(),
@@ -584,11 +588,14 @@ func getConfigPath() string {
 	return filepath.Join(home, ".dotagent", "config.json")
 }
 
-func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) *cron.CronService {
+func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) (*cron.CronService, error) {
 	cronStorePath := filepath.Join(workspace, "cron", "jobs.json")
 
 	// Create cron service
-	cronService := cron.NewCronService(cronStorePath, nil)
+	cronService, err := cron.NewCronService(cronStorePath, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create and register CronTool
 	cronTool := tools.NewCronTool(cronService, agentLoop, msgBus, workspace, restrict)
@@ -600,7 +607,7 @@ func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace
 		return result, nil
 	})
 
-	return cronService
+	return cronService, nil
 }
 
 func loadConfig() (*config.Config, error) {
@@ -664,7 +671,11 @@ func cronHelp() {
 }
 
 func cronListCmd(storePath string) {
-	cs := cron.NewCronService(storePath, nil)
+	cs, err := cron.NewCronService(storePath, nil)
+	if err != nil {
+		fmt.Printf("Error loading cron store: %v\n", err)
+		return
+	}
 	jobs := cs.ListJobs(true) // Show all jobs, including disabled
 
 	if len(jobs) == 0 {
@@ -780,7 +791,11 @@ func cronAddCmd(storePath string) {
 		}
 	}
 
-	cs := cron.NewCronService(storePath, nil)
+	cs, err := cron.NewCronService(storePath, nil)
+	if err != nil {
+		fmt.Printf("Error loading cron store: %v\n", err)
+		return
+	}
 	job, err := cs.AddJob(name, schedule, message, deliver, channel, to)
 	if err != nil {
 		fmt.Printf("Error adding job: %v\n", err)
@@ -791,7 +806,11 @@ func cronAddCmd(storePath string) {
 }
 
 func cronRemoveCmd(storePath, jobID string) {
-	cs := cron.NewCronService(storePath, nil)
+	cs, err := cron.NewCronService(storePath, nil)
+	if err != nil {
+		fmt.Printf("Error loading cron store: %v\n", err)
+		return
+	}
 	if cs.RemoveJob(jobID) {
 		fmt.Printf("✓ Removed job %s\n", jobID)
 	} else {
@@ -806,7 +825,11 @@ func cronEnableCmd(storePath string, disable bool) {
 	}
 
 	jobID := os.Args[3]
-	cs := cron.NewCronService(storePath, nil)
+	cs, err := cron.NewCronService(storePath, nil)
+	if err != nil {
+		fmt.Printf("Error loading cron store: %v\n", err)
+		return
+	}
 	enabled := !disable
 
 	job := cs.EnableJob(jobID, enabled)

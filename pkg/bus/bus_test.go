@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestMessageBus_PublishInboundDropsWhenBufferFull(t *testing.T) {
-	mb := NewMessageBus()
+	mb := NewMessageBusWithOptions(MessageBusOptions{
+		InboundPublish: PublishConfig{Timeout: 5 * time.Millisecond, MaxAttempts: 1},
+	})
 	defer mb.Close()
 
 	for i := 0; i < cap(mb.inbound); i++ {
@@ -26,7 +29,9 @@ func TestMessageBus_PublishInboundDropsWhenBufferFull(t *testing.T) {
 }
 
 func TestMessageBus_PublishOutboundDropsWhenBufferFull(t *testing.T) {
-	mb := NewMessageBus()
+	mb := NewMessageBusWithOptions(MessageBusOptions{
+		OutboundPublish: PublishConfig{Timeout: 5 * time.Millisecond, MaxAttempts: 1},
+	})
 	defer mb.Close()
 
 	for i := 0; i < cap(mb.outbound); i++ {

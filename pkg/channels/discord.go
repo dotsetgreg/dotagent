@@ -19,6 +19,7 @@ const (
 	typingRefreshInterval = 8 * time.Second
 	streamPreviewLimit    = 1600
 	streamEditMinInterval = 900 * time.Millisecond
+	discordAPIMaxWorkers  = 16
 )
 
 type DiscordChannel struct {
@@ -29,6 +30,7 @@ type DiscordChannel struct {
 	typingMu sync.Mutex
 	stream   map[string]*streamDraft
 	streamMu sync.Mutex
+	apiSlots chan struct{}
 }
 
 type typingSession struct {
@@ -57,6 +59,7 @@ func NewDiscordChannel(cfg config.DiscordConfig, bus *bus.MessageBus) (*DiscordC
 		config:      cfg,
 		typing:      make(map[string]*typingSession),
 		stream:      make(map[string]*streamDraft),
+		apiSlots:    make(chan struct{}, discordAPIMaxWorkers),
 	}, nil
 }
 
@@ -352,6 +355,7 @@ func (c *DiscordChannel) finalizeStreamDraft(ctx context.Context, key, channelID
 		if err := c.editMessage(ctx, channelID, draft.messageID, chunks[0]); err == nil {
 			for _, chunk := range chunks[1:] {
 				if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+					c.sendStreamFinalizeFailureNotice(ctx, channelID, err)
 					return err
 				}
 			}
@@ -360,6 +364,7 @@ func (c *DiscordChannel) finalizeStreamDraft(ctx context.Context, key, channelID
 	}
 	for _, chunk := range chunks {
 		if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+			c.sendStreamFinalizeFailureNotice(ctx, channelID, err)
 			return err
 		}
 	}
@@ -429,6 +434,9 @@ func ensureClosedMarkdownFence(content string) string {
 func (c *DiscordChannel) sendMessage(ctx context.Context, channelID, content string) (*discordgo.Message, error) {
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
+	if err := c.acquireAPISlot(sendCtx); err != nil {
+		return nil, err
+	}
 
 	type result struct {
 		msg *discordgo.Message
@@ -436,6 +444,7 @@ func (c *DiscordChannel) sendMessage(ctx context.Context, channelID, content str
 	}
 	done := make(chan result, 1)
 	go func() {
+		defer c.releaseAPISlot()
 		msg, err := c.session.ChannelMessageSend(channelID, content)
 		done <- result{msg: msg, err: err}
 	}()
@@ -454,9 +463,13 @@ func (c *DiscordChannel) sendMessage(ctx context.Context, channelID, content str
 func (c *DiscordChannel) editMessage(ctx context.Context, channelID, messageID, content string) error {
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
+	if err := c.acquireAPISlot(sendCtx); err != nil {
+		return err
+	}
 
 	done := make(chan error, 1)
 	go func() {
+		defer c.releaseAPISlot()
 		_, err := c.session.ChannelMessageEdit(channelID, messageID, content)
 		done <- err
 	}()
@@ -565,6 +578,47 @@ func appendContent(content, suffix string) string {
 	return content + "\n" + suffix
 }
 
+func (c *DiscordChannel) acquireAPISlot(ctx context.Context) error {
+	if c.apiSlots == nil {
+		return nil
+	}
+	select {
+	case c.apiSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("discord api worker acquisition timeout: %w", ctx.Err())
+	}
+}
+
+func (c *DiscordChannel) releaseAPISlot() {
+	if c.apiSlots == nil {
+		return
+	}
+	select {
+	case <-c.apiSlots:
+	default:
+	}
+}
+
+func (c *DiscordChannel) sendStreamFinalizeFailureNotice(ctx context.Context, channelID string, originalErr error) {
+	if strings.TrimSpace(channelID) == "" {
+		return
+	}
+	notice := "⚠️ I hit a delivery error while finalizing that response. Please ask me to resend."
+	if originalErr != nil {
+		logger.ErrorCF("discord", "Stream finalize delivery failed", map[string]any{
+			"channel_id": channelID,
+			"error":      originalErr.Error(),
+		})
+	}
+	if _, err := c.sendMessage(ctx, channelID, notice); err != nil {
+		logger.ErrorCF("discord", "Failed to send stream finalize failure notice", map[string]any{
+			"channel_id": channelID,
+			"error":      err.Error(),
+		})
+	}
+}
+
 func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m == nil || m.Author == nil {
 		return
@@ -629,5 +683,5 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
 		"is_dm":        fmt.Sprintf("%t", m.GuildID == ""),
 	}
 
-	c.HandleMessage(senderID, m.ChannelID, content, mediaPaths, metadata)
+	c.HandleMessage(senderID, m.ChannelID, m.ID, content, mediaPaths, metadata)
 }

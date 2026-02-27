@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/dotsetgreg/dotagent/pkg/logger"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
@@ -14,9 +17,16 @@ import (
 )
 
 type ContextBuilder struct {
-	workspace    string
-	skillsLoader *skills.SkillsLoader
-	tools        *tools.ToolRegistry // Direct reference to tool registry
+	workspace             string
+	skillsLoader          *skills.SkillsLoader
+	tools                 *tools.ToolRegistry // Direct reference to tool registry
+	bootstrapConflictOnce sync.Once
+}
+
+type SystemPromptMetadata struct {
+	Hash              string
+	BootstrapFile     string
+	BootstrapConflict bool
 }
 
 func getGlobalConfigDir() string {
@@ -105,15 +115,23 @@ func (cb *ContextBuilder) buildToolsSection() string {
 }
 
 func (cb *ContextBuilder) BuildSystemPrompt() string {
+	prompt, _ := cb.BuildSystemPromptWithMetadata()
+	return prompt
+}
+
+func (cb *ContextBuilder) BuildSystemPromptWithMetadata() (string, SystemPromptMetadata) {
+	meta := SystemPromptMetadata{}
 	parts := []string{}
 
 	// Core identity section
 	parts = append(parts, cb.getIdentity())
 
 	// Bootstrap files
-	bootstrapContent := cb.LoadBootstrapFiles()
+	bootstrapContent, bootstrapFile, bootstrapConflict := cb.loadBootstrapSelection()
 	if bootstrapContent != "" {
 		parts = append(parts, bootstrapContent)
+		meta.BootstrapFile = bootstrapFile
+		meta.BootstrapConflict = bootstrapConflict
 	}
 
 	// Skills - show summary, AI can read full content with read_file tool
@@ -126,29 +144,76 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 %s`, skillsSummary))
 	}
 
-	// Join with "---" separator
-	return strings.Join(parts, "\n\n---\n\n")
+	prompt := strings.Join(parts, "\n\n---\n\n")
+	sum := sha1.Sum([]byte(prompt))
+	meta.Hash = hex.EncodeToString(sum[:16])
+	return prompt, meta
 }
 
 func (cb *ContextBuilder) LoadBootstrapFiles() string {
-	// Keep bootstrap static and minimal. Dynamic persona data is injected from
-	// memory/persona context to avoid duplicating identity content in prompts.
-	agentCandidates := []string{"AGENT.md", "AGENTS.md"}
-	for _, filename := range agentCandidates {
-		filePath := filepath.Join(cb.workspace, filename)
-		data, err := os.ReadFile(filePath)
+	content, _, _ := cb.loadBootstrapSelection()
+	return content
+}
+
+func normalizeBootstrapContent(in string) string {
+	in = strings.ReplaceAll(in, "\r\n", "\n")
+	return strings.TrimSpace(in)
+}
+
+func (cb *ContextBuilder) loadBootstrapSelection() (content string, sourceFile string, conflict bool) {
+	const (
+		agentsFile = "AGENTS.md"
+		agentFile  = "AGENT.md"
+	)
+
+	readBootstrap := func(name string) (string, bool) {
+		data, err := os.ReadFile(filepath.Join(cb.workspace, name))
 		if err != nil {
-			continue
+			return "", false
 		}
-		return fmt.Sprintf("## %s\n\n%s", filename, strings.TrimSpace(string(data)))
+		normalized := normalizeBootstrapContent(string(data))
+		if normalized == "" {
+			return "", false
+		}
+		return normalized, true
 	}
-	return ""
+
+	agentsContent, hasAgents := readBootstrap(agentsFile)
+	agentContent, hasAgent := readBootstrap(agentFile)
+	switch {
+	case hasAgents:
+		content = fmt.Sprintf("## %s\n\n%s", agentsFile, agentsContent)
+		sourceFile = agentsFile
+	case hasAgent:
+		content = fmt.Sprintf("## %s\n\n%s", agentFile, agentContent)
+		sourceFile = agentFile
+	default:
+		return "", "", false
+	}
+
+	if hasAgents && hasAgent && agentsContent != agentContent {
+		conflict = true
+		cb.bootstrapConflictOnce.Do(func() {
+			logger.WarnCF("agent", "Bootstrap conflict detected; applying deterministic precedence", map[string]interface{}{
+				"selected":    agentsFile,
+				"ignored":     agentFile,
+				"workspace":   cb.workspace,
+				"determinism": "enabled",
+			})
+		})
+		notice := "## Bootstrap Notice\n\nBoth AGENTS.md and AGENT.md are present with different content. AGENTS.md is applied by deterministic precedence."
+		content = notice + "\n\n" + content
+	}
+	return content, sourceFile, conflict
 }
 
 func (cb *ContextBuilder) BuildMessages(history []providers.Message, summary string, recalledMemory string, currentMessage string, media []string, channel, chatID string) []providers.Message {
-	messages := []providers.Message{}
-
 	systemPrompt := cb.BuildSystemPrompt()
+	return cb.BuildMessagesWithSystemPrompt(systemPrompt, history, summary, recalledMemory, currentMessage, media, channel, chatID)
+}
+
+func (cb *ContextBuilder) BuildMessagesWithSystemPrompt(systemPrompt string, history []providers.Message, summary string, recalledMemory string, currentMessage string, media []string, channel, chatID string) []providers.Message {
+	messages := []providers.Message{}
 
 	// Log system prompt summary for debugging (debug mode only)
 	logger.DebugCF("agent", "System prompt built",

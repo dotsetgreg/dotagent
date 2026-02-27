@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,6 +83,8 @@ type PersonaManager struct {
 	fileHashes  map[string]string
 }
 
+var ErrPersonaExtractorParse = errors.New("persona extractor parse error")
+
 func NewPersonaManager(store Store, workspace string, extractor PersonaExtractionFunc, fileSync PersonaFileSyncMode, policy *PersonaPolicyEngine) *PersonaManager {
 	if fileSync == "" {
 		fileSync = PersonaFileSyncExportOnly
@@ -124,6 +127,7 @@ func (pm *PersonaManager) EmitCandidatesForTurn(ctx context.Context, sessionKey,
 	heuristics := pm.extractHeuristicCandidates(turnEvents, sessionKey, turnID, userID, agentID)
 
 	llmCandidates := []PersonaUpdateCandidate{}
+	extractionOutcome := "llm_empty"
 	if pm.extractor != nil {
 		req := PersonaExtractionRequest{
 			UserID:          userID,
@@ -138,8 +142,28 @@ func (pm *PersonaManager) EmitCandidatesForTurn(ctx context.Context, sessionKey,
 				c.Source = "llm"
 				llmCandidates = append(llmCandidates, c)
 			}
+			if len(extracted) > 0 {
+				extractionOutcome = "llm_ok"
+			}
+		} else {
+			switch {
+			case errors.Is(extErr, context.DeadlineExceeded), errors.Is(extErr, context.Canceled):
+				extractionOutcome = "llm_timeout"
+			case errors.Is(extErr, ErrPersonaExtractorParse):
+				extractionOutcome = "llm_parse_error"
+			default:
+				extractionOutcome = "llm_error"
+			}
 		}
+	} else {
+		extractionOutcome = "llm_disabled"
 	}
+	_ = pm.store.AddMetric(ctx, "memory.persona.extractor.outcome", 1, map[string]string{
+		"user_id":     userID,
+		"session_key": sessionKey,
+		"turn_id":     turnID,
+		"outcome":     extractionOutcome,
+	})
 
 	candidates := pm.normalizeCandidates(append(heuristics, llmCandidates...), sessionKey, turnID, userID, agentID)
 	if len(candidates) == 0 {

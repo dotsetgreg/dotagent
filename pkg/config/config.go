@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/caarlos0/env/v11"
@@ -173,6 +174,7 @@ type MemoryConfig struct {
 	PersonaFileSyncMode                 string   `json:"persona_file_sync_mode" env:"DOTAGENT_MEMORY_PERSONA_FILE_SYNC_MODE"`
 	PersonaPolicyMode                   string   `json:"persona_policy_mode" env:"DOTAGENT_MEMORY_PERSONA_POLICY_MODE"`
 	PersonaMinConfidence                float64  `json:"persona_min_confidence" env:"DOTAGENT_MEMORY_PERSONA_MIN_CONFIDENCE"`
+	PersonaSyncTimeoutMS                int      `json:"persona_sync_timeout_ms" env:"DOTAGENT_MEMORY_PERSONA_SYNC_TIMEOUT_MS"`
 	CompactionSummaryTimeoutSeconds     int      `json:"compaction_summary_timeout_seconds" env:"DOTAGENT_MEMORY_COMPACTION_SUMMARY_TIMEOUT_SECONDS"`
 	CompactionChunkChars                int      `json:"compaction_chunk_chars" env:"DOTAGENT_MEMORY_COMPACTION_CHUNK_CHARS"`
 	CompactionMaxTranscriptChars        int      `json:"compaction_max_transcript_chars" env:"DOTAGENT_MEMORY_COMPACTION_MAX_TRANSCRIPT_CHARS"`
@@ -269,6 +271,7 @@ func DefaultConfig() *Config {
 			PersonaFileSyncMode:                 "export_only",
 			PersonaPolicyMode:                   "balanced",
 			PersonaMinConfidence:                0.52,
+			PersonaSyncTimeoutMS:                2200,
 			CompactionSummaryTimeoutSeconds:     60,
 			CompactionChunkChars:                9000,
 			CompactionMaxTranscriptChars:        48000,
@@ -302,6 +305,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if err := env.Parse(cfg); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -343,4 +349,156 @@ func expandHome(path string) string {
 		return home
 	}
 	return path
+}
+
+// Validate enforces configuration coherence so startup fails fast on
+// misconfiguration instead of degrading at runtime.
+func (c *Config) Validate() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	errs := make([]string, 0, 16)
+	addErr := func(format string, args ...interface{}) {
+		errs = append(errs, fmt.Sprintf(format, args...))
+	}
+	inRangeInt := func(name string, value, min, max int) {
+		if value < min || value > max {
+			addErr("%s must be between %d and %d (got %d)", name, min, max, value)
+		}
+	}
+	positiveInt := func(name string, value int) {
+		if value <= 0 {
+			addErr("%s must be > 0 (got %d)", name, value)
+		}
+	}
+	validateThresholdPair := func(warnName string, warn int, criticalName string, critical int) {
+		positiveInt(warnName, warn)
+		positiveInt(criticalName, critical)
+		if warn > 0 && critical > 0 && warn >= critical {
+			addErr("%s must be < %s (got %d >= %d)", warnName, criticalName, warn, critical)
+		}
+	}
+
+	if strings.TrimSpace(c.Agents.Defaults.Workspace) == "" {
+		addErr("agents.defaults.workspace is required")
+	}
+	if strings.TrimSpace(c.Agents.Defaults.Provider) == "" {
+		addErr("agents.defaults.provider is required")
+	}
+	if strings.TrimSpace(c.Agents.Defaults.Model) == "" {
+		addErr("agents.defaults.model is required")
+	}
+	positiveInt("agents.defaults.max_tokens", c.Agents.Defaults.MaxTokens)
+	positiveInt("agents.defaults.max_tool_iterations", c.Agents.Defaults.MaxToolIterations)
+	positiveInt("agents.defaults.max_concurrent_runs", c.Agents.Defaults.MaxConcurrentRuns)
+	if c.Agents.Defaults.Temperature < 0 || c.Agents.Defaults.Temperature > 2 {
+		addErr("agents.defaults.temperature must be between 0 and 2 (got %.3f)", c.Agents.Defaults.Temperature)
+	}
+	if c.Agents.Defaults.SessionFileLockEnabled {
+		positiveInt("agents.defaults.session_lock_timeout_ms", c.Agents.Defaults.SessionLockTimeoutMS)
+		positiveInt("agents.defaults.session_lock_stale_seconds", c.Agents.Defaults.SessionLockStaleSeconds)
+		positiveInt("agents.defaults.session_lock_max_hold_seconds", c.Agents.Defaults.SessionLockMaxHoldSeconds)
+		if c.Agents.Defaults.SessionLockStaleSeconds <= c.Agents.Defaults.SessionLockMaxHoldSeconds {
+			addErr("agents.defaults.session_lock_stale_seconds must be > session_lock_max_hold_seconds (%d <= %d)",
+				c.Agents.Defaults.SessionLockStaleSeconds, c.Agents.Defaults.SessionLockMaxHoldSeconds)
+		}
+	}
+
+	inRangeInt("gateway.port", c.Gateway.Port, 1, 65535)
+	if strings.TrimSpace(c.Gateway.Host) == "" {
+		addErr("gateway.host is required")
+	}
+
+	if c.Heartbeat.Enabled {
+		inRangeInt("heartbeat.interval", c.Heartbeat.Interval, 5, 24*60)
+	}
+
+	positiveInt("tools.web.brave.max_results", c.Tools.Web.Brave.MaxResults)
+	positiveInt("tools.web.duckduckgo.max_results", c.Tools.Web.DuckDuckGo.MaxResults)
+
+	positiveInt("memory.max_recall_items", c.Memory.MaxRecallItems)
+	positiveInt("memory.candidate_limit", c.Memory.CandidateLimit)
+	if c.Memory.CandidateLimit < c.Memory.MaxRecallItems {
+		addErr("memory.candidate_limit must be >= memory.max_recall_items (%d < %d)",
+			c.Memory.CandidateLimit, c.Memory.MaxRecallItems)
+	}
+	positiveInt("memory.worker_poll_ms", c.Memory.WorkerPollMS)
+	positiveInt("memory.worker_lease_seconds", c.Memory.WorkerLeaseSeconds)
+	positiveInt("memory.embedding_batch_size", c.Memory.EmbeddingBatchSize)
+	positiveInt("memory.embedding_concurrency", c.Memory.EmbeddingConcurrency)
+	validateThresholdPair(
+		"memory.tool_loop_signature_warn_threshold", c.Memory.ToolLoopSignatureWarnThreshold,
+		"memory.tool_loop_signature_critical_threshold", c.Memory.ToolLoopSignatureCriticalThreshold,
+	)
+	validateThresholdPair(
+		"memory.tool_loop_drift_warn_threshold", c.Memory.ToolLoopDriftWarnThreshold,
+		"memory.tool_loop_drift_critical_threshold", c.Memory.ToolLoopDriftCriticalThreshold,
+	)
+	validateThresholdPair(
+		"memory.tool_loop_polling_warn_threshold", c.Memory.ToolLoopPollingWarnThreshold,
+		"memory.tool_loop_polling_critical_threshold", c.Memory.ToolLoopPollingCriticalThreshold,
+	)
+	validateThresholdPair(
+		"memory.tool_loop_no_progress_warn_threshold", c.Memory.ToolLoopNoProgressWarnThreshold,
+		"memory.tool_loop_no_progress_critical_threshold", c.Memory.ToolLoopNoProgressCriticalThreshold,
+	)
+	validateThresholdPair(
+		"memory.tool_loop_ping_pong_warn_threshold", c.Memory.ToolLoopPingPongWarnThreshold,
+		"memory.tool_loop_ping_pong_critical_threshold", c.Memory.ToolLoopPingPongCriticalThreshold,
+	)
+	positiveInt("memory.tool_loop_global_circuit_threshold", c.Memory.ToolLoopGlobalCircuitThreshold)
+	if c.Memory.ToolLoopGlobalCircuitThreshold < c.Memory.ToolLoopNoProgressCriticalThreshold {
+		addErr("memory.tool_loop_global_circuit_threshold must be >= memory.tool_loop_no_progress_critical_threshold (%d < %d)",
+			c.Memory.ToolLoopGlobalCircuitThreshold, c.Memory.ToolLoopNoProgressCriticalThreshold)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(c.Memory.ContextPruningMode)) {
+	case "", "off", "disabled", "conservative", "balanced", "aggressive":
+	default:
+		addErr("memory.context_pruning_mode must be one of off|disabled|conservative|balanced|aggressive (got %q)",
+			c.Memory.ContextPruningMode)
+	}
+	if strings.ToLower(strings.TrimSpace(c.Memory.ContextPruningMode)) != "off" &&
+		strings.ToLower(strings.TrimSpace(c.Memory.ContextPruningMode)) != "disabled" &&
+		c.Memory.ContextPruningKeepLastToolResults <= 0 {
+		addErr("memory.context_pruning_keep_last_tool_results must be > 0 when pruning is enabled")
+	}
+
+	positiveInt("memory.event_retention_days", c.Memory.EventRetentionDays)
+	positiveInt("memory.audit_retention_days", c.Memory.AuditRetentionDays)
+	positiveInt("memory.compaction_summary_timeout_seconds", c.Memory.CompactionSummaryTimeoutSeconds)
+	positiveInt("memory.compaction_chunk_chars", c.Memory.CompactionChunkChars)
+	positiveInt("memory.compaction_max_transcript_chars", c.Memory.CompactionMaxTranscriptChars)
+	positiveInt("memory.compaction_partial_skip_chars", c.Memory.CompactionPartialSkipChars)
+	if c.Memory.CompactionPartialSkipChars > c.Memory.CompactionMaxTranscriptChars {
+		addErr("memory.compaction_partial_skip_chars must be <= memory.compaction_max_transcript_chars (%d > %d)",
+			c.Memory.CompactionPartialSkipChars, c.Memory.CompactionMaxTranscriptChars)
+	}
+
+	if c.Memory.PersonaMinConfidence <= 0 || c.Memory.PersonaMinConfidence > 1 {
+		addErr("memory.persona_min_confidence must be in (0, 1] (got %.3f)", c.Memory.PersonaMinConfidence)
+	}
+	positiveInt("memory.persona_sync_timeout_ms", c.Memory.PersonaSyncTimeoutMS)
+	if c.Memory.PersonaSyncTimeoutMS > 30000 {
+		addErr("memory.persona_sync_timeout_ms must be <= 30000 (got %d)", c.Memory.PersonaSyncTimeoutMS)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Memory.PersonaPolicyMode)) {
+	case "", "balanced", "strict", "permissive":
+	default:
+		addErr("memory.persona_policy_mode must be one of strict|balanced|permissive (got %q)", c.Memory.PersonaPolicyMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Memory.PersonaFileSyncMode)) {
+	case "", "export_only", "import_export", "disabled":
+	default:
+		addErr("memory.persona_file_sync_mode must be one of export_only|import_export|disabled (got %q)", c.Memory.PersonaFileSyncMode)
+	}
+
+	positiveInt("memory.file_memory_poll_seconds", c.Memory.FileMemoryPollSeconds)
+	positiveInt("memory.file_memory_watch_debounce_ms", c.Memory.FileMemoryWatchDebounceMS)
+	positiveInt("memory.file_memory_max_file_bytes", c.Memory.FileMemoryMaxFileBytes)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid configuration: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }

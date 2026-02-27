@@ -101,6 +101,41 @@ func WrapTransportError(provider string, cause error) error {
 	}
 }
 
+// NormalizeProviderError ensures provider errors are consistently wrapped
+// with normalized metadata for downstream retry/recovery logic.
+func NormalizeProviderError(provider string, err error) error {
+	if err == nil {
+		return nil
+	}
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	var pe *Error
+	if errors.As(err, &pe) {
+		if provider == "" || pe.Provider != "" {
+			return err
+		}
+		cp := *pe
+		cp.Provider = provider
+		return &cp
+	}
+	meta := InspectError(err)
+	kind := meta.Kind
+	if kind == "" {
+		kind = ErrorKindUnknown
+	}
+	msg := strings.TrimSpace(meta.Message)
+	if msg == "" {
+		msg = strings.TrimSpace(err.Error())
+	}
+	return &Error{
+		Provider:   provider,
+		Kind:       kind,
+		StatusCode: meta.StatusCode,
+		RetryAfter: meta.RetryAfter,
+		Message:    msg,
+		Cause:      err,
+	}
+}
+
 func IsTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -283,6 +318,13 @@ func detectContextOverflowFromMessage(message string) bool {
 		strings.Contains(msg, "too many tokens") ||
 		strings.Contains(msg, "token limit") ||
 		strings.Contains(msg, "max message tokens") ||
+		strings.Contains(msg, "max input tokens") ||
+		strings.Contains(msg, "prompt too long") ||
+		strings.Contains(msg, "input too long") ||
+		strings.Contains(msg, "input exceeds") ||
+		strings.Contains(msg, "input is too large") ||
+		strings.Contains(msg, "maximum prompt") ||
+		strings.Contains(msg, "prompt size exceeded") ||
 		strings.Contains(msg, "request too large") ||
 		(strings.Contains(msg, "context") && strings.Contains(msg, "length"))
 }

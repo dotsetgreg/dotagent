@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -229,4 +230,47 @@ func TestLoadConfig_OpenAICodexEnvOverrides(t *testing.T) {
 	if got := cfg.Providers.OpenAICodex.OAuthTokenFile; got != "/tmp/codex-auth.json" {
 		t.Fatalf("expected openai-codex oauth token file from env, got %q", got)
 	}
+}
+
+func TestConfigValidate_DefaultConfigPasses(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config should be valid, got: %v", err)
+	}
+}
+
+func TestConfigValidate_RejectsInvalidLoopThresholds(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Memory.ToolLoopSignatureWarnThreshold = 5
+	cfg.Memory.ToolLoopSignatureCriticalThreshold = 5
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if got := err.Error(); got == "" || !containsAll(got, []string{"tool_loop_signature_warn_threshold", "tool_loop_signature_critical_threshold"}) {
+		t.Fatalf("expected signature threshold validation message, got: %v", err)
+	}
+}
+
+func TestLoadConfig_FailsOnInvalidConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad-config.json")
+	raw := `{
+  "gateway": {"host": "", "port": 70000},
+  "agents": {"defaults": {"workspace": "", "provider": "", "model": "", "max_tokens": 0, "max_tool_iterations": 0, "max_concurrent_runs": 0, "temperature": -1}}
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatalf("expected load config to fail validation")
+	}
+}
+
+func containsAll(haystack string, needles []string) bool {
+	for _, needle := range needles {
+		if !strings.Contains(haystack, needle) {
+			return false
+		}
+	}
+	return true
 }

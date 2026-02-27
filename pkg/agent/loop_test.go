@@ -1130,3 +1130,50 @@ func TestAgentLoop_UsesConfiguredLLMCallOptions(t *testing.T) {
 		t.Fatalf("expected temperature=0.23, got %v", got)
 	}
 }
+
+func TestInboundDedupeKey_UsesMessageIDWhenPresent(t *testing.T) {
+	msg := bus.InboundMessage{
+		Channel:   "discord",
+		ChatID:    "c1",
+		SenderID:  "u1",
+		Content:   "hello",
+		MessageID: "m123",
+	}
+	key := inboundDedupeKey(msg)
+	if !strings.Contains(key, "m123") {
+		t.Fatalf("expected message-id key, got %q", key)
+	}
+}
+
+func TestAgentLoop_DuplicateInboundDetection(t *testing.T) {
+	al := &AgentLoop{
+		recentInbound:    map[string]int64{},
+		inboundDedupeTTL: time.Minute,
+	}
+	msg := bus.InboundMessage{
+		Channel:   "discord",
+		ChatID:    "c1",
+		SenderID:  "u1",
+		Content:   "hello",
+		MessageID: "m123",
+	}
+	if dup := al.isDuplicateInbound(msg); dup {
+		t.Fatalf("first message should not be duplicate")
+	}
+	if dup := al.isDuplicateInbound(msg); !dup {
+		t.Fatalf("second message should be detected as duplicate")
+	}
+}
+
+func TestAgentLoop_DetectPromptBaselineChange(t *testing.T) {
+	al := &AgentLoop{sessionPromptHash: map[string]string{}}
+	if changed := al.detectPromptBaselineChange("s1", "abc"); changed {
+		t.Fatalf("first baseline registration should not be treated as changed")
+	}
+	if changed := al.detectPromptBaselineChange("s1", "abc"); changed {
+		t.Fatalf("same hash should not be treated as changed")
+	}
+	if changed := al.detectPromptBaselineChange("s1", "def"); !changed {
+		t.Fatalf("hash change should be detected")
+	}
+}

@@ -92,6 +92,13 @@ type Service struct {
 	fileMemoryDirty   bool
 	fileMemoryEventMS int64
 	fileMemoryWatchFP string
+
+	compactionMu    sync.Mutex
+	compactionState map[string]*compactionFlight
+}
+
+type compactionFlight struct {
+	done chan struct{}
 }
 
 func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
@@ -222,6 +229,7 @@ func NewService(cfg Config, summarize SummaryFunc) (*Service, error) {
 		snapshotMaxSessions:     256,
 		fileMemoryIndex:         map[string]fileMemorySnapshot{},
 		fileMemoryDirty:         true,
+		compactionState:         map[string]*compactionFlight{},
 	}
 
 	svc.startFileMemoryWatcher()
@@ -727,7 +735,44 @@ func (s *Service) SetProviderState(ctx context.Context, sessionKey, provider, st
 
 func (s *Service) ForceCompact(ctx context.Context, sessionKey, userID string, maxTokens int) error {
 	budget := DeriveContextBudget(maxTokens)
-	return s.compactor.CompactSession(ctx, sessionKey, userID, s.cfg.AgentID, budget)
+	return s.compactSessionSerialized(ctx, sessionKey, userID, budget)
+}
+
+func (s *Service) compactSessionSerialized(ctx context.Context, sessionKey, userID string, budget ContextBudget) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil
+	}
+
+	for {
+		s.compactionMu.Lock()
+		flight, busy := s.compactionState[sessionKey]
+		if !busy {
+			flight = &compactionFlight{done: make(chan struct{})}
+			s.compactionState[sessionKey] = flight
+			s.compactionMu.Unlock()
+			break
+		}
+		done := flight.done
+		s.compactionMu.Unlock()
+		_ = s.store.AddMetric(ctx, "memory.compaction.waiting", 1, map[string]string{
+			"session_key": sessionKey,
+		})
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+	}
+
+	err := s.compactor.CompactSession(ctx, sessionKey, userID, s.cfg.AgentID, budget)
+	s.compactionMu.Lock()
+	if flight := s.compactionState[sessionKey]; flight != nil {
+		close(flight.done)
+		delete(s.compactionState, sessionKey)
+	}
+	s.compactionMu.Unlock()
+	return err
 }
 
 func (s *Service) RollbackPersona(ctx context.Context, userID string) error {
@@ -1434,7 +1479,7 @@ func (s *Service) handleJob(ctx context.Context, job Job) error {
 		if strings.TrimSpace(userID) == "" {
 			return fmt.Errorf("invalid compact job payload")
 		}
-		return s.compactor.CompactSession(ctx, job.SessionKey, userID, s.cfg.AgentID, DeriveContextBudget(s.cfg.MaxContextTokens))
+		return s.compactSessionSerialized(ctx, job.SessionKey, userID, DeriveContextBudget(s.cfg.MaxContextTokens))
 	case JobEmbeddingSync:
 		return s.syncSessionEmbeddingDeltas(ctx, job.SessionKey)
 	case JobEmbeddingReindex:

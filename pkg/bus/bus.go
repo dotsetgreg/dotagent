@@ -9,13 +9,16 @@ import (
 )
 
 type MessageBus struct {
-	inbound  chan InboundMessage
-	outbound chan OutboundMessage
-	events   chan EventMessage
-	handlers map[string]MessageHandler
-	closed   bool
-	dropped  droppedCounters
-	mu       sync.RWMutex
+	inbound         chan InboundMessage
+	outbound        chan OutboundMessage
+	events          chan EventMessage
+	handlers        map[string]MessageHandler
+	closed          bool
+	dropped         droppedCounters
+	inboundPublish  PublishConfig
+	outboundPublish PublishConfig
+	eventsPublish   PublishConfig
+	mu              sync.RWMutex
 }
 
 type droppedCounters struct {
@@ -24,7 +27,25 @@ type droppedCounters struct {
 	events   atomic.Uint64
 }
 
-const publishTimeout = 100 * time.Millisecond
+type PublishConfig struct {
+	Timeout     time.Duration
+	MaxAttempts int
+}
+
+type MessageBusOptions struct {
+	InboundBuffer   int
+	OutboundBuffer  int
+	EventBuffer     int
+	InboundPublish  PublishConfig
+	OutboundPublish PublishConfig
+	EventsPublish   PublishConfig
+}
+
+const (
+	defaultInboundBufferSize  = 100
+	defaultOutboundBufferSize = 100
+	defaultEventsBufferSize   = 128
+)
 
 var (
 	ErrBusClosed      = errors.New("message bus is closed")
@@ -32,12 +53,42 @@ var (
 )
 
 func NewMessageBus() *MessageBus {
-	return &MessageBus{
-		inbound:  make(chan InboundMessage, 100),
-		outbound: make(chan OutboundMessage, 100),
-		events:   make(chan EventMessage, 128),
-		handlers: make(map[string]MessageHandler),
+	return NewMessageBusWithOptions(MessageBusOptions{})
+}
+
+func NewMessageBusWithOptions(opts MessageBusOptions) *MessageBus {
+	inboundBuffer := opts.InboundBuffer
+	if inboundBuffer <= 0 {
+		inboundBuffer = defaultInboundBufferSize
 	}
+	outboundBuffer := opts.OutboundBuffer
+	if outboundBuffer <= 0 {
+		outboundBuffer = defaultOutboundBufferSize
+	}
+	eventsBuffer := opts.EventBuffer
+	if eventsBuffer <= 0 {
+		eventsBuffer = defaultEventsBufferSize
+	}
+
+	return &MessageBus{
+		inbound:         make(chan InboundMessage, inboundBuffer),
+		outbound:        make(chan OutboundMessage, outboundBuffer),
+		events:          make(chan EventMessage, eventsBuffer),
+		handlers:        make(map[string]MessageHandler),
+		inboundPublish:  normalizePublishConfig(opts.InboundPublish),
+		outboundPublish: normalizePublishConfig(opts.OutboundPublish),
+		eventsPublish:   normalizePublishConfig(opts.EventsPublish),
+	}
+}
+
+func normalizePublishConfig(cfg PublishConfig) PublishConfig {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 200 * time.Millisecond
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 3
+	}
+	return cfg
 }
 
 func (mb *MessageBus) PublishInbound(msg InboundMessage) error {
@@ -47,20 +98,26 @@ func (mb *MessageBus) PublishInbound(msg InboundMessage) error {
 		return ErrBusClosed
 	}
 
-	select {
-	case mb.inbound <- msg:
-		return nil
-	default:
-		timer := time.NewTimer(publishTimeout)
-		defer timer.Stop()
+	for attempt := 0; attempt < mb.inboundPublish.MaxAttempts; attempt++ {
 		select {
 		case mb.inbound <- msg:
 			return nil
-		case <-timer.C:
+		default:
+		}
+		if attempt == mb.inboundPublish.MaxAttempts-1 {
 			mb.dropped.inbound.Add(1)
 			return ErrPublishDropped
 		}
+		timer := time.NewTimer(mb.inboundPublish.Timeout)
+		select {
+		case mb.inbound <- msg:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
+	mb.dropped.inbound.Add(1)
+	return ErrPublishDropped
 }
 
 func (mb *MessageBus) ConsumeInbound(ctx context.Context) (InboundMessage, bool) {
@@ -82,20 +139,26 @@ func (mb *MessageBus) PublishOutbound(msg OutboundMessage) error {
 		return ErrBusClosed
 	}
 
-	select {
-	case mb.outbound <- msg:
-		return nil
-	default:
-		timer := time.NewTimer(publishTimeout)
-		defer timer.Stop()
+	for attempt := 0; attempt < mb.outboundPublish.MaxAttempts; attempt++ {
 		select {
 		case mb.outbound <- msg:
 			return nil
-		case <-timer.C:
+		default:
+		}
+		if attempt == mb.outboundPublish.MaxAttempts-1 {
 			mb.dropped.outbound.Add(1)
 			return ErrPublishDropped
 		}
+		timer := time.NewTimer(mb.outboundPublish.Timeout)
+		select {
+		case mb.outbound <- msg:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
+	mb.dropped.outbound.Add(1)
+	return ErrPublishDropped
 }
 
 func (mb *MessageBus) SubscribeOutbound(ctx context.Context) (OutboundMessage, bool) {
@@ -150,20 +213,26 @@ func (mb *MessageBus) PublishEvent(event EventMessage) error {
 		return ErrBusClosed
 	}
 
-	select {
-	case mb.events <- event:
-		return nil
-	default:
-		timer := time.NewTimer(publishTimeout)
-		defer timer.Stop()
+	for attempt := 0; attempt < mb.eventsPublish.MaxAttempts; attempt++ {
 		select {
 		case mb.events <- event:
 			return nil
-		case <-timer.C:
+		default:
+		}
+		if attempt == mb.eventsPublish.MaxAttempts-1 {
 			mb.dropped.events.Add(1)
 			return ErrPublishDropped
 		}
+		timer := time.NewTimer(mb.eventsPublish.Timeout)
+		select {
+		case mb.events <- event:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
+	mb.dropped.events.Add(1)
+	return ErrPublishDropped
 }
 
 func (mb *MessageBus) SubscribeEvents(ctx context.Context) (EventMessage, bool) {
