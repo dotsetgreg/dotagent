@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -632,7 +631,7 @@ func TestBuildPromptContext_IncludesContinuationHandoff(t *testing.T) {
 	}
 }
 
-func TestSessionCompactor_AbortsArchiveWhenSummaryUnreliable(t *testing.T) {
+func TestSessionCompactor_ContinuesWithHeuristicSummaryWhenLLMSummaryFails(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	store, err := NewSQLiteStore(filepath.Join(dir, "state", "memory.db"))
@@ -664,15 +663,15 @@ func TestSessionCompactor_AbortsArchiveWhenSummaryUnreliable(t *testing.T) {
 	comp := NewSessionCompactor(store, func(ctx context.Context, existingSummary, transcript string) (string, error) {
 		return "", fmt.Errorf("simulated summary failure")
 	})
-	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(128)); !errors.Is(err, ErrCompactionSummaryUnreliable) {
-		t.Fatalf("expected ErrCompactionSummaryUnreliable, got %v", err)
+	if err := comp.CompactSession(ctx, sessionKey, "u1", "dotagent", DeriveContextBudget(128)); err != nil {
+		t.Fatalf("expected compaction success with heuristic fallback, got %v", err)
 	}
 	events, err := store.ListRecentEvents(ctx, sessionKey, 128, false)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(events) < 30 {
-		t.Fatalf("expected events to remain unarchived on unreliable summary, got %d", len(events))
+	if len(events) >= 30 {
+		t.Fatalf("expected compaction to archive older events, got %d", len(events))
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 
 	"github.com/dotsetgreg/dotagent/pkg/bus"
 	"github.com/dotsetgreg/dotagent/pkg/config"
-	"github.com/dotsetgreg/dotagent/pkg/memory"
 	"github.com/dotsetgreg/dotagent/pkg/providers"
 	"github.com/dotsetgreg/dotagent/pkg/tools"
 )
@@ -673,7 +672,7 @@ func (m *toolDefinitionCaptureProvider) GetDefaultModel() string {
 	return "mock-tool-def-capture"
 }
 
-// TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
+// TestAgentLoop_ContextExhaustionRetry verifies unrecoverable context overflow is surfaced.
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
 	if err != nil {
@@ -704,62 +703,23 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 
 	al := mustNewAgentLoop(t, cfg, msgBus, provider)
 
-	// Inject some history to simulate a full context
 	sessionKey := "test-session-context"
-	// Create dummy history
-	history := []providers.Message{
-		{Role: "system", Content: "System prompt"},
-		{Role: "user", Content: "Old message 1"},
-		{Role: "assistant", Content: "Old response 1"},
-		{Role: "user", Content: "Old message 2"},
-		{Role: "assistant", Content: "Old response 2"},
-		{Role: "user", Content: "Trigger message"},
-	}
-	if err := al.memory.EnsureSession(context.Background(), sessionKey, "test", "test-chat", "local-user"); err != nil {
-		t.Fatalf("ensure memory session: %v", err)
-	}
-	for i, msg := range history {
-		if err := al.memory.AppendEvent(context.Background(), memory.Event{
-			SessionKey: sessionKey,
-			TurnID:     "seed-turn",
-			Seq:        i + 1,
-			Role:       msg.Role,
-			Content:    msg.Content,
-		}); err != nil {
-			t.Fatalf("append seed history: %v", err)
-		}
-	}
 
 	// Call ProcessDirectWithChannel
 	// Note: ProcessDirectWithChannel calls processMessage which will execute runLLMIteration
 	response, err := al.ProcessDirectWithChannel(context.Background(), "Trigger message", sessionKey, "test", "test-chat")
 
-	if err != nil {
-		t.Fatalf("Expected success after retry, got error: %v", err)
+	if err == nil {
+		t.Fatalf("Expected unrecoverable context overflow error, got success response: %q", response)
 	}
-
-	if response != "Recovered from context error" {
-		t.Errorf("Expected 'Recovered from context error', got '%s'", response)
+	if response != "" {
+		t.Errorf("Expected empty response on unrecoverable overflow, got %q", response)
 	}
-
-	// We expect 2 calls: 1st failed, 2nd succeeded
-	if provider.currentCall != 2 {
-		t.Errorf("Expected 2 calls (1 fail + 1 success), got %d", provider.currentCall)
+	if !strings.Contains(strings.ToLower(err.Error()), "max message tokens") {
+		t.Fatalf("Expected context overflow details in error, got: %v", err)
 	}
-
-	// Check final history length
-	promptCtx, err := al.memory.BuildPromptContext(context.Background(), sessionKey, "local-user", "Trigger message", 4096)
-	if err != nil {
-		t.Fatalf("build prompt context after retry: %v", err)
-	}
-	finalHistory := promptCtx.History
-	// We verify that the history has been modified (compressed)
-	// Original length: 6
-	// Expected behavior: compression drops ~50% of history (mid slice)
-	// We can assert that the length is NOT what it would be without compression.
-	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
-	if len(finalHistory) >= 8 {
-		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	if provider.currentCall != 1 {
+		t.Errorf("Expected no retry when rebuilt context is unchanged, got %d calls", provider.currentCall)
 	}
 }
 
@@ -783,25 +743,33 @@ func TestAgentLoop_ContextRetryPreservesCurrentUserMessage(t *testing.T) {
 
 	msg := "Please answer this exact query after retry"
 	response, err := al.ProcessDirectWithChannel(context.Background(), msg, "retry-session", "cli", "direct")
-	if err != nil {
-		t.Fatalf("ProcessDirectWithChannel failed: %v", err)
+	if err == nil {
+		t.Fatalf("Expected context overflow error, got response: %q", response)
 	}
-	if response != "retry-success" {
-		t.Fatalf("unexpected response: %q", response)
+	if response != "" {
+		t.Fatalf("expected empty response on overflow failure, got: %q", response)
 	}
-	if provider.currentCall != 2 {
-		t.Fatalf("expected 2 provider calls, got %d", provider.currentCall)
+	if provider.currentCall != 1 {
+		t.Fatalf("expected no retry when overflow recovery cannot reduce context, got %d provider calls", provider.currentCall)
 	}
 
+	resolvedSessionKey, err := resolveSessionKey("retry-session", al.workspaceID, "cli", "direct", "local-user")
+	if err != nil {
+		t.Fatalf("resolve session key: %v", err)
+	}
+	promptCtx, err := al.memory.BuildPromptContext(context.Background(), resolvedSessionKey, "local-user", msg, al.contextWindow)
+	if err != nil {
+		t.Fatalf("build prompt context: %v", err)
+	}
 	found := false
-	for _, m := range provider.secondCallMessages {
+	for _, m := range promptCtx.History {
 		if m.Role == "user" && m.Content == msg {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("retry request did not include original user message")
+		t.Fatalf("current user message was not persisted after overflow failure")
 	}
 }
 
@@ -1162,6 +1130,25 @@ func TestAgentLoop_DuplicateInboundDetection(t *testing.T) {
 	}
 	if dup := al.isDuplicateInbound(msg); !dup {
 		t.Fatalf("second message should be detected as duplicate")
+	}
+}
+
+func TestAgentLoop_DuplicateInboundDetection_NoMessageIDSkipsExternalHashDedupe(t *testing.T) {
+	al := &AgentLoop{
+		recentInbound:    map[string]int64{},
+		inboundDedupeTTL: time.Minute,
+	}
+	msg := bus.InboundMessage{
+		Channel:  "discord",
+		ChatID:   "c1",
+		SenderID: "u1",
+		Content:  "hello",
+	}
+	if dup := al.isDuplicateInbound(msg); dup {
+		t.Fatalf("first message should not be duplicate")
+	}
+	if dup := al.isDuplicateInbound(msg); dup {
+		t.Fatalf("second message should not be deduped without stable message ID")
 	}
 }
 

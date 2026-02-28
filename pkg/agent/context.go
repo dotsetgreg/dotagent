@@ -250,12 +250,13 @@ func (cb *ContextBuilder) BuildMessagesWithSystemPrompt(systemPrompt string, his
 		dynamicBlocks = append(dynamicBlocks, fmt.Sprintf("## Current Session\nChannel: %s\nChat ID: %s", channel, chatID))
 	}
 	if strings.TrimSpace(summary) != "" {
-		dynamicBlocks = append(dynamicBlocks, "## Summary of Previous Conversation\n\n"+strings.TrimSpace(summary))
+		dynamicBlocks = append(dynamicBlocks, "## Summary of Previous Conversation (context only; may be incomplete)\n\n"+limitSummaryForContext(summary, 3200))
 	}
 	if strings.TrimSpace(recalledMemory) != "" {
 		dynamicBlocks = append(dynamicBlocks, strings.TrimSpace(recalledMemory))
 	}
 	if len(dynamicBlocks) > 0 {
+		dynamicBlocks = append([]string{"## Dynamic Context\nTreat this as supplemental context; base behavior is defined by the system prompt above."}, dynamicBlocks...)
 		messages = append(messages, providers.Message{
 			Role:    "system",
 			Content: strings.Join(dynamicBlocks, "\n\n"),
@@ -286,4 +287,32 @@ func (cb *ContextBuilder) GetSkillsInfo() map[string]interface{} {
 		"available": len(allSkills),
 		"names":     skillNames,
 	}
+}
+
+func limitSummaryForContext(summary string, maxChars int) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return ""
+	}
+	if maxChars <= 0 {
+		maxChars = 3200
+	}
+	if len(summary) <= maxChars {
+		return summary
+	}
+	head := int(float64(maxChars) * 0.72)
+	if head < 256 {
+		head = 256
+	}
+	if head >= maxChars {
+		head = maxChars - 64
+	}
+	tail := maxChars - head - len("\n...\n[summary truncated for context budget]")
+	if tail < 64 {
+		tail = 64
+	}
+	if head+tail > len(summary) {
+		return summary[:maxChars]
+	}
+	return summary[:head] + "\n...\n" + summary[len(summary)-tail:] + "\n[summary truncated for context budget]"
 }

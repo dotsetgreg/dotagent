@@ -50,19 +50,30 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {
 	}
 
 	// Extract parts from compound senderID like "123456|username"
+	senderID = strings.TrimSpace(senderID)
 	idPart := senderID
 	userPart := ""
 	if idx := strings.Index(senderID, "|"); idx > 0 {
-		idPart = senderID[:idx]
-		userPart = senderID[idx+1:]
+		idPart = strings.TrimSpace(senderID[:idx])
+		userPart = strings.TrimSpace(senderID[idx+1:])
 	}
 
 	for _, allowed := range c.allowList {
-		candidate := strings.TrimSpace(strings.TrimPrefix(allowed, "@"))
-		if candidate == "" {
+		raw := strings.TrimSpace(allowed)
+		if raw == "" {
 			continue
 		}
-		if candidate == senderID || candidate == idPart || (userPart != "" && candidate == userPart) {
+		if strings.HasPrefix(raw, "@") {
+			candidate := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+			if candidate == "" {
+				continue
+			}
+			if (userPart != "" && strings.EqualFold(candidate, userPart)) || (userPart == "" && strings.EqualFold(candidate, senderID)) {
+				return true
+			}
+			continue
+		}
+		if strings.EqualFold(raw, senderID) || (idPart != "" && strings.EqualFold(raw, idPart)) {
 			return true
 		}
 	}

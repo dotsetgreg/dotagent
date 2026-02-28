@@ -28,6 +28,7 @@ type CronPayload struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
 	Command string `json:"command,omitempty"`
+	Actor   string `json:"actor,omitempty"`
 	Deliver bool   `json:"deliver"`
 	Channel string `json:"channel,omitempty"`
 	To      string `json:"to,omitempty"`
@@ -292,6 +293,15 @@ func (cs *CronService) executeJobByID(jobID string) {
 	} else {
 		nextRun := cs.computeNextRun(&job.Schedule, time.Now().UnixMilli())
 		job.State.NextRunAtMS = nextRun
+		if nextRun == nil {
+			job.Enabled = false
+			if err == nil {
+				job.State.LastStatus = "error"
+				if strings.TrimSpace(job.State.LastError) == "" {
+					job.State.LastError = "schedule has no valid future run; job disabled"
+				}
+			}
+		}
 	}
 
 	if err := cs.saveStoreUnsafe(); err != nil {
@@ -349,6 +359,13 @@ func (cs *CronService) recomputeNextRuns() {
 		job := &cs.store.Jobs[i]
 		if job.Enabled {
 			job.State.NextRunAtMS = cs.computeNextRun(&job.Schedule, now)
+			if job.State.NextRunAtMS == nil {
+				job.Enabled = false
+				job.State.LastStatus = "error"
+				if strings.TrimSpace(job.State.LastError) == "" {
+					job.State.LastError = "schedule has no valid future run; job disabled"
+				}
+			}
 		}
 	}
 }
@@ -430,7 +447,32 @@ func (cs *CronService) saveStoreUnsafe() error {
 		return err
 	}
 
-	return os.WriteFile(cs.storePath, data, 0600)
+	tmpPath := fmt.Sprintf("%s.tmp-%d", cs.storePath, time.Now().UnixNano())
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := f.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, cs.storePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (cs *CronService) AddJob(name string, schedule CronSchedule, message string, deliver bool, channel, to string) (*CronJob, error) {

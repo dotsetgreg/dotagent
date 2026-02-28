@@ -46,3 +46,12 @@ func TestExtractUserContentUpsertOps_QuestionWithPersistenceCueStillCaptures(t *
 	}
 	t.Fatalf("expected identity capture when explicit persistence cue is present; ops=%+v", ops)
 }
+
+func TestExtractUserContentUpsertOps_QuestionDoesNotCaptureTaskIntent(t *testing.T) {
+	ops := extractUserContentUpsertOps("Can you schedule deployment checks for me?", "evt-4")
+	for _, op := range ops {
+		if op.Kind == MemoryTaskState {
+			t.Fatalf("unexpected task capture for question-style request: %+v", op)
+		}
+	}
+}

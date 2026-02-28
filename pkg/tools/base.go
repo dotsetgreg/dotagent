@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 )
 
@@ -82,6 +83,7 @@ type ClosableTool interface {
 type toolExecutionContext struct {
 	channel       string
 	chatID        string
+	actorID       string
 	asyncCallback AsyncCallback
 }
 
@@ -99,6 +101,18 @@ func withToolExecutionContext(ctx context.Context, channel, chatID string, async
 		if chatID == "" {
 			chatID = existing.chatID
 		}
+		if existing.actorID != "" {
+			execCtx := toolExecutionContext{
+				channel:       channel,
+				chatID:        chatID,
+				actorID:       existing.actorID,
+				asyncCallback: asyncCallback,
+			}
+			if asyncCallback == nil {
+				execCtx.asyncCallback = existing.asyncCallback
+			}
+			return context.WithValue(ctx, toolExecutionContextKey{}, execCtx)
+		}
 		if asyncCallback == nil {
 			asyncCallback = existing.asyncCallback
 		}
@@ -108,6 +122,18 @@ func withToolExecutionContext(ctx context.Context, channel, chatID string, async
 		chatID:        chatID,
 		asyncCallback: asyncCallback,
 	}
+	return context.WithValue(ctx, toolExecutionContextKey{}, execCtx)
+}
+
+// WithToolExecutionActor annotates context with the actor/user identifier that
+// initiated the tool execution request.
+func WithToolExecutionActor(ctx context.Context, actorID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	actorID = strings.TrimSpace(actorID)
+	execCtx, _ := toolExecutionContextFromContext(ctx)
+	execCtx.actorID = actorID
 	return context.WithValue(ctx, toolExecutionContextKey{}, execCtx)
 }
 
@@ -125,6 +151,14 @@ func channelChatFromContext(ctx context.Context) (string, string) {
 		return "", ""
 	}
 	return execCtx.channel, execCtx.chatID
+}
+
+func actorFromContext(ctx context.Context) string {
+	execCtx, ok := toolExecutionContextFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(execCtx.actorID)
 }
 
 func asyncCallbackFromContext(ctx context.Context) AsyncCallback {

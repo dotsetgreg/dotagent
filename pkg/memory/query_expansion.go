@@ -69,6 +69,22 @@ func expandQueryTerms(query string) []string {
 	for i := 0; i+1 < len(latinTerms) && i < 6; i++ {
 		terms = append(terms, latinTerms[i]+" "+latinTerms[i+1])
 	}
+	if len(terms) == 0 {
+		for _, token := range baseTokens {
+			token = strings.TrimSpace(strings.ToLower(token))
+			if token == "" {
+				continue
+			}
+			// Keep at least one lexical anchor to avoid zero-term lookups.
+			if containsCJK(token) {
+				terms = append(terms, cjkNgrams(token, 1, 2)...)
+				continue
+			}
+			if len(token) >= 2 {
+				terms = append(terms, token)
+			}
+		}
+	}
 
 	return dedupeQueryTerms(terms)
 }

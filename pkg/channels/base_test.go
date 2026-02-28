@@ -28,6 +28,12 @@ func TestBaseChannelIsAllowed(t *testing.T) {
 			want:      true,
 		},
 		{
+			name:      "plain username entry does not match compound username part",
+			allowList: []string{"alice"},
+			senderID:  "123456|alice",
+			want:      false,
+		},
+		{
 			name:      "exact compound sender matches compound allowlist",
 			allowList: []string{"123456|alice"},
 			senderID:  "123456|alice",

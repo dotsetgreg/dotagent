@@ -162,6 +162,26 @@ func TestCreateProvider_Ollama_WithAPIKey(t *testing.T) {
 	}
 }
 
+func TestCreateProvider_Ollama_UsesInteractiveTimeout(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Provider = ProviderOllama
+	cfg.Providers.Ollama.APIBase = "http://127.0.0.1:11434/v1"
+	provider, err := CreateProvider(cfg)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	cp, ok := provider.(*chatCompletionsProvider)
+	if !ok {
+		t.Fatalf("expected chatCompletionsProvider type for ollama")
+	}
+	if cp.httpClient == nil {
+		t.Fatalf("expected http client")
+	}
+	if cp.httpClient.Timeout != defaultOllamaHTTPTimeout {
+		t.Fatalf("expected ollama timeout %s, got %s", defaultOllamaHTTPTimeout, cp.httpClient.Timeout)
+	}
+}
+
 func TestSupportedProviders_IncludesOllama(t *testing.T) {
 	supported := SupportedProviders()
 	if !slices.Contains(supported, ProviderOllama) {

@@ -270,3 +270,35 @@ func TestCronService_CorruptStoreRecovered(t *testing.T) {
 		t.Fatalf("expected backup file for corrupt store")
 	}
 }
+
+func TestCronService_RecomputeNextRunsDisablesInvalidTimezoneJobs(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "cron", "jobs.json")
+	cs := mustNewCronService(t, storePath)
+
+	job, err := cs.AddJob("tz-job", CronSchedule{Kind: "cron", Expr: "* * * * *", TZ: "UTC"}, "hello", false, "cli", "direct")
+	if err != nil {
+		t.Fatalf("AddJob failed: %v", err)
+	}
+
+	cs.mu.Lock()
+	for i := range cs.store.Jobs {
+		if cs.store.Jobs[i].ID == job.ID {
+			cs.store.Jobs[i].Schedule.TZ = "Mars/Olympus"
+			cs.store.Jobs[i].Enabled = true
+		}
+	}
+	cs.recomputeNextRuns()
+	cs.mu.Unlock()
+
+	found := cs.ListJobs(true)
+	if len(found) != 1 {
+		t.Fatalf("expected one job, got %d", len(found))
+	}
+	if found[0].Enabled {
+		t.Fatalf("expected invalid timezone job to be disabled")
+	}
+	if !strings.Contains(strings.ToLower(found[0].State.LastError), "schedule has no valid future run") {
+		t.Fatalf("expected invalid timezone error to be recorded, got %q", found[0].State.LastError)
+	}
+}

@@ -137,3 +137,25 @@ line three
 		t.Fatalf("expected body separator to remain, got %q", body)
 	}
 }
+
+func TestSkillsLoader_ListSkills_DerivesDescriptionFromBodyWhenFrontmatterMissing(t *testing.T) {
+	workspace := t.TempDir()
+	skillDir := filepath.Join(workspace, "skills", "ops-helper")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("mkdir skill dir: %v", err)
+	}
+	content := `# Ops Helper
+Run common operational diagnostics safely.
+`
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write skill file: %v", err)
+	}
+	loader := NewSkillsLoader(workspace, "", "")
+	skills := loader.ListSkills()
+	if len(skills) != 1 {
+		t.Fatalf("expected one skill, got %d", len(skills))
+	}
+	if skills[0].Description == "" {
+		t.Fatalf("expected derived description to be non-empty")
+	}
+}

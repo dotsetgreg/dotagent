@@ -14,6 +14,7 @@ var (
 	forgetRegex                       = regexp.MustCompile(`(?i)\b(?:please\s+)?(?:forget|remove)\b(?:\s+(?:that|this|about))?\s+(.+)$`)
 	extractionLikelyQuestionLeadRegex = regexp.MustCompile(`(?i)^\s*(?:what|why|how|when|where|who|can|could|would|do|does|did|is|are|am|if|whether)\b`)
 	extractionPersistenceCueRegex     = regexp.MustCompile(`(?i)\b(?:remember|note|save|store|track|my name is|my timezone is|call me)\b`)
+	extractionHypotheticalLeadRegex   = regexp.MustCompile(`(?i)^\s*(?:if|suppose|imagine|what if)\b`)
 
 	firstPersonVerbFactRegex = regexp.MustCompile(`(?i)\b(i (?:am|i'm|have|had|use|used|work on|work with|build|built|maintain|maintained|live in|lived in|read|reading|need|needed|want|wanted|prefer|like|love|hate|dislike|got|keep|own|run|study|studied|mod|modded|modified)\b[^.!?\n]{4,180})`)
 	sentenceSplitRegex       = regexp.MustCompile(`[.!?\n;]+`)
@@ -26,7 +27,8 @@ func extractUserContentUpsertOps(content, sourceEventID string) []ConsolidationO
 	if content == "" {
 		return nil
 	}
-	skipFactCapture := isLikelyQuestionForMemory(content) && !extractionPersistenceCueRegex.MatchString(content)
+	skipQuestionCapture := isLikelyQuestionForMemory(content) && !extractionPersistenceCueRegex.MatchString(content)
+	skipFactCapture := skipQuestionCapture
 
 	ops := []ConsolidationOp{}
 	seen := map[string]struct{}{}
@@ -118,24 +120,26 @@ func extractUserContentUpsertOps(content, sourceEventID string) []ConsolidationO
 		}
 	}
 
-	for _, m := range taskStateRegex.FindAllStringSubmatch(content, -1) {
-		if len(m) < 2 {
-			continue
+	if !skipQuestionCapture {
+		for _, m := range taskStateRegex.FindAllStringSubmatch(content, -1) {
+			if len(m) < 2 {
+				continue
+			}
+			task := normalizeEntityPhrase(strings.Join(m[1:], " "))
+			if task == "" {
+				continue
+			}
+			addOp(ConsolidationOp{
+				Action:      "upsert",
+				Kind:        MemoryTaskState,
+				Key:         contentKey("task", task),
+				Content:     "Open task intent: " + task,
+				Confidence:  0.6,
+				SourceEvent: sourceEventID,
+				TTL:         14 * 24 * time.Hour,
+				Metadata:    map[string]string{"source_role": "user", "extractor": "task"},
+			})
 		}
-		task := normalizeEntityPhrase(strings.Join(m[1:], " "))
-		if task == "" {
-			continue
-		}
-		addOp(ConsolidationOp{
-			Action:      "upsert",
-			Kind:        MemoryTaskState,
-			Key:         contentKey("task", task),
-			Content:     "Open task intent: " + task,
-			Confidence:  0.6,
-			SourceEvent: sourceEventID,
-			TTL:         14 * 24 * time.Hour,
-			Metadata:    map[string]string{"source_role": "user", "extractor": "task"},
-		})
 	}
 
 	return ops
@@ -193,6 +197,9 @@ func extractFirstPersonClauses(content string) []string {
 		}
 		lower := strings.ToLower(part)
 		if len(lower) < 8 {
+			continue
+		}
+		if extractionHypotheticalLeadRegex.MatchString(lower) {
 			continue
 		}
 		if !firstPersonLeadRegex.MatchString(lower) {

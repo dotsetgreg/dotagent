@@ -87,11 +87,13 @@ func applyJitter(delay time.Duration, jitter float64) time.Duration {
 func RetryCall[T any](ctx context.Context, cfg RetryConfig, call func() (T, error), shouldRetry func(error) bool, onRetry func(RetryInfo)) (T, error) {
 	cfg = cfg.normalized()
 	var zero T
+	var lastErr error
 	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
 		value, err := call()
 		if err == nil {
 			return value, nil
 		}
+		lastErr = err
 		if attempt >= cfg.MaxAttempts || shouldRetry == nil || !shouldRetry(err) {
 			return zero, err
 		}
@@ -107,6 +109,9 @@ func RetryCall[T any](ctx context.Context, cfg RetryConfig, call func() (T, erro
 			return zero, ctx.Err()
 		case <-time.After(delay):
 		}
+	}
+	if lastErr != nil {
+		return zero, lastErr
 	}
 	return zero, context.Canceled
 }

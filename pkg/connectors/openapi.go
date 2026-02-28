@@ -367,6 +367,9 @@ func compileOpenAPISpec(raw []byte, configuredBaseURL string, allowPrivateHosts 
 			opParameters := parseOpenAPIParameters(spec, toInterfaceSlice(opObj["parameters"]))
 			parameters := mergeOpenAPIParameters(pathParameters, opParameters)
 			bodySchema, bodyRequired := parseOpenAPIRequestBody(spec, opObj["requestBody"])
+			if existing, exists := operations[opID]; exists {
+				return nil, fmt.Errorf("openapi operationId %q is duplicated (%s %s conflicts with %s %s)", opID, strings.ToUpper(existing.Method), existing.Path, strings.ToUpper(methodLower), rawPath)
+			}
 			operations[opID] = openAPIOperation{
 				ID:               opID,
 				Method:           methodLower,

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -197,6 +198,11 @@ func (t *CronTool) addJob(ctx context.Context, args map[string]interface{}) *Too
 		// Need to save the updated payload
 		t.cronService.UpdateJob(job)
 	}
+	actorID := actorFromContext(ctx)
+	if actorID != "" {
+		job.Payload.Actor = actorID
+		t.cronService.UpdateJob(job)
+	}
 
 	return SilentResult(fmt.Sprintf("Cron job added: %s (id: %s)", job.Name, job.ID))
 }
@@ -329,23 +335,46 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		return "ok"
 	}
 
-	// For deliver=false, process through agent (for complex tasks)
-	sessionKey := fmt.Sprintf("cron-%s", job.ID)
+	// For deliver=false, route through normal inbound flow so scheduler ordering,
+	// dedupe policy, and outbound dispatch remain consistent with user messages.
+	actor := strings.TrimSpace(job.Payload.Actor)
+	if actor == "" {
+		actor = "cron:" + strings.TrimSpace(job.ID)
+	}
+	inbound := bus.InboundMessage{
+		Channel:   channel,
+		SenderID:  actor,
+		ChatID:    chatID,
+		Content:   job.Payload.Message,
+		MessageID: fmt.Sprintf("cron-%s-%d", strings.TrimSpace(job.ID), time.Now().UnixNano()),
+		Metadata: map[string]string{
+			"source": "cron",
+			"job_id": strings.TrimSpace(job.ID),
+		},
+	}
+	if t.msgBus != nil {
+		if err := t.msgBus.PublishInbound(inbound); err != nil {
+			return fmt.Sprintf("Error queueing scheduled message: %v", err)
+		}
+		return "ok"
+	}
 
-	// Call agent with job's message
-	response, err := t.executor.ProcessDirectWithChannel(
-		ctx,
-		job.Payload.Message,
-		sessionKey,
-		channel,
-		chatID,
-	)
-
+	// Fallback when message bus is unavailable.
+	if t.executor == nil {
+		return "Error: cron executor unavailable"
+	}
+	response, err := t.executor.ProcessDirectWithChannel(ctx, job.Payload.Message, fmt.Sprintf("cron-%s", job.ID), channel, chatID)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
-
-	// Response is automatically sent via MessageBus by AgentLoop
-	_ = response // Will be sent by AgentLoop
+	if strings.TrimSpace(response) != "" && t.msgBus != nil {
+		if err := t.msgBus.PublishOutbound(bus.OutboundMessage{
+			Channel: channel,
+			ChatID:  chatID,
+			Content: response,
+		}); err != nil {
+			return fmt.Sprintf("Error delivering scheduled response: %v", err)
+		}
+	}
 	return "ok"
 }

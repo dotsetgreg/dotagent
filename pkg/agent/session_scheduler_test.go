@@ -89,9 +89,18 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 	s := newSessionSchedulerWithQueue(1, 1)
 	defer s.Stop()
 
+	started := make(chan struct{})
 	release := make(chan struct{})
-	if err := s.Submit("lane-a", func() { <-release }); err != nil {
+	if err := s.Submit("lane-a", func() {
+		close(started)
+		<-release
+	}); err != nil {
 		t.Fatalf("failed to enqueue first lane-a task: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("first lane-a task did not start in time")
 	}
 	if err := s.Submit("lane-a", func() { <-release }); err != nil {
 		t.Fatalf("failed to enqueue buffered lane-a task: %v", err)
@@ -104,11 +113,16 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 		close(thirdDone)
 	}()
 
-	// Third lane-a submit should block while queue is full.
+	// Third lane-a submit should fail quickly while queue is full.
 	select {
 	case <-thirdDone:
-		t.Fatalf("expected third lane-a submit to block while queue is full")
-	case <-time.After(40 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("expected third lane-a submit to fail quickly while queue is full")
+	}
+	if err := <-thirdErr; err == nil {
+		t.Fatalf("expected lane-a overflow error")
+	} else if err != ErrSchedulerLaneFull {
+		t.Fatalf("expected ErrSchedulerLaneFull, got %v", err)
 	}
 
 	start := time.Now()
@@ -121,14 +135,6 @@ func TestSessionScheduler_NoHeadOfLineBlockingAcrossLanes(t *testing.T) {
 	}
 
 	close(release)
-	select {
-	case <-thirdDone:
-		if err := <-thirdErr; err != nil {
-			t.Fatalf("third lane-a submit returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("third lane-a submit did not unblock after release")
-	}
 
 	if !s.Wait(3 * time.Second) {
 		t.Fatalf("scheduler timed out waiting for no-head-of-line test")

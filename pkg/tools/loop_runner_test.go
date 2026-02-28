@@ -197,7 +197,7 @@ func TestApplyContextPruningInPlace_BalancedKeepsRecent(t *testing.T) {
 	}
 }
 
-func TestLoopDetector_SignatureWarningThenCritical(t *testing.T) {
+func TestLoopDetector_SignatureWarningsDoNotHardBreak(t *testing.T) {
 	cfg := normalizeToolLoopDetectionConfig(ToolLoopDetectionConfig{
 		Enabled:                    true,
 		WarningsEnabled:            true,
@@ -215,8 +215,8 @@ func TestLoopDetector_SignatureWarningThenCritical(t *testing.T) {
 		t.Fatalf("expected warning outcome on second repeat, got %+v", out)
 	}
 	out = d.checkResponsePattern(calls)
-	if out == nil || !strings.EqualFold(out.Level, "critical") {
-		t.Fatalf("expected critical outcome on third repeat, got %+v", out)
+	if out != nil {
+		t.Fatalf("expected no critical outcome on repeated signature alone, got %+v", out)
 	}
 }
 

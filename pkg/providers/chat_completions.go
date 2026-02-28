@@ -17,6 +17,7 @@ import (
 )
 
 const defaultHTTPTimeout = 300 * time.Second
+const defaultOllamaHTTPTimeout = 90 * time.Second
 
 type chatCompletionsProvider struct {
 	providerName string
@@ -41,7 +42,11 @@ func newChatCompletionsProvider(providerName, apiBase, defaultModel, proxy strin
 		return nil, fmt.Errorf("%s auth is not configured", providerName)
 	}
 
-	client := &http.Client{Timeout: defaultHTTPTimeout}
+	timeout := defaultHTTPTimeout
+	if providerName == ProviderOllama {
+		timeout = defaultOllamaHTTPTimeout
+	}
+	client := &http.Client{Timeout: timeout}
 	proxy = strings.TrimSpace(proxy)
 	if proxy != "" {
 		proxyURL, err := url.Parse(proxy)

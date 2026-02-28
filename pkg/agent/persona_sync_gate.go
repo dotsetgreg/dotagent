@@ -10,6 +10,7 @@ var personaSyncLikelyQuestionLeadRegex = regexp.MustCompile(`(?i)^\s*(?:what|why
 var personaSyncStrongCueRegex = regexp.MustCompile(`(?i)\b(?:my name is|call me|your name is|call yourself|you(?:'re| are) called|from now on|forget|remove|my timezone is|i(?:'m| am) in timezone|my preferred language is|my language is|respond in|speak in|set (?:my|your)|(?:please\s+)?remember this[:\s]|for this session|your\s+[a-z][a-z0-9 _\-]{1,32}\s+is)\b`)
 
 var personaSyncStyleCueRegex = regexp.MustCompile(`(?i)\b(?:be|respond|talk|write)\s+(?:more\s+)?(?:concise|detailed|formal|casual|direct|friendly)\b`)
+var personaSyncPersistenceScopeRegex = regexp.MustCompile(`(?i)\b(?:from now on|going forward|for this session|always|please remember|remember this|keep this)\b`)
 
 var personaSyncQuestionDirectiveCueRegex = regexp.MustCompile(`(?i)\b(?:call me|call yourself|your name is|my name is|respond in|speak in|for this session|set (?:my|your)|forget|remove)\b`)
 
@@ -24,5 +25,15 @@ func shouldApplyPersonaSyncFastPath(userMessage string) bool {
 	if personaSyncLikelyQuestionLeadRegex.MatchString(content) && !personaSyncQuestionDirectiveCueRegex.MatchString(content) {
 		return false
 	}
-	return personaSyncStrongCueRegex.MatchString(content) || personaSyncStyleCueRegex.MatchString(content)
+	if personaSyncStrongCueRegex.MatchString(content) {
+		return true
+	}
+	if !personaSyncStyleCueRegex.MatchString(content) {
+		return false
+	}
+	// Avoid blocking the turn on long task prompts that contain incidental style words.
+	if len(content) > 160 && !personaSyncPersistenceScopeRegex.MatchString(content) {
+		return false
+	}
+	return true
 }

@@ -259,19 +259,46 @@ func (sl *SkillsLoader) getSkillMetadata(skillPath string) *SkillMetadata {
 	if err != nil {
 		return nil
 	}
+	body := sl.stripFrontmatter(string(content))
 
 	frontmatter := sl.extractFrontmatter(string(content))
 	if frontmatter == "" {
 		return &SkillMetadata{
-			Name: filepath.Base(filepath.Dir(skillPath)),
+			Name:        filepath.Base(filepath.Dir(skillPath)),
+			Description: sl.deriveSkillDescription(body),
 		}
 	}
 
 	yamlMeta := sl.parseSimpleYAML(frontmatter)
+	description := strings.TrimSpace(yamlMeta["description"])
+	if description == "" {
+		description = sl.deriveSkillDescription(body)
+	}
 	return &SkillMetadata{
 		Name:        yamlMeta["name"],
-		Description: yamlMeta["description"],
+		Description: description,
 	}
+}
+
+func (sl *SkillsLoader) deriveSkillDescription(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "Skill instructions"
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(line, "#-*> "))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "---") {
+			continue
+		}
+		if len(line) > MaxDescriptionLength {
+			line = line[:MaxDescriptionLength]
+		}
+		return line
+	}
+	return "Skill instructions"
 }
 
 // parseSimpleYAML parses simple key: value YAML format

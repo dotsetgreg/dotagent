@@ -113,7 +113,20 @@ func (r *ToolRegistry) ExecuteWithContext(ctx context.Context, name string, args
 	execCtx := withToolExecutionContext(ctx, channel, chatID, asyncCallback)
 
 	start := time.Now()
-	result := tool.Execute(execCtx, args)
+	var result *ToolResult
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicErr := fmt.Errorf("tool %q panicked: %v", name, r)
+				logger.ErrorCF("tool", "Tool execution panicked", map[string]interface{}{
+					"tool":  name,
+					"panic": fmt.Sprint(r),
+				})
+				result = ErrorResult(panicErr.Error()).WithError(panicErr)
+			}
+		}()
+		result = tool.Execute(execCtx, args)
+	}()
 	duration := time.Since(start)
 	if result == nil {
 		err := fmt.Errorf("tool %q returned nil result", name)

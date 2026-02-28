@@ -270,3 +270,38 @@ func TestOpenAPIRuntime_PrivateSpecURLBlockedByDefault(t *testing.T) {
 		t.Fatalf("expected constructor to fail for private spec_url")
 	}
 }
+
+func TestOpenAPIRuntime_DuplicateOperationIDFailsCompilation(t *testing.T) {
+	spec := map[string]interface{}{
+		"openapi": "3.1.0",
+		"paths": map[string]interface{}{
+			"/users": map[string]interface{}{
+				"get": map[string]interface{}{
+					"operationId": "dupOp",
+				},
+			},
+			"/teams": map[string]interface{}{
+				"get": map[string]interface{}{
+					"operationId": "dupOp",
+				},
+			},
+		},
+	}
+	tmp := t.TempDir()
+	specPath := filepath.Join(tmp, "spec.json")
+	raw, _ := json.Marshal(spec)
+	if err := os.WriteFile(specPath, raw, 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	rt, err := NewOpenAPIRuntime("dup-openapi", OpenAPIConfig{
+		SpecPath:          specPath,
+		BaseURL:           "https://api.example.com",
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	if err := rt.Health(context.Background()); err == nil {
+		t.Fatalf("expected duplicate operationId health failure")
+	}
+}

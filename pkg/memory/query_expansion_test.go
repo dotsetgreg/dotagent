@@ -40,3 +40,10 @@ func TestExpandQueryTerms_CJKExpansion(t *testing.T) {
 		t.Fatalf("expected CJK bigrams in terms: %#v", terms)
 	}
 }
+
+func TestExpandQueryTerms_FallbackWhenStopwordsWouldEmptyTerms(t *testing.T) {
+	terms := expandQueryTerms("the and or to")
+	if len(terms) == 0 {
+		t.Fatalf("expected fallback terms for stopword-only query")
+	}
+}

@@ -49,12 +49,15 @@ func (t loopTestTool) Execute(_ context.Context, _ map[string]interface{}) *Tool
 	return &ToolResult{ForLLM: "ok"}
 }
 
-func TestRunToolLoop_CircuitBreakerSignatureRepeat(t *testing.T) {
+func TestRunToolLoop_RepeatedSignatureReliesOnNoProgressBreaker(t *testing.T) {
 	provider := &scriptedLoopProvider{
 		responses: []*providers.LLMResponse{
 			{ToolCalls: []providers.ToolCall{{ID: "1", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
 			{ToolCalls: []providers.ToolCall{{ID: "2", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
 			{ToolCalls: []providers.ToolCall{{ID: "3", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
+			{ToolCalls: []providers.ToolCall{{ID: "4", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
+			{ToolCalls: []providers.ToolCall{{ID: "5", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
+			{ToolCalls: []providers.ToolCall{{ID: "6", Name: "looptool", Arguments: map[string]interface{}{"q": "same"}}}},
 		},
 	}
 
@@ -73,11 +76,11 @@ func TestRunToolLoop_CircuitBreakerSignatureRepeat(t *testing.T) {
 	if result == nil {
 		t.Fatal("RunToolLoop returned nil result")
 	}
-	if !strings.Contains(result.Content, "repeated tool-call loop") {
-		t.Fatalf("expected signature circuit-breaker message, got: %q", result.Content)
+	if !strings.Contains(strings.ToLower(result.Content), "no progress") {
+		t.Fatalf("expected no-progress breaker message, got: %q", result.Content)
 	}
-	if result.Iterations != 3 {
-		t.Fatalf("expected 3 iterations before breaker, got %d", result.Iterations)
+	if result.Iterations < 4 {
+		t.Fatalf("expected detector to allow multiple repeats before break, got %d iterations", result.Iterations)
 	}
 }
 

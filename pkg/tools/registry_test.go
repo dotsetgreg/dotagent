@@ -23,6 +23,17 @@ func (t *executionContextProbeTool) Execute(ctx context.Context, args map[string
 	return SilentResult(channel + ":" + chatID)
 }
 
+type actorContextProbeTool struct{}
+
+func (t *actorContextProbeTool) Name() string        { return "actor-probe" }
+func (t *actorContextProbeTool) Description() string { return "actor probe" }
+func (t *actorContextProbeTool) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+}
+func (t *actorContextProbeTool) Execute(ctx context.Context, args map[string]interface{}) *ToolResult {
+	return SilentResult(actorFromContext(ctx))
+}
+
 type asyncContextProbeTool struct {
 	setCallbackCalls int
 }
@@ -95,6 +106,21 @@ func TestToolRegistry_ExecuteWithContext_UsesRequestScopedAsyncCallback(t *testi
 	}
 	if callbackCalled {
 		t.Fatalf("callback should not be invoked by ExecuteWithContext itself")
+	}
+}
+
+func TestToolRegistry_ExecuteWithContext_PreservesActorIDFromContext(t *testing.T) {
+	registry := NewToolRegistry()
+	if err := registry.Register(&actorContextProbeTool{}); err != nil {
+		t.Fatalf("register actor probe: %v", err)
+	}
+	ctx := WithToolExecutionActor(context.Background(), "user-123")
+	result := registry.ExecuteWithContext(ctx, "actor-probe", map[string]interface{}{}, "discord", "chat-1", nil)
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if result.ForLLM != "user-123" {
+		t.Fatalf("expected actor user-123, got %q", result.ForLLM)
 	}
 }
 

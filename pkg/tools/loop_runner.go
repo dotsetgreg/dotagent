@@ -98,8 +98,8 @@ func defaultToolLoopDetectionConfig() ToolLoopDetectionConfig {
 	return ToolLoopDetectionConfig{
 		Enabled:                     true,
 		WarningsEnabled:             true,
-		SignatureWarnThreshold:      2,
-		SignatureCriticalThreshold:  3,
+		SignatureWarnThreshold:      3,
+		SignatureCriticalThreshold:  5,
 		DriftWarnThreshold:          6,
 		DriftCriticalThreshold:      8,
 		PollingWarnThreshold:        4,
@@ -427,9 +427,15 @@ func recoverFromModelError(ctx context.Context, config ToolLoopConfig, state *ru
 				"error":   rebuildErr.Error(),
 			})
 		} else if len(rebuilt) > 0 {
-			state.messages = cloneMessages(rebuilt)
-			state.hasContextOverflowCompacted = true
-			return true, nil
+			if messagesSemanticallyEqual(state.messages, rebuilt) {
+				logger.WarnCF("toolloop", "Rebuilt context unchanged after compaction; trying truncation fallback", map[string]any{
+					"attempt": state.overflowCompactionAttempts,
+				})
+			} else {
+				state.messages = cloneMessages(rebuilt)
+				state.hasContextOverflowCompacted = true
+				return true, nil
+			}
 		}
 	}
 
@@ -463,6 +469,27 @@ func cloneMessages(messages []providers.Message) []providers.Message {
 	out := make([]providers.Message, len(messages))
 	copy(out, messages)
 	return out
+}
+
+func messagesSemanticallyEqual(a, b []providers.Message) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if strings.TrimSpace(a[i].Role) != strings.TrimSpace(b[i].Role) {
+			return false
+		}
+		if strings.TrimSpace(a[i].Content) != strings.TrimSpace(b[i].Content) {
+			return false
+		}
+		if strings.TrimSpace(a[i].ToolCallID) != strings.TrimSpace(b[i].ToolCallID) {
+			return false
+		}
+		if len(a[i].ToolCalls) != len(b[i].ToolCalls) {
+			return false
+		}
+	}
+	return true
 }
 
 type toolLoopDetector struct {
@@ -505,14 +532,6 @@ func (d *toolLoopDetector) checkResponsePattern(calls []providers.ToolCall) *loo
 	if signature != "" {
 		d.responseSignatures[signature]++
 		count := d.responseSignatures[signature]
-		if count >= d.cfg.SignatureCriticalThreshold {
-			return &loopDetectionOutcome{
-				Level:   "critical",
-				Reason:  "signature_repeat",
-				Message: "I’m stopping tool execution because I detected a repeated tool-call loop. If you still want this action, restate it with a narrower scope.",
-				Count:   count,
-			}
-		}
 		if count >= d.cfg.SignatureWarnThreshold {
 			if outcome := d.warnOutcome("signature_repeat|"+signature, "signature_repeat", count,
 				"I’m seeing repeated tool-call patterns. I will continue for now, but if this keeps repeating I will stop the loop."); outcome != nil {
@@ -945,7 +964,9 @@ func truncateWithMarker(content string, maxChars int) string {
 	if head+tail >= len(content) {
 		return content[:maxChars]
 	}
-	truncated := content[:head] + "\n...\n" + content[len(content)-tail:]
+	headChunk := truncateAtBoundary(content[:head], false)
+	tailChunk := truncateAtBoundary(content[len(content)-tail:], true)
+	truncated := headChunk + "\n...\n" + tailChunk
 	note := fmt.Sprintf("\n[tool result trimmed from %d to %d chars]", len(content), len(truncated))
 	if len(truncated)+len(note) > maxChars {
 		allowed := maxChars - len(note)
@@ -954,10 +975,32 @@ func truncateWithMarker(content string, maxChars int) string {
 			note = ""
 		}
 		if allowed < len(truncated) {
-			truncated = truncated[:allowed]
+			truncated = truncateAtBoundary(truncated[:allowed], false)
 		}
 	}
 	return truncated + note
+}
+
+func truncateAtBoundary(chunk string, keepTail bool) string {
+	if strings.TrimSpace(chunk) == "" {
+		return chunk
+	}
+	if keepTail {
+		if idx := strings.Index(chunk, "\n"); idx >= 0 && idx+1 < len(chunk) {
+			return strings.TrimLeft(chunk[idx+1:], "\n")
+		}
+		if idx := strings.Index(chunk, " "); idx >= 0 && idx+1 < len(chunk) {
+			return strings.TrimLeft(chunk[idx+1:], " ")
+		}
+		return chunk
+	}
+	if idx := strings.LastIndex(chunk, "\n"); idx >= 0 {
+		return strings.TrimRight(chunk[:idx], "\n")
+	}
+	if idx := strings.LastIndex(chunk, " "); idx >= 0 {
+		return strings.TrimRight(chunk[:idx], " ")
+	}
+	return chunk
 }
 
 func maxInt(a, b int) int {

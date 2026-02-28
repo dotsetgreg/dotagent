@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dotsetgreg/dotagent/pkg/providers"
 )
 
 func TestLoadBootstrapFiles_PrefersAgentsMDAndEmitsConflictNotice(t *testing.T) {
@@ -70,5 +72,21 @@ func TestBuildSystemPrompt_DeterministicHash(t *testing.T) {
 	}
 	if meta1.Hash == "" || meta2.Hash == "" || meta1.Hash != meta2.Hash {
 		t.Fatalf("expected stable prompt hash, got %q vs %q", meta1.Hash, meta2.Hash)
+	}
+}
+
+func TestBuildMessagesWithSystemPrompt_TruncatesLargeSummary(t *testing.T) {
+	cb := NewContextBuilder(t.TempDir())
+	summary := strings.Repeat("summary line ", 500)
+	msgs := cb.BuildMessagesWithSystemPrompt("system", []providers.Message{}, summary, "", "hi", nil, "discord", "chat-1")
+	if len(msgs) < 2 {
+		t.Fatalf("expected system + dynamic context messages")
+	}
+	dynamic := msgs[1].Content
+	if !strings.Contains(dynamic, "summary truncated for context budget") {
+		t.Fatalf("expected truncation marker in dynamic summary block")
+	}
+	if !strings.Contains(dynamic, "Dynamic Context") {
+		t.Fatalf("expected dynamic context framing")
 	}
 }

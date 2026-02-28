@@ -39,6 +39,7 @@ var (
 	ErrSchedulerStopped    = errors.New("session scheduler stopped")
 	ErrSchedulerNilTask    = errors.New("session scheduler received nil task")
 	ErrSchedulerLaneClosed = errors.New("session scheduler lane closed")
+	ErrSchedulerLaneFull   = errors.New("session scheduler lane queue full")
 )
 
 func newSessionScheduler(maxConcurrent int) *sessionScheduler {
@@ -112,8 +113,18 @@ func (s *sessionScheduler) enqueue(lane *laneWorker, fn func()) (err error) {
 			err = ErrSchedulerLaneClosed
 		}
 	}()
-	lane.queue <- fn
-	return nil
+	select {
+	case lane.queue <- fn:
+		return nil
+	default:
+		if lane.closed.Load() {
+			return ErrSchedulerLaneClosed
+		}
+		if s.stopped.Load() {
+			return ErrSchedulerStopped
+		}
+		return ErrSchedulerLaneFull
+	}
 }
 
 func (s *sessionScheduler) Stop() {

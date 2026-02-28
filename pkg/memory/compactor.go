@@ -108,14 +108,12 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 	}
 
 	sourceCount := len(events)
-	keepTurns, retainedCount := selectTurnsToKeep(events, keepLatest)
+	turnIDs := deriveCompactionTurnIDs(events)
+	keepTurns, retainedCount := selectTurnsToKeep(turnIDs, keepLatest)
 	archiveStrategy := "turns"
 	toArchive := make([]Event, 0, len(events))
-	for _, ev := range events {
-		turnID := strings.TrimSpace(ev.TurnID)
-		if turnID == "" {
-			turnID = ev.ID
-		}
+	for i, ev := range events {
+		turnID := turnIDs[i]
 		if _, ok := keepTurns[turnID]; ok {
 			continue
 		}
@@ -177,15 +175,11 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 	}
 	if recoveryMode == "heuristic_emergency" && c.summarize != nil {
 		_ = c.store.CheckpointCompaction(ctx, compactionID, map[string]string{
-			"phase":         "summary_unreliable",
+			"phase":         "summary_unreliable_continue",
 			"recovery_mode": recoveryMode,
 			"reason":        "heuristic_only_fallback",
 		})
-		_ = c.store.FailCompaction(ctx, compactionID, ErrCompactionSummaryUnreliable.Error())
-		hookPayload.RecoveryMode = recoveryMode
-		hookPayload.Stage = "summary_unreliable"
-		retErr = ErrCompactionSummaryUnreliable
-		return retErr
+		recoveryMode = "heuristic_fallback"
 	}
 	if recoveryMode == "heuristic_emergency" && c.summarize == nil {
 		recoveryMode = "heuristic_no_summarizer"
@@ -223,11 +217,21 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 
 	var archivedCount int
 	if archiveStrategy == "turns" {
+		knownTurnIDs := knownCompactionTurnIDs(events)
 		keepTurnIDs := make([]string, 0, len(keepTurns))
 		for turnID := range keepTurns {
+			if _, ok := knownTurnIDs[turnID]; !ok {
+				continue
+			}
 			keepTurnIDs = append(keepTurnIDs, turnID)
 		}
-		archivedCount, err = c.store.ArchiveEventsExceptTurns(ctx, sessionKey, keepTurnIDs)
+		if len(keepTurnIDs) == 0 {
+			archiveStrategy = "events_fallback"
+			retainedCount = keepLatest
+			archivedCount, err = c.store.ArchiveEventsBefore(ctx, sessionKey, keepLatest)
+		} else {
+			archivedCount, err = c.store.ArchiveEventsExceptTurns(ctx, sessionKey, keepTurnIDs)
+		}
 	} else {
 		archivedCount, err = c.store.ArchiveEventsBefore(ctx, sessionKey, keepLatest)
 	}
@@ -264,8 +268,27 @@ func (c *SessionCompactor) CompactSession(ctx context.Context, sessionKey, userI
 func estimateEventTokens(events []Event) int {
 	total := 0
 	for _, ev := range events {
-		words := len(strings.Fields(ev.Content))
-		tokens := words * 4 / 3
+		content := strings.TrimSpace(ev.Content)
+		if content == "" {
+			continue
+		}
+		words := len(strings.Fields(content))
+		chars := len(content)
+		tokens := chars / 4
+		if words > 0 {
+			wordEstimate := words * 4 / 3
+			if wordEstimate > tokens {
+				tokens = wordEstimate
+			} else {
+				tokens = (tokens + wordEstimate) / 2
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(ev.Role), "tool") {
+			tokens = int(float64(tokens)*1.25) + 12
+		}
+		if isLikelyStructuredPayload(strings.ToLower(content)) {
+			tokens = int(float64(tokens)*1.20) + 8
+		}
 		if tokens < 8 {
 			tokens = 8
 		}
@@ -415,8 +438,8 @@ func buildCompactionTranscript(events []Event, maxTranscriptChars, partialSkipCh
 		}
 		if role == "tool" {
 			content = stripToolResultDetails(content, partialSkipChars)
-		} else if len(content) > 900 {
-			content = content[:900] + "... [truncated]"
+		} else if len(content) > 1600 {
+			content = truncateCompactionContent(content, 1600, "... [truncated]")
 		}
 		line := role + ": " + content + "\n"
 		if b.Len()+len(line) > maxTranscriptChars {
@@ -470,7 +493,7 @@ func stripToolResultDetails(content string, maxChars int) string {
 		content += "\n[tool payload details stripped for compaction]"
 	}
 	if len(content) > maxChars {
-		content = content[:maxChars] + "... [tool output truncated]"
+		content = truncateCompactionContent(content, maxChars, "... [tool output truncated]")
 	}
 	return content
 }
@@ -479,10 +502,12 @@ func isLikelyStructuredPayload(lower string) bool {
 	if lower == "" {
 		return false
 	}
-	if strings.Contains(lower, "{") && strings.Contains(lower, "}") {
+	trimmed := strings.TrimSpace(lower)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		return true
 	}
-	if strings.Contains(lower, "[") && strings.Contains(lower, "]") {
+	jsonLike := strings.Count(lower, "\":") + strings.Count(lower, "},") + strings.Count(lower, "],")
+	if jsonLike >= 2 && ((strings.Contains(lower, "{") && strings.Contains(lower, "}")) || (strings.Contains(lower, "[") && strings.Contains(lower, "]"))) {
 		return true
 	}
 	return strings.Contains(lower, "\"status\"") ||
@@ -524,18 +549,14 @@ func fallbackSummary(existing string, events []Event) string {
 	return strings.Join(parts, "\n")
 }
 
-func selectTurnsToKeep(events []Event, keepLatest int) (map[string]struct{}, int) {
+func selectTurnsToKeep(turnIDs []string, keepLatest int) (map[string]struct{}, int) {
 	keep := map[string]struct{}{}
-	if keepLatest <= 0 || len(events) == 0 {
+	if keepLatest <= 0 || len(turnIDs) == 0 {
 		return keep, 0
 	}
 	keptEvents := 0
-	for i := len(events) - 1; i >= 0; i-- {
-		ev := events[i]
-		turnID := strings.TrimSpace(ev.TurnID)
-		if turnID == "" {
-			turnID = ev.ID
-		}
+	for i := len(turnIDs) - 1; i >= 0; i-- {
+		turnID := strings.TrimSpace(turnIDs[i])
 		if turnID == "" {
 			continue
 		}
@@ -550,6 +571,69 @@ func selectTurnsToKeep(events []Event, keepLatest int) (map[string]struct{}, int
 		keptEvents++
 	}
 	return keep, keptEvents
+}
+
+func deriveCompactionTurnIDs(events []Event) []string {
+	out := make([]string, len(events))
+	lastKnown := ""
+	for i := range events {
+		tid := strings.TrimSpace(events[i].TurnID)
+		if tid != "" {
+			lastKnown = tid
+			out[i] = tid
+			continue
+		}
+		if lastKnown != "" {
+			out[i] = lastKnown
+			continue
+		}
+		nextKnown := ""
+		for j := i + 1; j < len(events); j++ {
+			if candidate := strings.TrimSpace(events[j].TurnID); candidate != "" {
+				nextKnown = candidate
+				break
+			}
+		}
+		if nextKnown != "" {
+			out[i] = nextKnown
+			continue
+		}
+		if id := strings.TrimSpace(events[i].ID); id != "" {
+			out[i] = id
+		}
+	}
+	return out
+}
+
+func knownCompactionTurnIDs(events []Event) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, ev := range events {
+		if tid := strings.TrimSpace(ev.TurnID); tid != "" {
+			out[tid] = struct{}{}
+		}
+	}
+	return out
+}
+
+func truncateCompactionContent(content string, maxChars int, suffix string) string {
+	content = strings.TrimSpace(content)
+	if content == "" || maxChars <= 0 || len(content) <= maxChars {
+		return content
+	}
+	limit := maxChars
+	if suffix != "" && limit > len(suffix)+8 {
+		limit -= len(suffix)
+	}
+	candidate := strings.TrimSpace(content[:limit])
+	if idx := strings.LastIndex(candidate, "\n"); idx >= 120 {
+		candidate = strings.TrimSpace(candidate[:idx])
+	} else if idx := strings.LastIndex(candidate, " "); idx >= 120 {
+		candidate = strings.TrimSpace(candidate[:idx])
+	}
+	if suffix == "" {
+		return candidate
+	}
+	return candidate + suffix
 }
 
 func buildSessionSnapshot(ctx context.Context, store Store, sessionKey, userID, agentID, compactionID, summary string, events []Event) (SessionSnapshot, error) {

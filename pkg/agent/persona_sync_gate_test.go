@@ -19,6 +19,11 @@ func TestShouldApplyPersonaSyncFastPath(t *testing.T) {
 		{name: "question with weak memory word", input: "Can you remember this bug report?", wantRun: false},
 		{name: "save instruction explicit", input: "Please remember this: my timezone is America/New_York", wantRun: true},
 		{name: "casual statement no directive", input: "I live in Seattle and like coffee.", wantRun: false},
+		{
+			name:    "long prompt with incidental style phrase",
+			input:   "Write a migration plan for this service and include rollback steps, safety checks, testing strategy, and communication plan. Also write in a formal tone for the document body.",
+			wantRun: false,
+		},
 	}
 
 	for _, tt := range tests {

@@ -8,7 +8,7 @@ package agent
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -511,7 +511,7 @@ TURN TRANSCRIPT:
 			MaxHoldDuration: time.Duration(cfg.Agents.Defaults.SessionLockMaxHoldSeconds) * time.Second,
 		}),
 		recentInbound:      map[string]int64{},
-		inboundDedupeTTL:   90 * time.Second,
+		inboundDedupeTTL:   30 * time.Second,
 		sessionPromptHash:  map[string]string{},
 		personaSyncTimeout: time.Duration(cfg.Memory.PersonaSyncTimeoutMS) * time.Millisecond,
 	}
@@ -597,6 +597,16 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 					"lane_key":    laneKey,
 					"error":       submitErr.Error(),
 				})
+				if errors.Is(submitErr, ErrSchedulerLaneFull) {
+					if !constants.IsInternalChannel(incoming.Channel) {
+						al.publishOutbound(bus.OutboundMessage{
+							Channel: incoming.Channel,
+							ChatID:  incoming.ChatID,
+							Content: "I am currently busy in this chat and could not queue that message yet. Please retry in a moment.",
+						}, "scheduler_lane_full")
+					}
+					continue
+				}
 				if retryErr := scheduler.Submit(laneKey, runTask); retryErr != nil {
 					logger.ErrorCF("agent", "Retry submit failed; notifying user", map[string]interface{}{
 						"session_key": incoming.SessionKey,
@@ -652,12 +662,22 @@ func inboundDedupeKey(msg bus.InboundMessage) string {
 	if mid := strings.TrimSpace(msg.MessageID); mid != "" {
 		return strings.ToLower(channel + "|" + chatID + "|" + sender + "|" + mid)
 	}
+	if msg.Metadata != nil {
+		if dedupeID := strings.TrimSpace(msg.Metadata["dedupe_id"]); dedupeID != "" {
+			return strings.ToLower(channel + "|" + chatID + "|" + sender + "|d:" + dedupeID)
+		}
+	}
+	// Avoid suppressing legitimate repeated user messages from channels that do
+	// not provide stable message IDs.
+	if !constants.IsInternalChannel(channel) && !strings.HasPrefix(strings.ToLower(sender), "cron:") {
+		return ""
+	}
 	content := strings.TrimSpace(strings.ToLower(msg.Content))
 	if content == "" {
 		return ""
 	}
-	sum := sha1.Sum([]byte(content))
-	return strings.ToLower(channel + "|" + chatID + "|" + sender + "|h:" + hex.EncodeToString(sum[:8]))
+	sum := sha256.Sum256([]byte(content))
+	return strings.ToLower(channel + "|" + chatID + "|" + sender + "|h:" + hex.EncodeToString(sum[:16]))
 }
 
 func (al *AgentLoop) detectPromptBaselineChange(sessionKey, promptHash string) bool {
@@ -1019,7 +1039,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		}
 	}
 	currentUserPrompt := opts.UserMessage
-	if !opts.NoHistory && recordedUserTurn && historyContainsUserMessage(history, opts.UserMessage) {
+	if !opts.NoHistory && recordedUserTurn && historyEndsWithUserMessage(history, opts.UserMessage) {
 		// Current user turn is already in persisted history; avoid duplicate copy.
 		currentUserPrompt = ""
 	}
@@ -1060,6 +1080,11 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	retryCfg.MaxAttempts = 3
 	retryCfg.MinDelay = 1500 * time.Millisecond
 	retryCfg.MaxDelay = 8 * time.Second
+	if strings.EqualFold(al.providerName, providers.ProviderOllama) {
+		retryCfg.MaxAttempts = 2
+		retryCfg.MinDelay = 600 * time.Millisecond
+		retryCfg.MaxDelay = 2500 * time.Millisecond
+	}
 	streamID := turnID
 	streamForwarder := newLLMStreamForwarder(func(chunk string) {
 		if chunk == "" || constants.IsInternalChannel(opts.Channel) {
@@ -1077,7 +1102,8 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		streamForwarder = nil
 	}
 	overflowNoticeSent := false
-	loopResult, err := tools.RunToolLoop(ctx, tools.ToolLoopConfig{
+	toolLoopCtx := tools.WithToolExecutionActor(ctx, opts.UserID)
+	loopResult, err := tools.RunToolLoop(toolLoopCtx, tools.ToolLoopConfig{
 		Provider:               al.provider,
 		Model:                  al.model,
 		Tools:                  al.tools,
@@ -1117,6 +1143,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 					"error":       compactErr.Error(),
 					"session_key": opts.SessionKey,
 				})
+				return nil, compactErr
 			}
 			rebuilt, rebuildErr := al.memory.BuildPromptContext(rebuildCtx, opts.SessionKey, opts.UserID, opts.UserMessage, al.contextWindow)
 			if rebuildErr != nil {
@@ -1792,15 +1819,20 @@ func (al *AgentLoop) resolveCommandSessionKey(msg bus.InboundMessage, userID str
 	return strings.TrimSpace(msg.SessionKey)
 }
 
-func historyContainsUserMessage(history []providers.Message, content string) bool {
+func historyEndsWithUserMessage(history []providers.Message, content string) bool {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return false
 	}
-	for _, m := range history {
-		if m.Role == "user" && strings.TrimSpace(m.Content) == content {
-			return true
+	for i := len(history) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(history[i].Role))
+		if role == "tool" {
+			continue
 		}
+		if role != "user" {
+			return false
+		}
+		return strings.TrimSpace(history[i].Content) == content
 	}
 	return false
 }

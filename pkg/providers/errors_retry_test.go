@@ -69,6 +69,21 @@ func TestParseRetryAfterHeader(t *testing.T) {
 	}
 }
 
+func TestRetryCall_ReturnsLastProviderErrorAfterRetries(t *testing.T) {
+	ctx := context.Background()
+	cfg := RetryConfig{MaxAttempts: 2, MinDelay: 0, MaxDelay: 0, Jitter: 0}
+	want := fmt.Errorf("provider permanent failure")
+	_, err := RetryCall(ctx, cfg, func() (string, error) {
+		return "", want
+	}, func(error) bool { return true }, nil)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if err.Error() != want.Error() {
+		t.Fatalf("expected last provider error, got %v", err)
+	}
+}
+
 func TestNormalizeProviderError_WrapsUntypedError(t *testing.T) {
 	err := NormalizeProviderError("openrouter", fmt.Errorf("request too large"))
 	meta := InspectError(err)
